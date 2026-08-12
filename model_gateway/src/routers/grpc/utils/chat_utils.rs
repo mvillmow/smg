@@ -1,6 +1,7 @@
 //! Chat message processing, tool constraints, and shared utilities for gRPC routers.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     sync::{Arc, OnceLock},
 };
@@ -135,6 +136,85 @@ pub(crate) async fn encode_blocking(
         .map_err(|e| anyhow!("tokenization task failed: {e}"))?
 }
 
+/// True iff `token` is a syntactically valid JSON integer literal: an optional
+/// leading `-`, then either a lone `0` or a nonzero digit followed by digits.
+fn is_canonical_json_integer(token: &str) -> bool {
+    let digits = token.strip_prefix('-').unwrap_or(token);
+    !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'))
+}
+
+/// Rewrite integer literals that neither `i64` nor `u64` can hold into JSON
+/// strings, so parsing the result into a [`Value`] cannot round them through
+/// `f64` and silently corrupt their digits.
+///
+/// Tool-call arguments routinely carry identifiers the model must echo
+/// verbatim; a 20+-digit integer coerced to `f64` comes back with different
+/// digits and the tool receives a corrupted id. Quoting trades native numeric
+/// typing in the rendered template for digit-exact fidelity, the right trade
+/// at magnitudes only ids reach. In-range integers and float-shaped tokens
+/// (fraction or exponent present) pass through untouched, as does anything
+/// inside string values. Tokens that are not canonical JSON integers are also
+/// left alone so malformed input still fails in the parser, not here.
+fn quote_unrepresentable_integers(input: &str) -> Cow<'_, str> {
+    let bytes = input.as_bytes();
+    let mut rewritten: Option<String> = None;
+    let mut copied_until = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if b != b'-' && !b.is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        // In valid JSON a number token runs until a structural character or
+        // whitespace, none of which this set can consume.
+        let start = i;
+        while i < bytes.len() && matches!(bytes[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+        {
+            i += 1;
+        }
+        let token = &input[start..i];
+        if is_canonical_json_integer(token)
+            && token.parse::<i64>().is_err()
+            && token.parse::<u64>().is_err()
+        {
+            let out = rewritten.get_or_insert_with(|| String::with_capacity(input.len() + 8));
+            out.push_str(&input[copied_until..start]);
+            out.push('"');
+            out.push_str(token);
+            out.push('"');
+            copied_until = i;
+        }
+    }
+    match rewritten {
+        Some(mut out) => {
+            out.push_str(&input[copied_until..]);
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(input),
+    }
+}
+
 /// Process tool call arguments in messages
 /// Per Transformers docs, tool call arguments in assistant messages should be dicts
 pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
@@ -159,8 +239,9 @@ pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), 
                 continue;
             };
 
-            // Parse JSON string to object (like Python json.loads)
-            match serde_json::from_str::<Value>(args_str) {
+            // Parse JSON string to object (like Python json.loads), guarding
+            // integers f64 would corrupt. Errors report the original text.
+            match serde_json::from_str::<Value>(&quote_unrepresentable_integers(args_str)) {
                 Ok(parsed) => *args = parsed,
                 Err(e) => {
                     return Err(format!(
@@ -1514,5 +1595,84 @@ mod tests {
         let id = generate_tool_call_id("gpt-4o", "get_weather", 0, 0);
         assert!(id.starts_with("call_"), "got: {id}");
         assert!(!id.contains("get_weather"), "got: {id}");
+    }
+
+    fn assistant_message_with_arguments(arguments: &str) -> Vec<Value> {
+        vec![json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "function": {"name": "lookup", "arguments": arguments}
+            }]
+        })]
+    }
+
+    fn processed_arguments(arguments: &str) -> Value {
+        let mut messages = assistant_message_with_arguments(arguments);
+        process_tool_call_arguments(&mut messages).expect("arguments should parse");
+        messages[0]["tool_calls"][0]["function"]["arguments"].clone()
+    }
+
+    #[test]
+    fn test_process_tool_call_arguments_preserves_unrepresentable_integers() {
+        let args = processed_arguments(
+            r#"{"id": 123456789012345678901234567890, "neg": -99999999999999999999}"#,
+        );
+        assert_eq!(args["id"], json!("123456789012345678901234567890"));
+        assert_eq!(args["neg"], json!("-99999999999999999999"));
+    }
+
+    #[test]
+    fn test_process_tool_call_arguments_keeps_representable_numbers_native() {
+        let args = processed_arguments(
+            r#"{"umax": 18446744073709551615, "imin": -9223372036854775808, "f": 1.5, "e": 1e2, "n": 7}"#,
+        );
+        assert_eq!(args["umax"].as_u64(), Some(u64::MAX));
+        assert_eq!(args["imin"].as_i64(), Some(i64::MIN));
+        assert!(args["f"].is_f64() && args["e"].is_f64());
+        assert_eq!(args["n"].as_i64(), Some(7));
+    }
+
+    #[test]
+    fn test_process_tool_call_arguments_handles_nested_containers() {
+        let args = processed_arguments(
+            r#"{"a": [[123456789012345678901234567890]], "b": {"c": [1, -99999999999999999999999]}}"#,
+        );
+        assert_eq!(args["a"][0][0], json!("123456789012345678901234567890"));
+        assert_eq!(args["b"]["c"][0].as_i64(), Some(1));
+        assert_eq!(args["b"]["c"][1], json!("-99999999999999999999999"));
+    }
+
+    #[test]
+    fn test_process_tool_call_arguments_invalid_json_still_errors() {
+        for bad in [
+            r"{bad",
+            r#"{"a": [1-2]}"#,
+            r#"{"a": 00123456789012345678901234567890}"#,
+        ] {
+            let mut messages = assistant_message_with_arguments(bad);
+            let err = process_tool_call_arguments(&mut messages)
+                .expect_err("malformed arguments must be rejected");
+            assert!(err.contains(bad), "error should cite original text: {err}");
+        }
+    }
+
+    #[test]
+    fn test_quote_unrepresentable_integers_ignores_digits_inside_strings() {
+        let input = r#"{"note": "ref 123456789012345678901234567890 \" tail", "big": 123456789012345678901234567890}"#;
+        let guarded = quote_unrepresentable_integers(input);
+        assert_eq!(
+            guarded,
+            r#"{"note": "ref 123456789012345678901234567890 \" tail", "big": "123456789012345678901234567890"}"#
+        );
+    }
+
+    #[test]
+    fn test_quote_unrepresentable_integers_borrows_when_untouched() {
+        let input = r#"{"a": 1, "b": [2.5, "30000000000000000000000"], "c": -3e-5}"#;
+        assert!(matches!(
+            quote_unrepresentable_integers(input),
+            Cow::Borrowed(_)
+        ));
     }
 }
