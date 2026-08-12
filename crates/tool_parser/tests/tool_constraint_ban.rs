@@ -56,9 +56,13 @@ fn curated_ban_inventories_per_parser() {
         excludes(&ban_tag_json(&factory, "kimi_k3")),
         vec!["<|open|>tools<|sep|>"]
     );
+    // Both Inkling invocation modes: JSON-arguments and TML text-mode.
     assert_eq!(
         excludes(&ban_tag_json(&factory, "inkling")),
-        vec!["<|content_invoke_tool_json|>"]
+        vec![
+            "<|content_invoke_tool_json|>",
+            "<|content_invoke_tool_text|>"
+        ]
     );
 }
 
