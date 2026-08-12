@@ -76,6 +76,10 @@ impl InklingParser {
         }
     }
 
+    /// Strings that only ever open Inkling's native tool-call syntax; banning
+    /// them makes tool calls unreachable when `tool_choice` is `"none"`.
+    pub const TOOL_CALL_BAN_STRINGS: &'static [&'static str] = &[TOOL_CALL_JSON_START];
+
     /// Build an xgrammar structural tag that constrains the JSON arguments for
     /// each declared tool while retaining Inkling's native TML framing.
     pub fn build_structural_tag(tools: &[Tool], at_least_one: bool) -> Value {
