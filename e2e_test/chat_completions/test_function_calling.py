@@ -1591,7 +1591,9 @@ THINKING_WEATHER_TOOLS = [
 ]
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+# TokenSpeed excluded: its cold-start kernel compilation for Qwen3-30B-A3B
+# exceeds the worker launch timeout on the 1-GPU CI rig.
+@pytest.mark.engine("sglang", "vllm", "trtllm")
 @pytest.mark.gpu(1)
 @pytest.mark.model("Qwen/Qwen3-30B-A3B")
 @pytest.mark.gateway(

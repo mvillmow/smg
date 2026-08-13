@@ -1157,13 +1157,13 @@ mod tests {
         // Qwen3-style: the generation prompt injects a CLOSED empty think
         // block only when thinking is disabled — completions never start
         // mid-reasoning, so this must not count as think-in-prefill.
-        let qwen3_style = r#"
+        let qwen3_style = r"
 {%- if add_generation_prompt %}
     {{- '<|im_start|>assistant\n' }}
     {%- if enable_thinking is defined and enable_thinking is false %}
         {{- '<think>\n\n</think>\n\n' }}
     {%- endif %}
-{%- endif %}"#;
+{%- endif %}";
         let (_, think_in_prefill) = detect_all_with_ast(qwen3_style);
         assert!(
             !think_in_prefill,
@@ -1172,10 +1172,10 @@ mod tests {
 
         // Thinking-only style: the generation prompt ends with an OPEN
         // <think>, so completions genuinely start mid-reasoning.
-        let thinking_style = r#"
+        let thinking_style = r"
 {%- if add_generation_prompt %}
     {{- '<|im_start|>assistant\n<think>\n' }}
-{%- endif %}"#;
+{%- endif %}";
         let (_, think_in_prefill) = detect_all_with_ast(thinking_style);
         assert!(
             think_in_prefill,
