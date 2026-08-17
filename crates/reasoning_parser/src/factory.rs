@@ -6,9 +6,9 @@ use parking_lot::RwLock;
 
 use crate::{
     parsers::{
-        BaseReasoningParser, CohereCmdParser, DeepSeekR1Parser, Glm45Parser, InklingParser,
-        KimiK3Parser, KimiParser, MiniMaxParser, NanoV3Parser, PassthroughParser, Qwen3Parser,
-        QwenThinkingParser, Step3Parser,
+        BaseReasoningParser, CohereCmdParser, DeepSeekR1Parser, Gemma4Parser, Glm45Parser,
+        InklingParser, KimiK3Parser, KimiParser, MiniMaxParser, NanoV3Parser, PassthroughParser,
+        Qwen3Parser, QwenThinkingParser, Step3Parser,
     },
     traits::{ParserConfig, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE},
 };
@@ -148,6 +148,9 @@ impl ParserFactory {
 
         registry.register_parser("nano_v3", || Box::new(NanoV3Parser::new()));
 
+        // Gemma 4 channel-marker reasoning; markers are special tokens.
+        registry.register_parser("gemma4", || Box::new(Gemma4Parser::new()));
+
         registry.register_parser("inkling", || Box::new(InklingParser::new()));
 
         // standard think tokens, always_in_reasoning=false
@@ -236,6 +239,11 @@ impl ParserFactory {
         registry.register_pattern("nemotron-3", "nano_v3");
 
         // Inkling checkpoints use the model-family name in their ID or config.
+        // Gemma 4 only — earlier Gemma generations have no reasoning channel,
+        // so no bare "gemma" pattern.
+        registry.register_pattern("gemma-4", "gemma4");
+        registry.register_pattern("gemma4", "gemma4");
+
         registry.register_pattern("inkling", "inkling");
 
         Self { registry }
@@ -346,6 +354,20 @@ mod tests {
         assert_eq!(factory.create("Kimi_K3").model_type(), "kimi_k3");
         // The legacy kimi pattern still resolves plain Kimi-K2 ids.
         assert_eq!(factory.create("kimi-chat").model_type(), "kimi");
+    }
+
+    #[test]
+    fn test_factory_creates_gemma4_for_gemma_4_only() {
+        let factory = ParserFactory::new();
+        assert_eq!(
+            factory.create("google/gemma-4-27b-it").model_type(),
+            "gemma4"
+        );
+        // Earlier generations must NOT match — they have no reasoning channel.
+        assert_eq!(
+            factory.create("google/gemma-3-27b-it").model_type(),
+            "passthrough"
+        );
     }
 
     #[test]
