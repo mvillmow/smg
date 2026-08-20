@@ -96,9 +96,11 @@ impl ReasoningParser for Gemma4Parser {
             // else: still a strict prefix of the label — keep holding.
         }
 
-        // Reasoning closed while text was still held (e.g. a reasoning block
-        // shorter than the label): release it so nothing is swallowed.
-        if !result.normal_text.is_empty() && !self.pending_reasoning.is_empty() {
+        // Reasoning block closed while text was still held (a block shorter
+        // than the label, possibly with no trailing answer in the chunk):
+        // release it as reasoning now — the stream may end here and no later
+        // call could recover it.
+        if !self.pending_reasoning.is_empty() && !self.base.is_in_reasoning() {
             let held = std::mem::take(&mut self.pending_reasoning);
             result.reasoning_text = format!("{held}{}", result.reasoning_text);
             self.label_handled = true;
@@ -209,17 +211,20 @@ mod tests {
     #[test]
     fn streaming_releases_held_prefix_when_block_ends_early() {
         let mut parser = Gemma4Parser::new();
-        let mut reasoning = String::new();
-        let mut normal = String::new();
         // A reasoning block shorter than the label ("thou") must be released
-        // when the block closes, not dropped.
-        for chunk in ["<|channel>thou<channel|>", "answer"] {
-            let r = parser.parse_reasoning_streaming_incremental(chunk).unwrap();
-            reasoning.push_str(&r.reasoning_text);
-            normal.push_str(&r.normal_text);
-        }
-        assert_eq!(reasoning, "thou");
-        assert_eq!(normal, "answer");
+        // in the same call that closes the block — the stream may end there
+        // and no later call could recover it.
+        let r = parser
+            .parse_reasoning_streaming_incremental("<|channel>thou<channel|>")
+            .unwrap();
+        assert_eq!(r.reasoning_text, "thou");
+        assert_eq!(r.normal_text, "");
+
+        let r = parser
+            .parse_reasoning_streaming_incremental("answer")
+            .unwrap();
+        assert_eq!(r.reasoning_text, "");
+        assert_eq!(r.normal_text, "answer");
     }
 
     #[test]

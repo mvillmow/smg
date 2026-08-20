@@ -238,12 +238,12 @@ impl ParserFactory {
         // infix breaks the substring — so match the generation prefix directly.
         registry.register_pattern("nemotron-3", "nano_v3");
 
-        // Inkling checkpoints use the model-family name in their ID or config.
         // Gemma 4 only — earlier Gemma generations have no reasoning channel,
         // so no bare "gemma" pattern.
         registry.register_pattern("gemma-4", "gemma4");
         registry.register_pattern("gemma4", "gemma4");
 
+        // Inkling checkpoints use the model-family name in their ID or config.
         registry.register_pattern("inkling", "inkling");
 
         Self { registry }
