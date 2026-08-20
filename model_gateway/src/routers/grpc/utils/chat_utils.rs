@@ -163,6 +163,11 @@ fn quote_unrepresentable_integers(input: &str) -> Cow<'_, str> {
     let mut copied_until = 0;
     let mut in_string = false;
     let mut escaped = false;
+    // Container/positional context: numbers are rewritten only in VALUE
+    // position. An (invalid) numeric object key must stay untouched -
+    // quoting it would turn previously rejected JSON into accepted JSON.
+    let mut containers: Vec<u8> = Vec::new();
+    let mut last_sig: Option<u8> = None;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -173,25 +178,67 @@ fn quote_unrepresentable_integers(input: &str) -> Cow<'_, str> {
                 escaped = true;
             } else if b == b'"' {
                 in_string = false;
+                last_sig = Some(b'"');
             }
             i += 1;
             continue;
         }
-        if b == b'"' {
-            in_string = true;
-            i += 1;
-            continue;
+        match b {
+            b'"' => {
+                in_string = true;
+                i += 1;
+                continue;
+            }
+            b'{' | b'[' => {
+                containers.push(b);
+                last_sig = Some(b);
+                i += 1;
+                continue;
+            }
+            b'}' | b']' => {
+                containers.pop();
+                last_sig = Some(b);
+                i += 1;
+                continue;
+            }
+            b':' | b',' => {
+                last_sig = Some(b);
+                i += 1;
+                continue;
+            }
+            _ if b.is_ascii_whitespace() => {
+                i += 1;
+                continue;
+            }
+            _ => {}
         }
         if b != b'-' && !b.is_ascii_digit() {
+            last_sig = Some(b);
             i += 1;
             continue;
         }
+        // Value position: object value (after ':'), array element (after '['
+        // or a ',' whose container is an array), or a top-level scalar.
+        // Everything else - an object key after '{' or an object ',' or any
+        // malformed adjacency - is left untouched so invalid JSON keeps
+        // failing exactly as before.
+        let value_position = match last_sig {
+            None => true,
+            Some(b':') => true,
+            Some(b'[') => true,
+            Some(b',') => containers.last() == Some(&b'['),
+            _ => false,
+        };
         // In valid JSON a number token runs until a structural character or
         // whitespace, none of which this set can consume.
         let start = i;
         while i < bytes.len() && matches!(bytes[i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
         {
             i += 1;
+        }
+        last_sig = Some(b'0');
+        if !value_position {
+            continue;
         }
         let token = &input[start..i];
         if is_canonical_json_integer(token)
@@ -506,18 +553,18 @@ pub(crate) fn filter_tools_by_tool_choice(
 /// so this function assumes tool_choice references valid tools.
 pub(crate) fn filter_chat_request_by_tool_choice(
     body: &ChatCompletionRequest,
-) -> std::borrow::Cow<'_, ChatCompletionRequest> {
+) -> Cow<'_, ChatCompletionRequest> {
     if let Some(tools) = &body.tools {
         if let Some(filtered_tools) = filter_tools_by_tool_choice(tools, body.tool_choice.as_ref())
         {
             let mut filtered_body = body.clone();
             filtered_body.tools = Some(filtered_tools);
-            return std::borrow::Cow::Owned(filtered_body);
+            return Cow::Owned(filtered_body);
         }
     }
 
     // No filtering needed - return original request
-    std::borrow::Cow::Borrowed(body)
+    Cow::Borrowed(body)
 }
 
 /// Process chat messages and apply template (shared by both routers)
@@ -1672,6 +1719,41 @@ mod tests {
         let input = r#"{"a": 1, "b": [2.5, "30000000000000000000000"], "c": -3e-5}"#;
         assert!(matches!(
             quote_unrepresentable_integers(input),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn test_numeric_object_keys_stay_untouched_and_invalid() {
+        // An (invalid) oversized numeric object KEY must not be quoted into
+        // valid JSON - only VALUE positions are rewritten.
+        let bad_key = r"{123456789012345678901234567890: 1}";
+        assert!(matches!(
+            quote_unrepresentable_integers(bad_key),
+            Cow::Borrowed(_)
+        ));
+        let mut messages = assistant_message_with_arguments(bad_key);
+        let err = process_tool_call_arguments(&mut messages)
+            .expect_err("numeric object keys must still be rejected");
+        assert!(
+            err.contains(bad_key),
+            "error should cite original text: {err}"
+        );
+
+        // The same oversized integer in VALUE positions is still guarded:
+        // object value, array element (first and after comma), nested.
+        let values = r#"{"k": 123456789012345678901234567890, "arr": [123456789012345678901234567890, 5, 123456789012345678901234567890]}"#;
+        let guarded = quote_unrepresentable_integers(values);
+        assert_eq!(
+            guarded,
+            r#"{"k": "123456789012345678901234567890", "arr": ["123456789012345678901234567890", 5, "123456789012345678901234567890"]}"#
+        );
+
+        // An object comma introduces a KEY, not a value - a numeric key after
+        // a valid pair stays untouched (and keeps failing downstream).
+        let bad_second_key = r#"{"a": 1, 123456789012345678901234567890: 2}"#;
+        assert!(matches!(
+            quote_unrepresentable_integers(bad_second_key),
             Cow::Borrowed(_)
         ));
     }
