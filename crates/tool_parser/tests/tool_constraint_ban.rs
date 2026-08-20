@@ -1,3 +1,8 @@
+#![expect(
+    clippy::expect_used,
+    reason = "test-only helpers outside #[test] fns; failures are test failures"
+)]
+
 //! Suppression-constraint coverage: the `tool_choice: "none"` ban tag.
 //!
 //! The ban is a structural tag whose format is free text excluding the
@@ -5,16 +10,15 @@
 //! model-native framing (and a curated opener inventory) produce one.
 
 use serde_json::Value;
-use tool_parser::{ParserFactory, ToolConstraint};
+use tool_parser::ParserFactory;
 
 fn ban_tag_json(factory: &ParserFactory, parser: &str) -> Value {
     let constraint = factory
         .registry()
         .tool_call_ban_constraint(Some(parser))
-        .unwrap_or_else(|| panic!("{parser} should produce a ban constraint"));
-    let ToolConstraint::StructuralTag(json) = constraint else {
-        panic!("ban constraint must be a structural tag");
-    };
+        .expect("parser should produce a ban constraint");
+    let (kind, json) = constraint.to_tuple();
+    assert_eq!(kind, "structural_tag", "ban constraint for {parser}");
     serde_json::from_str(&json).expect("ban tag must be valid JSON")
 }
 
