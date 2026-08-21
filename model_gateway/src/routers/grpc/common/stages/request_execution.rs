@@ -660,7 +660,9 @@ impl RequestExecutionStage {
         // KV-transfer window: prefill drain complete to decode send complete.
         let kv_window_start = Instant::now();
 
-        debug!("vLLM PD: prefill completed, sending decode request");
+        if !skip_prefill {
+            debug!("vLLM PD: prefill completed, sending decode request");
+        }
 
         if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
             decode_request.set_data_parallel_rank(rank as i32);
@@ -746,12 +748,16 @@ impl RequestExecutionStage {
                 prefill_duration,
             );
         }
-        Metrics::record_pd_kv_transfer_duration(
-            metrics_labels::BACKEND_PD,
-            model,
-            runtime,
-            kv_window_start.elapsed(),
-        );
+        // No prefill leg means no KV handoff: a decode-only dispatch must not
+        // put its near-zero send window into the transfer histogram either.
+        if !skip_prefill {
+            Metrics::record_pd_kv_transfer_duration(
+                metrics_labels::BACKEND_PD,
+                model,
+                runtime,
+                kv_window_start.elapsed(),
+            );
+        }
 
         // Prefill has completed and its KV blocks are held pending decode's
         // transfer; aborting decode mid-transfer on a client disconnect can
