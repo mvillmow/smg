@@ -301,7 +301,9 @@ jobs:
           echo "protobuf runtime: $(python -c 'import google.protobuf as p; print(p.__version__)')"
           if ! probe >/dev/null; then
             echo "grpc_health import failed:"
-            probe | tail -3
+            # `|| true`: probe exits nonzero by definition here, and pipefail
+            # would otherwise make this diagnostic line kill the step.
+            probe | tail -3 || true
             echo "raising the protobuf runtime..."
             pip install --upgrade "protobuf<8"
             echo "protobuf runtime now: $(python -c 'import google.protobuf as p; print(p.__version__)')"
