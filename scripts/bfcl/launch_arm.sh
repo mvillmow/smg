@@ -179,7 +179,14 @@ case "$ARM" in
     [ -n "$SMG_REASONING_PARSER" ] && smg_cmd+=(--reasoning-parser "$SMG_REASONING_PARSER")
     start arm_b_gateway "$RUN_DIR/arm_b_gateway.log" "${smg_cmd[@]}"
     log_tail=$(stream_log "$RUN_DIR/arm_b_gateway.log")
-    wait_http "http://127.0.0.1:$ARM_B_GW_PORT/health" "${BFCL_STARTUP_TIMEOUT:-420}"
+    # /readiness, not /health: the gateway autoloads each gRPC worker's tokenizer
+    # asynchronously AFTER the worker reports healthy, and generation 500s with
+    # `tokenizer_not_found` until that lands. /health flips as soon as the worker
+    # process is up, so scoring against it races the autoload and turns every
+    # early case into a server error — which BFCL then scores as a wrong answer
+    # rather than an infrastructure fault. /readiness is exactly the signal that
+    # holds until every gRPC worker's tokenizer is registered.
+    wait_http "http://127.0.0.1:$ARM_B_GW_PORT/readiness" "${BFCL_STARTUP_TIMEOUT:-420}"
     kill "$log_tail" 2>/dev/null || true
     echo "http://127.0.0.1:$ARM_B_GW_PORT"
     ;;

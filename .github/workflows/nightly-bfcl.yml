@@ -446,8 +446,19 @@ jobs:
               lines += ["", f"**Unweighted mean across {len(numeric)} categories: {sum(numeric) / len(numeric) * 100:.2f}%**"]
           if data.get("timed_out"):
               lines += ["", "> arm timed out — treat the table as partial."]
+          # A category at exactly zero is not a "low score": a working model and
+          # parser cannot miss every case, so it means the requests never really
+          # ran — an unloaded tokenizer, a dead worker, a frontend emitting
+          # nothing. Fail loudly, because BFCL scores an HTTP 500 as a wrong
+          # answer and the run would otherwise finish green and meaningless.
+          zeroed = [c for c, v in scores.items() if isinstance(v, (int, float)) and v == 0.0]
+          if zeroed:
+              lines += ["", f"> **zero-score categories: {', '.join(sorted(zeroed))}** — treated as a failed run."]
           open(md_out, "w").write("\n".join(lines) + "\n")
           json.dump({"mode": "smg_only", "smg": data}, open(json_out, "w"), indent=2)
+          if zeroed:
+              print("::error::BFCL scored 0.00% on " + ", ".join(sorted(zeroed)) + " — the arm did not serve requests successfully")
+              raise SystemExit(2)
           PYRENDER
           elif [ "$ARM_MODE" = sequential ]; then
             # Whole node per arm (TP=8), one at a time: each model needs all 8 GPUs
