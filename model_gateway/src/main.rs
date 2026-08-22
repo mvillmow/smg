@@ -2382,6 +2382,33 @@ mod tests {
         );
     }
 
+    /// `--tool-choice-none-ban` must flow into `RouterConfig` and survive
+    /// nesting into `ServerConfig.router_config` — the consumers (the gRPC
+    /// preparation stages) read it off `RouterConfig`. Two-path
+    /// config-plumbing guard, plus the off-by-default contract.
+    #[test]
+    fn tool_choice_none_ban_flows_into_both_configs() {
+        let cli = cli_args_from(&["--tool-choice-none-ban"]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            router_config.tool_choice_none_ban,
+            "tool_choice_none_ban must reach RouterConfig via to_router_config"
+        );
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(
+            server_config.router_config.tool_choice_none_ban,
+            "tool_choice_none_ban must survive into ServerConfig via to_server_config"
+        );
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            !defaults.tool_choice_none_ban,
+            "tool_choice_none_ban must default off"
+        );
+    }
+
     /// The overload thresholds must reach `RouterConfig` and survive nesting
     /// into `ServerConfig.router_config` — the consumer (load monitor) reads
     /// them off `RouterConfig`. Two-path config-plumbing guard.
