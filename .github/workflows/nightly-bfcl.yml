@@ -287,34 +287,24 @@ jobs:
         # grpcio-health-checking 1.82.0rc2 (pulled in because the sglang install
         # allows prereleases) declares protobuf>=6.33.5 but ships stubs generated
         # with 7.35.0 gencode. protobuf refuses a runtime older than the gencode,
-        # so importing grpc_health.v1 dies and the worker never binds its port.
-        # Raising the runtime is the compatible direction — newer runtime against
-        # older gencode is always allowed — and both smg and that package cap at
-        # <8, so this stays inside every declared constraint.
+        # so importing grpc_health dies and the sglang worker never binds its
+        # port — surfacing much later as an opaque "TIMEOUT waiting for grpc".
+        #
+        # Test the symptom rather than guess the requirement: try the import, and
+        # only if it fails raise the runtime. Newer runtime against older gencode
+        # is always allowed, and smg and grpcio-health-checking both cap at <8, so
+        # this stays inside every declared constraint. Failing here costs seconds;
+        # failing at launch costs a 4-GPU host and the startup timeout.
         run: |
           set -euo pipefail
-          need=$(python - <<'PYNEED'
-          import re
-          from importlib import metadata
-          try:
-              src = metadata.distribution("grpcio-health-checking").read_text("grpc_health/v1/health_pb2.py") or ""
-          except Exception:
-              src = ""
-          m = re.search(r"ValidateProtobufRuntimeVersion\(\s*[^,]+,\s*(\d+),\s*(\d+),\s*(\d+)", src)
-          print(f"{m.group(1)}.{m.group(2)}.{m.group(3)}" if m else "")
-          PYNEED
-          )
-          cur=$(python -c "import google.protobuf as p; print(p.__version__)")
-          echo "protobuf runtime=$cur health-stub gencode=${need:-unknown}"
-          # Gencode majors are offset by +1 from the runtime's (5.x gencode <-> 4.x
-          # runtime), so compare only when we could read it, and let pip resolve.
-          if [ -n "$need" ]; then
-            python - "$cur" "$need" <<'PYCMP' || pip install --upgrade "protobuf<8"
-          import sys
-          cur = tuple(int(x) for x in sys.argv[1].split(".")[:3])
-          need = tuple(int(x) for x in sys.argv[2].split(".")[:3])
-          sys.exit(0 if cur >= need else 1)
-          PYCMP
+          probe() { python -c "from grpc_health.v1 import health_pb2_grpc" 2>&1; }
+          echo "protobuf runtime: $(python -c 'import google.protobuf as p; print(p.__version__)')"
+          if ! probe >/dev/null; then
+            echo "grpc_health import failed:"
+            probe | tail -3
+            echo "raising the protobuf runtime..."
+            pip install --upgrade "protobuf<8"
+            echo "protobuf runtime now: $(python -c 'import google.protobuf as p; print(p.__version__)')"
           fi
           python -c "from grpc_health.v1 import health_pb2_grpc; print('grpc_health imports OK')"
       - name: Register model in bfcl (no-op if bfcl already ships a handler)
