@@ -283,6 +283,40 @@ jobs:
           pip uninstall -y smg || true
           pip install wheel/*.whl
           pip install "bfcl-eval" soundfile ninja
+      - name: Align protobuf runtime with the installed gencode
+        # grpcio-health-checking 1.82.0rc2 (pulled in because the sglang install
+        # allows prereleases) declares protobuf>=6.33.5 but ships stubs generated
+        # with 7.35.0 gencode. protobuf refuses a runtime older than the gencode,
+        # so importing grpc_health.v1 dies and the worker never binds its port.
+        # Raising the runtime is the compatible direction — newer runtime against
+        # older gencode is always allowed — and both smg and that package cap at
+        # <8, so this stays inside every declared constraint.
+        run: |
+          set -euo pipefail
+          need=$(python - <<'PYNEED'
+          import re
+          from importlib import metadata
+          try:
+              src = metadata.distribution("grpcio-health-checking").read_text("grpc_health/v1/health_pb2.py") or ""
+          except Exception:
+              src = ""
+          m = re.search(r"ValidateProtobufRuntimeVersion\(\s*[^,]+,\s*(\d+),\s*(\d+),\s*(\d+)", src)
+          print(f"{m.group(1)}.{m.group(2)}.{m.group(3)}" if m else "")
+          PYNEED
+          )
+          cur=$(python -c "import google.protobuf as p; print(p.__version__)")
+          echo "protobuf runtime=$cur health-stub gencode=${need:-unknown}"
+          # Gencode majors are offset by +1 from the runtime's (5.x gencode <-> 4.x
+          # runtime), so compare only when we could read it, and let pip resolve.
+          if [ -n "$need" ]; then
+            python - "$cur" "$need" <<'PYCMP' || pip install --upgrade "protobuf<8"
+          import sys
+          cur = tuple(int(x) for x in sys.argv[1].split(".")[:3])
+          need = tuple(int(x) for x in sys.argv[2].split(".")[:3])
+          sys.exit(0 if cur >= need else 1)
+          PYCMP
+          fi
+          python -c "from grpc_health.v1 import health_pb2_grpc; print('grpc_health imports OK')"
       - name: Register model in bfcl (no-op if bfcl already ships a handler)
         # The registration itself is best-effort (bfcl may already ship a
         # handler), but the RESULT is not: an unregistered id makes `bfcl
