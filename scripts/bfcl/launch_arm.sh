@@ -51,6 +51,14 @@ SMG_REASONING_PARSER="${BFCL_SMG_REASONING_PARSER:-}"
 # more stable under sustained bfcl load on shared/contended GPUs.
 VLLM_EXTRA="${BFCL_VLLM_EXTRA:-}"
 
+# Engine behind SMG on arm B: "vllm" (default) or "sglang". SMG serves either
+# over the same gRPC contract, so the arm is identical from BFCL's side. The
+# escape hatch exists for models the pinned vLLM cannot load — arm A is pure
+# vLLM and simply cannot run those, so such legs score arm B alone.
+ARM_B_WORKER="${BFCL_ARM_B_WORKER:-vllm}"
+SGLANG_PYTHON="${SGLANG_PYTHON:-python}"   # python that can `-m sglang.launch_server`
+SGLANG_EXTRA="${BFCL_SGLANG_EXTRA:-}"
+
 # Ports. Default to an OS-assigned free port (resolved per-arm in the case
 # below) so concurrent arms/jobs sharing a host — e.g. bin-packed CI runners
 # under hostNetwork — don't collide on a fixed port. Pin via env for a stable
@@ -125,16 +133,32 @@ case "$ARM" in
     ARM_B_GRPC_PORT="${ARM_B_GRPC_PORT:-$(free_port)}"
     ARM_B_GW_PORT="${ARM_B_GW_PORT:-$(free_port)}"
     ARM_B_METRICS_PORT="${ARM_B_METRICS_PORT:-$(free_port)}"
-    # 1) vLLM gRPC worker (raw-token; SMG will own template+parsing).
-    declare -a wcmd=(
-      CUDA_VISIBLE_DEVICES="$GPU" "$VLLM_PYTHON" -m vllm.entrypoints.grpc_server
-      --model "$MODEL_SRC" --served-model-name "$MODEL"
-      --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
-      --tensor-parallel-size "$TP" --max-model-len "$MAX_MODEL_LEN"
-      --gpu-memory-utilization "$GPU_MEM_UTIL"
-    )
-    # shellcheck disable=SC2206  # intentional word-split of optional extra flags
-    [ -n "$VLLM_EXTRA" ] && wcmd+=($VLLM_EXTRA)
+    # 1) gRPC worker (raw-token; SMG will own template+parsing).
+    if [ "$ARM_B_WORKER" = sglang ]; then
+      # --grpc-mode serves SMG's scheduler protocol, the same path the e2e
+      # sglang lanes use. max_model_len maps to --context-length; "auto" means
+      # "let the engine pick", so the flag is simply omitted.
+      declare -a wcmd=(
+        CUDA_VISIBLE_DEVICES="$GPU" "$SGLANG_PYTHON" -m sglang.launch_server
+        --model-path "$MODEL_SRC" --served-model-name "$MODEL"
+        --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
+        --tp-size "$TP" --mem-fraction-static "$GPU_MEM_UTIL"
+        --grpc-mode --log-level info
+      )
+      [ "$MAX_MODEL_LEN" != auto ] && wcmd+=(--context-length "$MAX_MODEL_LEN")
+      # shellcheck disable=SC2206  # intentional word-split of optional extra flags
+      [ -n "$SGLANG_EXTRA" ] && wcmd+=($SGLANG_EXTRA)
+    else
+      declare -a wcmd=(
+        CUDA_VISIBLE_DEVICES="$GPU" "$VLLM_PYTHON" -m vllm.entrypoints.grpc_server
+        --model "$MODEL_SRC" --served-model-name "$MODEL"
+        --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
+        --tensor-parallel-size "$TP" --max-model-len "$MAX_MODEL_LEN"
+        --gpu-memory-utilization "$GPU_MEM_UTIL"
+      )
+      # shellcheck disable=SC2206  # intentional word-split of optional extra flags
+      [ -n "$VLLM_EXTRA" ] && wcmd+=($VLLM_EXTRA)
+    fi
     start arm_b_worker "$RUN_DIR/arm_b_worker.log" "${wcmd[@]}"
     log_tail=$(stream_log "$RUN_DIR/arm_b_worker.log")
     wait_grpc "$ARM_B_GRPC_PORT" "${BFCL_STARTUP_TIMEOUT:-420}"
