@@ -72,6 +72,10 @@ ARM_B_METRICS_PORT="${BFCL_ARM_B_METRICS_PORT:-}" # SMG Prometheus port (default
 VLLM_BIN="${VLLM_BIN:-vllm}"                      # `vllm serve` console script
 VLLM_PYTHON="${VLLM_PYTHON:-python}"             # python that can `-m vllm.entrypoints.grpc_server`
 SMG_LAUNCH="${SMG_LAUNCH:-smg launch}"           # SMG launcher (binary subcmd or `python -m smg.launch_router`)
+# Raise to "debug" to capture what the parsers were handed. Off by default:
+# debug logs model output, which is user content, and a full BFCL category
+# produces a very large log.
+SMG_LOG_LEVEL="${BFCL_SMG_LOG_LEVEL:-}"
 
 mkdir -p "$RUN_DIR"
 
@@ -195,6 +199,7 @@ case "$ARM" in
     # Empty => omit, so SMG auto-detects (e.g. gpt-oss → harmony pipeline).
     [ -n "$SMG_TOOL_PARSER" ] && smg_cmd+=(--tool-call-parser "$SMG_TOOL_PARSER")
     [ -n "$SMG_REASONING_PARSER" ] && smg_cmd+=(--reasoning-parser "$SMG_REASONING_PARSER")
+    [ -n "$SMG_LOG_LEVEL" ] && smg_cmd+=(--log-level "$SMG_LOG_LEVEL")
     start arm_b_gateway "$RUN_DIR/arm_b_gateway.log" "${smg_cmd[@]}"
     log_tail=$(stream_log "$RUN_DIR/arm_b_gateway.log")
     # /readiness, not /health: the gateway autoloads each gRPC worker's tokenizer

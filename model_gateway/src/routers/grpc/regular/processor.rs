@@ -21,7 +21,7 @@ use openai_protocol::{
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::routers::{
     error,
@@ -355,6 +355,25 @@ impl ResponseProcessor {
                 .await
             // Lock is dropped here
         };
+
+        // "The model called one tool when it should have called two" is only
+        // answerable with the bytes the parser was handed, and by the time a
+        // report reaches us the generation is gone. Behind debug because this
+        // is model output and therefore user content.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let found = match &result {
+                Ok((_, calls)) => calls.len(),
+                Err(_) => 0,
+            };
+            debug!(
+                model = %model,
+                parser = ?tool_parser_name,
+                tool_calls_found = found,
+                text_len = processed_text.len(),
+                text = %processed_text,
+                "tool parse input and outcome"
+            );
+        }
 
         match result {
             Ok((normal_text, parsed_tool_calls)) => {

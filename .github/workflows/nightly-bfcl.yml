@@ -54,6 +54,10 @@ on:
         description: "Override per-arm `bfcl generate`/`evaluate` wall-clock cap in seconds (0 = uncapped); empty = matrix default"
         required: false
         default: ""
+      smg_log_level:
+        description: "SMG gateway log level for arm B (e.g. debug to capture what the parsers were handed); empty = default"
+        required: false
+        default: ""
 
 concurrency:
   group: nightly-bfcl-${{ github.event_name }}-${{ github.ref }}
@@ -359,6 +363,7 @@ jobs:
           GPU_B: ${{ matrix.gpu_b }}
           # Per-leg health-wait budget: big MoEs need minutes for load + compile + quant.
           BFCL_STARTUP_TIMEOUT: ${{ matrix.startup_timeout }}
+          BFCL_SMG_LOG_LEVEL: ${{ github.event.inputs.smg_log_level || '' }}
           RUN_TIMEOUT: ${{ github.event.inputs.run_timeout || matrix.run_timeout }}
           # Arm logs + pidfiles under RUNNER_TEMP (per-job, uploadable) not /tmp.
           BFCL_RUN_DIR: ${{ runner.temp }}/bfcl_run
@@ -546,8 +551,11 @@ jobs:
             ${{ runner.temp }}/bfcl_transcripts.tgz
           if-no-files-found: warn
           retention-days: 30
-      - name: Upload arm logs (failure only)
-        if: failure()
+      - name: Upload arm logs
+        # Not failure-only: a run can succeed and still be worth explaining
+        # (a category scoring far below its peers), and the arm logs are the
+        # only record of what the parsers were handed.
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: bfcl-ab-${{ matrix.name }}-logs-${{ github.run_id }}
