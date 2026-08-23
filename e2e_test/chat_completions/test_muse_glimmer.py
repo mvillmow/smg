@@ -87,9 +87,13 @@ class TestMuseGlimmerParsing:
         )
 
         message = response.choices[0].message
+        reasoning = getattr(message, "reasoning_content", None)
         assert_no_framing("content", message.content)
-        assert_no_framing("reasoning_content", getattr(message, "reasoning_content", None))
+        assert_no_framing("reasoning_content", reasoning)
         assert message.content, "expected a user-facing answer"
+        # Without this the test passes if the parser drops every to=self segment:
+        # the answer still arrives, framing-free, and nothing else notices.
+        assert reasoning, "expected reasoning_content with separate_reasoning enabled"
 
     def test_streaming_never_leaks_framing(self, model, api_client):
         """Streaming deltas must not surface framing, even mid-marker.
@@ -119,6 +123,9 @@ class TestMuseGlimmerParsing:
         assert_no_framing("streamed content", content)
         assert_no_framing("streamed reasoning", reasoning)
         assert content, "expected streamed answer text"
+        # Same gap as the non-streaming case: assert_no_framing returns early on
+        # an empty string, so silently dropping every to=self delta would pass.
+        assert reasoning, "expected streamed reasoning_content"
 
     def test_tool_call_is_parsed(self, model, api_client):
         """An ATEM call in a tool channel becomes a structured tool_call."""

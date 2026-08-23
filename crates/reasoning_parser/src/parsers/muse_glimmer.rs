@@ -225,7 +225,14 @@ impl MuseGlimmerParser {
         if token == START {
             // Opens a new header regardless of what preceded it. A tool segment
             // whose terminator never arrived ends here rather than absorbing the
-            // next segment.
+            // next segment — but the tool parser downstream only sees the bytes
+            // we emit, and an unterminated segment there swallows whatever
+            // follows it, so close the segment explicitly on the way out.
+            // Without this a truncated call is followed by the model's answer
+            // being absorbed into the tool body and dropped entirely.
+            if self.state == State::Tool {
+                result.normal_text.push_str(EOM);
+            }
             self.header.clear();
             self.state = State::Header;
             return;
@@ -725,6 +732,26 @@ mod tests {
         let parser = MuseGlimmerParser::new();
         assert_eq!(parser.model_type(), "muse_glimmer");
         assert!(parser.requires_special_tokens());
+    }
+
+    /// Regression: a tool segment interrupted by the next `<|start|>` — the
+    /// model abandoned the call without its terminator — must still be closed
+    /// on the way out. The tool parser only sees what we emit, and an
+    /// unterminated segment there absorbs the following answer and drops it.
+    #[test]
+    fn interrupted_tool_segment_is_closed_before_the_next_one() {
+        let output = format!(
+            " to=get_weather{MESSAGE}{CALL_BODY}{START}assistant to=user{MESSAGE}It is sunny.{EOT}"
+        );
+
+        let mut parser = MuseGlimmerParser::new();
+        let result = parser.detect_and_parse_reasoning(&output).unwrap();
+
+        assert_eq!(
+            result.normal_text,
+            format!("{}It is sunny.", segment("get_weather", CALL_BODY, EOM)),
+            "the tool segment must carry a terminator before the answer"
+        );
     }
 
     #[test]

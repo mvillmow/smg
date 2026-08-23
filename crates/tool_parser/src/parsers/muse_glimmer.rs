@@ -393,11 +393,14 @@ impl MuseGlimmerParser {
 
     /// Segmenting never fails: unparsable input degrades to normal text, so
     /// this returns the pair directly and the trait methods wrap it.
+    ///
+    /// Always segments, even with no ATEM markup in sight. Short-circuiting on
+    /// `has_tool_markers` would return the raw bytes — framing and any `to=self`
+    /// body included — for a turn that reasoned and answered without calling a
+    /// tool, and would disagree with `parse_incremental`, which has no such
+    /// shortcut. Unframed plain text still round-trips unchanged: the scanner's
+    /// leading-header valve flushes it verbatim.
     fn parse_complete_inner(&self, text: &str, tools: &[Tool]) -> (String, Vec<ToolCall>) {
-        if !self.has_tool_markers(text) {
-            return (text.to_string(), vec![]);
-        }
-
         let scan = self.scan(text, tools, true);
         (scan.normal_text, scan.calls)
     }
@@ -976,6 +979,53 @@ mod tests {
         let result = parser.parse_incremental(&text, &[]).await.unwrap();
         assert_eq!(result.calls.len(), 1);
         assert_eq!(result.calls[0].tool_index, 0);
+    }
+
+    /// A turn that reasoned and answered without calling a tool still has full
+    /// framing. Returning it verbatim would leak `<|start|>` and the private
+    /// chain-of-thought to the client, and would differ from the streaming path.
+    #[tokio::test]
+    async fn framed_turn_without_calls_is_still_segmented() {
+        let text = format!(
+            "{}{}",
+            segment("self", "No tool applies here.", EOM),
+            segment("user", "Paris is the capital of France.", EOT)
+        );
+
+        let (normal, calls) = MuseGlimmerParser::new()
+            .parse_complete(&text)
+            .await
+            .unwrap();
+
+        assert!(calls.is_empty());
+        assert_eq!(normal, "Paris is the capital of France.");
+        assert!(!normal.contains("<|"), "framing must not leak: {normal:?}");
+        assert!(
+            !normal.contains("No tool applies"),
+            "reasoning must not surface"
+        );
+    }
+
+    /// The complete and streaming paths must derive the same normal text.
+    #[tokio::test]
+    async fn complete_and_streaming_agree_on_a_callless_framed_turn() {
+        let text = format!(
+            "{}{}",
+            segment("self", "thinking", EOM),
+            segment("user", "the answer", EOT)
+        );
+
+        let (complete, _) = MuseGlimmerParser::new()
+            .parse_complete(&text)
+            .await
+            .unwrap();
+        let streamed = MuseGlimmerParser::new()
+            .parse_incremental(&text, &[])
+            .await
+            .unwrap()
+            .normal_text;
+
+        assert_eq!(complete, streamed);
     }
 
     #[test]
