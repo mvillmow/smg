@@ -108,6 +108,19 @@ free_port() {  # OS-assigned free TCP port (same idiom as the e2e infra's get_op
   python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()'
 }
 
+# A free port low enough that a +10000 derivation still lands in range. sglang
+# derives its native gRPC port that way, so an OS-assigned port above 55535
+# makes it refuse to start — a flake that only shows up on unlucky draws.
+free_low_port() {
+  local p
+  for _ in $(seq 1 20); do
+    p=$(free_port)
+    if [ "$p" -le 55000 ]; then echo "$p"; return 0; fi
+  done
+  echo "[launch_arm] no free port <=55000 after 20 tries" >&2
+  return 1
+}
+
 case "$ARM" in
   a)
     ARM_A_PORT="${ARM_A_PORT:-$(free_port)}"
@@ -130,7 +143,12 @@ case "$ARM" in
     ;;
 
   b)
-    ARM_B_GRPC_PORT="${ARM_B_GRPC_PORT:-$(free_port)}"
+    # sglang derives a second port from this one, so keep it in the low range.
+    if [ "$ARM_B_WORKER" = sglang ]; then
+      ARM_B_GRPC_PORT="${ARM_B_GRPC_PORT:-$(free_low_port)}"
+    else
+      ARM_B_GRPC_PORT="${ARM_B_GRPC_PORT:-$(free_port)}"
+    fi
     ARM_B_GW_PORT="${ARM_B_GW_PORT:-$(free_port)}"
     ARM_B_METRICS_PORT="${ARM_B_METRICS_PORT:-$(free_port)}"
     # 1) gRPC worker (raw-token; SMG will own template+parsing).
@@ -143,7 +161,7 @@ case "$ARM" in
         --model-path "$MODEL_SRC" --served-model-name "$MODEL"
         --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
         --tp-size "$TP" --mem-fraction-static "$GPU_MEM_UTIL"
-        --grpc-mode --log-level info
+        --smg-grpc-mode --log-level info
       )
       [ "$MAX_MODEL_LEN" != auto ] && wcmd+=(--context-length "$MAX_MODEL_LEN")
       # shellcheck disable=SC2206  # intentional word-split of optional extra flags
