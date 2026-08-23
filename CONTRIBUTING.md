@@ -101,6 +101,12 @@ Signed-off-by: Your Name <your.email@example.com>
   Example: `Fixed in abc1234 — capped total_chunks at 1024 before allocation`.
   Silence or "Fixed!" makes reviewers re-hunt your work.
 
+For a public-contract change, identify the affected Rust package, HTTP/OpenAPI,
+protobuf, CLI/config, generated-client, or release surface in the PR description.
+State whether the change is additive, deprecated-compatible, or breaking; include
+the version decision and migration note when required by
+[`docs/api-stability.md`](docs/api-stability.md).
+
 ---
 
 ## Using code agents (Claude Code, Cursor, Copilot, etc.)
