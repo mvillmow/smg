@@ -52,16 +52,28 @@ owner = "CODEOWNERS"
 
     assert module.load_inventory(inventory) == [
         module.InventoryEntry(
-            "smg-client", "clients/rust", "public-sdk", True,
-            "release-crates", "CODEOWNERS",
+            "smg-client",
+            "clients/rust",
+            "public-sdk",
+            True,
+            "release-crates",
+            "CODEOWNERS",
         ),
         module.InventoryEntry(
-            "smg", "model_gateway", "external-application", False,
-            "release-crates", "CODEOWNERS",
+            "smg",
+            "model_gateway",
+            "external-application",
+            False,
+            "release-crates",
+            "CODEOWNERS",
         ),
         module.InventoryEntry(
-            "smg-python", "bindings/python", "version-locked-binding", False,
-            "none", "CODEOWNERS",
+            "smg-python",
+            "bindings/python",
+            "version-locked-binding",
+            False,
+            "none",
+            "CODEOWNERS",
         ),
     ]
 
@@ -127,8 +139,12 @@ def test_unclassified_crate_is_an_error(tmp_path: Path) -> None:
     ]
     entries = [
         module.InventoryEntry(
-            "known", "crates/known", "published-library", True,
-            "release-crates", "CODEOWNERS",
+            "known",
+            "crates/known",
+            "published-library",
+            True,
+            "release-crates",
+            "CODEOWNERS",
         )
     ]
 
@@ -140,10 +156,18 @@ def test_unclassified_crate_is_an_error(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("publishable", "classification", "semver", "expected"),
     [
-        (True, "quality-only", False,
-         "publishable crate known must be classified published-library"),
-        (False, "published-library", True,
-         "private crate known cannot be classified published-library"),
+        (
+            True,
+            "quality-only",
+            False,
+            "publishable crate known must be classified published-library",
+        ),
+        (
+            False,
+            "published-library",
+            True,
+            "private crate known cannot be classified published-library",
+        ),
     ],
 )
 def test_publish_state_must_match_classification(
@@ -151,33 +175,131 @@ def test_publish_state_must_match_classification(
 ) -> None:
     module = _load()
     packages = [module.PackageRecord("known", "crates/known", publishable, True)]
-    entries = [module.InventoryEntry(
-        "known", "crates/known", classification, semver,
-        "release-crates" if publishable else "none", "CODEOWNERS",
-    )]
+    entries = [
+        module.InventoryEntry(
+            "known",
+            "crates/known",
+            classification,
+            semver,
+            "release-crates" if publishable else "none",
+            "CODEOWNERS",
+        )
+    ]
+
+    assert expected in module.validate_inventory(packages, entries)
+
+
+@pytest.mark.parametrize(
+    ("semver", "release", "expected"),
+    [
+        (
+            False,
+            "release-crates",
+            "published-library package known must set semver = true",
+        ),
+        (
+            True,
+            "none",
+            'published-library package known must set release = "release-crates"',
+        ),
+    ],
+)
+def test_published_library_requires_semver_and_release_governance(
+    semver: bool, release: str, expected: str
+) -> None:
+    module = _load()
+    packages = [module.PackageRecord("known", "crates/known", True, True)]
+    entries = [
+        module.InventoryEntry(
+            "known",
+            "crates/known",
+            "published-library",
+            semver,
+            release,
+            "CODEOWNERS",
+        )
+    ]
 
     assert expected in module.validate_inventory(packages, entries)
 
 
 def test_publishable_crate_missing_from_release_workflow_fails() -> None:
     module = _load()
-    entries = [module.InventoryEntry(
-        "engine-zmq-client", "crates/engine_zmq_client", "published-library",
-        True, "release-crates", "CODEOWNERS",
-    )]
+    entries = [
+        module.InventoryEntry(
+            "engine-zmq-client",
+            "crates/engine_zmq_client",
+            "published-library",
+            True,
+            "release-crates",
+            "CODEOWNERS",
+        )
+    ]
 
     assert module.validate_release_coverage(entries, {"openai-protocol"}) == [
         "publishable crate missing from release-crates workflow: engine-zmq-client"
     ]
 
 
+def test_version_registry_crates_reads_only_the_crates_array() -> None:
+    module = _load()
+    registry_text = """\
+CRATES=(
+    "known|crates/known|known"
+    "openapi-gen|clients/openapi-gen|-"
+)
+
+PYTHON_PACKAGES=(
+    "ignored|python/ignored|python/ignored/pyproject.toml"
+)
+"""
+
+    assert module.version_registry_crates(registry_text) == {
+        "known": "crates/known",
+        "openapi-gen": "clients/openapi-gen",
+    }
+
+
+@pytest.mark.parametrize(
+    ("registry_text", "expected"),
+    [
+        (
+            'CRATES=(\n    "other|crates/other|other"\n)\n',
+            "release-governed package missing from version registry: known",
+        ),
+        (
+            'CRATES=(\n    "known|crates/not_known|known"\n)\n',
+            "version registry path mismatch for known: "
+            "expected crates/known, found crates/not_known",
+        ),
+    ],
+)
+def test_release_governed_package_requires_version_registry_coverage(
+    registry_text: str, expected: str
+) -> None:
+    module = _load()
+    entries = [
+        module.InventoryEntry(
+            "known",
+            "crates/known",
+            "published-library",
+            True,
+            "release-crates",
+            "CODEOWNERS",
+        )
+    ]
+
+    registry = module.version_registry_crates(registry_text)
+    assert module.validate_version_registry_coverage(entries, registry) == [expected]
+
+
 def test_render_inventory_is_sorted_and_marks_semver() -> None:
     module = _load()
     entries = [
-        module.InventoryEntry("zeta", "crates/zeta", "quality-only", False,
-                              "none", "CODEOWNERS"),
-        module.InventoryEntry("alpha", "crates/alpha", "published-library", True,
-                              "release-crates", "CODEOWNERS"),
+        module.InventoryEntry("zeta", "crates/zeta", "quality-only", False, "none", "CODEOWNERS"),
+        module.InventoryEntry(
+            "alpha", "crates/alpha", "published-library", True, "release-crates", "CODEOWNERS"
+        ),
     ]
 
     rendered = module.render_inventory(entries)

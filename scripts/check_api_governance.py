@@ -9,19 +9,28 @@ import re
 import subprocess
 import sys
 import tomllib
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
-
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_PATH = REPO_ROOT / "governance/api-surfaces.toml"
 RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github/workflows/release-crates.yml"
+VERSION_REGISTRY_PATH = REPO_ROOT / "scripts/check_release_versions.sh"
 INVENTORY_DOC_PATH = REPO_ROOT / "docs/api-surface-inventory.md"
 
-RELEASE_CRATE = re.compile(
-    r"^\s*(?:-\s*)?crate:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE
+RELEASE_CRATE = re.compile(r"^\s*(?:-\s*)?crate:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
+VERSION_REGISTRY_ENTRY = re.compile(
+    r'^\s*"([A-Za-z0-9_-]+)\|([A-Za-z0-9_./-]+)\|([A-Za-z0-9_-]+)"\s*$'
 )
+CLASSIFICATION_RULES = {
+    "published-library": (True, "release-crates"),
+    "quality-only": (False, "none"),
+    "public-sdk": (True, "release-crates"),
+    "external-application": (False, "release-crates"),
+    "version-locked-binding": (False, "core-version-sync"),
+}
 
 
 @dataclass(frozen=True)
@@ -58,9 +67,7 @@ def load_inventory(path: Path) -> list[InventoryEntry]:
     ]
 
 
-def packages_from_metadata(
-    metadata: dict[str, Any], repo_root: Path
-) -> list[PackageRecord]:
+def packages_from_metadata(metadata: dict[str, Any], repo_root: Path) -> list[PackageRecord]:
     """Normalize direct ``crates/<directory>`` Cargo packages."""
     root = repo_root.resolve()
     packages: list[PackageRecord] = []
@@ -81,8 +88,7 @@ def packages_from_metadata(
                 path=relative_path.as_posix(),
                 publishable=package.get("publish") != [],
                 has_lib_target=any(
-                    "lib" in target.get("kind", [])
-                    for target in package.get("targets", [])
+                    "lib" in target.get("kind", []) for target in package.get("targets", [])
                 ),
             )
         )
@@ -93,6 +99,37 @@ def packages_from_metadata(
 def release_crates(workflow_text: str) -> set[str]:
     """Return crate names from release-workflow matrix and input entries."""
     return set(RELEASE_CRATE.findall(workflow_text))
+
+
+def version_registry_crates(script_text: str) -> dict[str, str]:
+    """Return package-to-path mappings from the shell script's ``CRATES`` array."""
+    registry: dict[str, str] = {}
+    in_crates = False
+
+    for line_number, line in enumerate(script_text.splitlines(), start=1):
+        stripped = line.strip()
+        if not in_crates:
+            if stripped == "CRATES=(":
+                in_crates = True
+            continue
+
+        if stripped == ")":
+            return registry
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        match = VERSION_REGISTRY_ENTRY.fullmatch(line)
+        if match is None:
+            raise ValueError(f"invalid CRATES registry entry on line {line_number}")
+
+        name, path, _workspace_dependency = match.groups()
+        if name in registry:
+            raise ValueError(f"duplicate CRATES registry package: {name}")
+        registry[name] = path
+
+    if in_crates:
+        raise ValueError("unterminated CRATES registry array")
+    raise ValueError("CRATES registry array not found")
 
 
 def validate_inventory(
@@ -117,12 +154,30 @@ def validate_inventory(
     packages_by_name = {package.name: package for package in packages}
     packages_by_path = {package.path: package for package in packages}
 
+    for entry in sorted(entries, key=lambda item: item.name):
+        rule = CLASSIFICATION_RULES.get(entry.classification)
+        if rule is None:
+            errors.append(
+                f"unsupported inventory classification for {entry.name}: {entry.classification}"
+            )
+            continue
+
+        expected_semver, expected_release = rule
+        if entry.semver != expected_semver:
+            errors.append(
+                f"{entry.classification} package {entry.name} must set semver = "
+                f"{'true' if expected_semver else 'false'}"
+            )
+        if entry.release != expected_release:
+            errors.append(
+                f"{entry.classification} package {entry.name} must set release = "
+                f'"{expected_release}"'
+            )
+
     for package in sorted(packages, key=lambda item: item.name):
         entry = entries_by_name.get(package.name)
         if entry is None:
-            errors.append(
-                f"unclassified crates/ package: {package.name} ({package.path})"
-            )
+            errors.append(f"unclassified crates/ package: {package.name} ({package.path})")
             continue
 
         if entry.path != package.path:
@@ -132,15 +187,9 @@ def validate_inventory(
             )
 
         if package.publishable and entry.classification != "published-library":
-            errors.append(
-                f"publishable crate {package.name} must be classified "
-                "published-library"
-            )
+            errors.append(f"publishable crate {package.name} must be classified published-library")
         if not package.publishable and entry.classification == "published-library":
-            errors.append(
-                f"private crate {package.name} cannot be classified "
-                "published-library"
-            )
+            errors.append(f"private crate {package.name} cannot be classified published-library")
         if entry.classification == "published-library" and not package.has_lib_target:
             errors.append(f"published-library crate {package.name} has no lib target")
 
@@ -152,8 +201,7 @@ def validate_inventory(
         package_by_path = packages_by_path.get(entry.path)
         if package_by_name is None and package_by_path is None:
             errors.append(
-                f"inventory references missing crates/ package: "
-                f"{entry.name} ({entry.path})"
+                f"inventory references missing crates/ package: {entry.name} ({entry.path})"
             )
 
     return errors
@@ -168,6 +216,26 @@ def validate_release_coverage(
         for entry in sorted(entries, key=lambda item: item.name)
         if entry.release == "release-crates" and entry.name not in workflow_crates
     ]
+
+
+def validate_version_registry_coverage(
+    entries: Sequence[InventoryEntry], registry_crates: Mapping[str, str]
+) -> list[str]:
+    """Return release-governed entries missing from or drifting in CRATES."""
+    errors: list[str] = []
+    for entry in sorted(entries, key=lambda item: item.name):
+        if entry.release != "release-crates":
+            continue
+
+        registry_path = registry_crates.get(entry.name)
+        if registry_path is None:
+            errors.append(f"release-governed package missing from version registry: {entry.name}")
+        elif registry_path != entry.path:
+            errors.append(
+                f"version registry path mismatch for {entry.name}: "
+                f"expected {entry.path}, found {registry_path}"
+            )
+    return errors
 
 
 def render_inventory(entries: Sequence[InventoryEntry]) -> str:
@@ -235,6 +303,8 @@ def _run(command: str) -> list[str]:
 
     workflow_crates = release_crates(RELEASE_WORKFLOW_PATH.read_text())
     errors.extend(validate_release_coverage(entries, workflow_crates))
+    registry_crates = version_registry_crates(VERSION_REGISTRY_PATH.read_text())
+    errors.extend(validate_version_registry_coverage(entries, registry_crates))
     if not INVENTORY_DOC_PATH.exists() or INVENTORY_DOC_PATH.read_text() != rendered:
         errors.append(
             "generated API surface inventory is out of date; "
@@ -244,9 +314,7 @@ def _run(command: str) -> list[str]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Validate SMG API surface governance"
-    )
+    parser = argparse.ArgumentParser(description="Validate SMG API surface governance")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--write-doc", action="store_true")
