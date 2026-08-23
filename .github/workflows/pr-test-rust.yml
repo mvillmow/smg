@@ -70,11 +70,8 @@ jobs:
       - name: Ruff format check
         run: ruff format --check e2e_test/ bindings/python/ scripts/
 
-      # Nothing ran these before, so the guards under scripts/tests/ were dead
-      # weight — including the one added with the BFCL grading fix, which was
-      # written to stop a 38-point mis-scoring bug from returning and had never
-      # once executed in CI. They are pure-Python and take under a second, so
-      # they belong in the lint job rather than behind a GPU lane.
+      # Exercise the pure-Python scoring and workflow-wiring guards without
+      # putting them behind a GPU lane; the suite completes in under a second.
       - name: Pytest (scripts/tests)
         run: pytest scripts/tests/ -q
 
