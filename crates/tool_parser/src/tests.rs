@@ -739,7 +739,7 @@ mod qwen_xml_tests {
 }
 
 #[cfg(test)]
-mod qwen_mapping_tests {
+mod model_mapping_tests {
     use crate::factory::ParserFactory;
 
     #[test]

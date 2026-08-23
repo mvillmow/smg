@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use async_trait::async_trait;
 use openai_protocol::common::Tool;
 use regex::Regex;
@@ -35,9 +37,6 @@ use crate::{
 /// "is not expected to be valid XML" and that "spaces for string values are not
 /// stripped".
 pub struct MuseGlimmerParser {
-    invoke_pattern: Regex,
-    param_pattern: Regex,
-
     /// Streaming buffer; the whole thing is re-scanned on every chunk.
     buffer: String,
     /// Bytes of derived normal text already returned to the caller.
@@ -52,6 +51,26 @@ const EOM: &str = "<|eom|>";
 const EOT: &str = "<|eot|>";
 const FUNCTION_CALLS_OPEN: &str = "<atem:function_calls>";
 const INVOKE_OPEN: &str = "<atem:invoke";
+
+#[expect(
+    clippy::expect_used,
+    reason = "regex pattern is a compile-time string literal"
+)]
+static INVOKE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)<atem:invoke\b[^>]*?\bname="([^"]*)"[^>]*?>(.*?)</atem:invoke>"#)
+        .expect("valid ATEM invoke pattern")
+});
+
+#[expect(
+    clippy::expect_used,
+    reason = "regex pattern is a compile-time string literal"
+)]
+static PARAM_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    // `[^"]*` rather than `[^"]+` so a malformed empty name still matches and
+    // the scan advances past it instead of stalling.
+    Regex::new(r#"(?s)<atem:parameter\b[^>]*?\bname="([^"]*)"[^>]*?>(.*?)</atem:parameter>"#)
+        .expect("valid ATEM parameter pattern")
+});
 
 const SELF_RECIPIENT: &str = "self";
 const USER_RECIPIENT: &str = "user";
@@ -140,24 +159,8 @@ fn coerce_atem_value(raw: &str, declared_type: Option<&str>) -> Value {
 }
 
 impl MuseGlimmerParser {
-    #[expect(
-        clippy::expect_used,
-        reason = "regex patterns are compile-time string literals"
-    )]
     pub fn new() -> Self {
-        let invoke_pattern =
-            Regex::new(r#"(?s)<atem:invoke\b[^>]*?\bname="([^"]*)"[^>]*?>(.*?)</atem:invoke>"#)
-                .expect("Valid ATEM invoke pattern");
-        // `[^"]*` rather than `[^"]+` so a malformed empty name still matches and
-        // the scan advances past it instead of stalling.
-        let param_pattern = Regex::new(
-            r#"(?s)<atem:parameter\b[^>]*?\bname="([^"]*)"[^>]*?>(.*?)</atem:parameter>"#,
-        )
-        .expect("Valid ATEM parameter pattern");
-
         Self {
-            invoke_pattern,
-            param_pattern,
             buffer: String::new(),
             emitted_normal_len: 0,
             sent_tool_call_count: 0,
@@ -248,10 +251,10 @@ impl MuseGlimmerParser {
     }
 
     /// Extract every complete `<atem:invoke>` from a tool-channel body.
-    fn extract_calls(&self, body: &str, tools: &[Tool]) -> Vec<ToolCall> {
+    fn extract_calls(body: &str, tools: &[Tool]) -> Vec<ToolCall> {
         let mut calls = Vec::new();
 
-        for capture in self.invoke_pattern.captures_iter(body) {
+        for capture in INVOKE_PATTERN.captures_iter(body) {
             let (Some(name_match), Some(inner_match)) = (capture.get(1), capture.get(2)) else {
                 continue;
             };
@@ -262,7 +265,7 @@ impl MuseGlimmerParser {
 
             let param_types = helpers::param_types_for_function(tools, &name);
             let mut parameters = serde_json::Map::new();
-            for param in self.param_pattern.captures_iter(inner_match.as_str()) {
+            for param in PARAM_PATTERN.captures_iter(inner_match.as_str()) {
                 if let (Some(key), Some(value)) = (param.get(1), param.get(2)) {
                     let key = key.as_str().to_string();
                     let declared = param_types.get(&key).map(String::as_str);
@@ -282,11 +285,11 @@ impl MuseGlimmerParser {
     /// Close a tool segment: harvest its calls, and if it produced none while
     /// being complete, give the body back as normal text rather than dropping
     /// it or leaking its framing.
-    fn close_tool_segment(&self, body: &mut String, closed: bool, tools: &[Tool], scan: &mut Scan) {
+    fn close_tool_segment(body: &mut String, closed: bool, tools: &[Tool], scan: &mut Scan) {
         if body.is_empty() {
             return;
         }
-        let calls = self.extract_calls(body, tools);
+        let calls = Self::extract_calls(body, tools);
         if calls.is_empty() {
             if closed {
                 scan.normal_text.push_str(body);
@@ -320,10 +323,10 @@ impl MuseGlimmerParser {
 
     /// Segment `text` and derive normal text plus complete calls.
     ///
-    /// Pure in `&self`: pooled parsers are shared across requests, and the
-    /// streaming path re-runs this over the whole buffer on every chunk, so the
-    /// derived normal text must only ever grow.
-    fn scan(&self, text: &str, tools: &[Tool], finalize: bool) -> Scan {
+    /// Pure: pooled parsers are shared across requests, and the streaming path
+    /// re-runs this over the whole buffer on every chunk, so the derived normal
+    /// text must only ever grow.
+    fn scan(text: &str, tools: &[Tool], finalize: bool) -> Scan {
         let mut scan = Scan::default();
         let mut state = State::LeadingHeader;
         let mut header = String::new();
@@ -359,7 +362,7 @@ impl MuseGlimmerParser {
             if token == START {
                 // Opens a new header whatever preceded it, so a tool segment
                 // whose terminator never arrived ends here.
-                self.close_tool_segment(&mut tool_body, true, tools, &mut scan);
+                Self::close_tool_segment(&mut tool_body, true, tools, &mut scan);
                 header.clear();
                 state = State::Header;
             } else if matches!(state, State::LeadingHeader | State::Header) {
@@ -373,7 +376,7 @@ impl MuseGlimmerParser {
                 }
             } else if token == EOM || token == EOT {
                 if state == State::Tool {
-                    self.close_tool_segment(&mut tool_body, true, tools, &mut scan);
+                    Self::close_tool_segment(&mut tool_body, true, tools, &mut scan);
                 }
                 state = State::Idle;
             } else if state == State::Tool {
@@ -386,7 +389,7 @@ impl MuseGlimmerParser {
 
         // A tool segment still open at end-of-input can already have produced
         // complete calls; surface those without giving up its body.
-        self.close_tool_segment(&mut tool_body, finalize, tools, &mut scan);
+        Self::close_tool_segment(&mut tool_body, finalize, tools, &mut scan);
 
         scan
     }
@@ -400,8 +403,8 @@ impl MuseGlimmerParser {
     /// tool, and would disagree with `parse_incremental`, which has no such
     /// shortcut. Unframed plain text still round-trips unchanged: the scanner's
     /// leading-header valve flushes it verbatim.
-    fn parse_complete_inner(&self, text: &str, tools: &[Tool]) -> (String, Vec<ToolCall>) {
-        let scan = self.scan(text, tools, true);
+    fn parse_complete_inner(text: &str, tools: &[Tool]) -> (String, Vec<ToolCall>) {
+        let scan = Self::scan(text, tools, true);
         (scan.normal_text, scan.calls)
     }
 }
@@ -415,7 +418,7 @@ impl Default for MuseGlimmerParser {
 #[async_trait]
 impl ToolParser for MuseGlimmerParser {
     async fn parse_complete(&self, output: &str) -> ParserResult<(String, Vec<ToolCall>)> {
-        Ok(self.parse_complete_inner(output, &[]))
+        Ok(Self::parse_complete_inner(output, &[]))
     }
 
     async fn parse_complete_with_tools(
@@ -423,7 +426,7 @@ impl ToolParser for MuseGlimmerParser {
         output: &str,
         tools: &[Tool],
     ) -> ParserResult<(String, Vec<ToolCall>)> {
-        Ok(self.parse_complete_inner(output, tools))
+        Ok(Self::parse_complete_inner(output, tools))
     }
 
     async fn parse_incremental(
@@ -433,7 +436,7 @@ impl ToolParser for MuseGlimmerParser {
     ) -> ParserResult<StreamingParseResult> {
         self.buffer.push_str(chunk);
 
-        let scan = self.scan(&self.buffer, tools, false);
+        let scan = Self::scan(&self.buffer, tools, false);
 
         // The derived text only grows, so the delta is its unsent suffix. On the
         // impossible mismatch emit nothing rather than double-emit.
