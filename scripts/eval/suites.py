@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Evaluation suites: how to load a problem set, prompt it, and grade a reply.
 
 A suite is deliberately three small pure-ish pieces — ``load``, ``render``,

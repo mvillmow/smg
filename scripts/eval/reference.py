@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Published accuracy numbers, paired with the protocol needed to reproduce them.
 
 A score is only comparable to a published one if the *protocol* matches: the
