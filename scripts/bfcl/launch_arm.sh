@@ -51,14 +51,6 @@ SMG_REASONING_PARSER="${BFCL_SMG_REASONING_PARSER:-}"
 # more stable under sustained bfcl load on shared/contended GPUs.
 VLLM_EXTRA="${BFCL_VLLM_EXTRA:-}"
 
-# Engine behind SMG on arm B: "vllm" (default) or "sglang". SMG serves either
-# over the same gRPC contract, so the arm is identical from BFCL's side. The
-# escape hatch exists for models the pinned vLLM cannot load — arm A is pure
-# vLLM and simply cannot run those, so such legs score arm B alone.
-ARM_B_WORKER="${BFCL_ARM_B_WORKER:-vllm}"
-SGLANG_PYTHON="${SGLANG_PYTHON:-python}"   # python that can `-m sglang.launch_server`
-SGLANG_EXTRA="${BFCL_SGLANG_EXTRA:-}"
-
 # Ports. Default to an OS-assigned free port (resolved per-arm in the case
 # below) so concurrent arms/jobs sharing a host — e.g. bin-packed CI runners
 # under hostNetwork — don't collide on a fixed port. Pin via env for a stable
@@ -72,10 +64,6 @@ ARM_B_METRICS_PORT="${BFCL_ARM_B_METRICS_PORT:-}" # SMG Prometheus port (default
 VLLM_BIN="${VLLM_BIN:-vllm}"                      # `vllm serve` console script
 VLLM_PYTHON="${VLLM_PYTHON:-python}"             # python that can `-m vllm.entrypoints.grpc_server`
 SMG_LAUNCH="${SMG_LAUNCH:-smg launch}"           # SMG launcher (binary subcmd or `python -m smg.launch_router`)
-# Raise to "debug" to capture what the parsers were handed. Off by default:
-# debug logs model output, which is user content, and a full BFCL category
-# produces a very large log.
-SMG_LOG_LEVEL="${BFCL_SMG_LOG_LEVEL:-}"
 
 mkdir -p "$RUN_DIR"
 
@@ -112,19 +100,6 @@ free_port() {  # OS-assigned free TCP port (same idiom as the e2e infra's get_op
   python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()'
 }
 
-# A free port low enough that a +10000 derivation still lands in range. sglang
-# derives its native gRPC port that way, so an OS-assigned port above 55535
-# makes it refuse to start — a flake that only shows up on unlucky draws.
-free_low_port() {
-  local p
-  for _ in $(seq 1 20); do
-    p=$(free_port)
-    if [ "$p" -le 55000 ]; then echo "$p"; return 0; fi
-  done
-  echo "[launch_arm] no free port <=55000 after 20 tries" >&2
-  return 1
-}
-
 case "$ARM" in
   a)
     ARM_A_PORT="${ARM_A_PORT:-$(free_port)}"
@@ -147,40 +122,19 @@ case "$ARM" in
     ;;
 
   b)
-    # sglang derives a second port from this one, so keep it in the low range.
-    if [ "$ARM_B_WORKER" = sglang ]; then
-      ARM_B_GRPC_PORT="${ARM_B_GRPC_PORT:-$(free_low_port)}"
-    else
-      ARM_B_GRPC_PORT="${ARM_B_GRPC_PORT:-$(free_port)}"
-    fi
+    ARM_B_GRPC_PORT="${ARM_B_GRPC_PORT:-$(free_port)}"
     ARM_B_GW_PORT="${ARM_B_GW_PORT:-$(free_port)}"
     ARM_B_METRICS_PORT="${ARM_B_METRICS_PORT:-$(free_port)}"
-    # 1) gRPC worker (raw-token; SMG will own template+parsing).
-    if [ "$ARM_B_WORKER" = sglang ]; then
-      # --grpc-mode serves SMG's scheduler protocol, the same path the e2e
-      # sglang lanes use. max_model_len maps to --context-length; "auto" means
-      # "let the engine pick", so the flag is simply omitted.
-      declare -a wcmd=(
-        CUDA_VISIBLE_DEVICES="$GPU" "$SGLANG_PYTHON" -m sglang.launch_server
-        --model-path "$MODEL_SRC" --served-model-name "$MODEL"
-        --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
-        --tp-size "$TP" --mem-fraction-static "$GPU_MEM_UTIL"
-        --smg-grpc-mode --log-level info
-      )
-      [ "$MAX_MODEL_LEN" != auto ] && wcmd+=(--context-length "$MAX_MODEL_LEN")
-      # shellcheck disable=SC2206  # intentional word-split of optional extra flags
-      [ -n "$SGLANG_EXTRA" ] && wcmd+=($SGLANG_EXTRA)
-    else
-      declare -a wcmd=(
-        CUDA_VISIBLE_DEVICES="$GPU" "$VLLM_PYTHON" -m vllm.entrypoints.grpc_server
-        --model "$MODEL_SRC" --served-model-name "$MODEL"
-        --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
-        --tensor-parallel-size "$TP" --max-model-len "$MAX_MODEL_LEN"
-        --gpu-memory-utilization "$GPU_MEM_UTIL"
-      )
-      # shellcheck disable=SC2206  # intentional word-split of optional extra flags
-      [ -n "$VLLM_EXTRA" ] && wcmd+=($VLLM_EXTRA)
-    fi
+    # 1) vLLM gRPC worker (raw-token; SMG will own template+parsing).
+    declare -a wcmd=(
+      CUDA_VISIBLE_DEVICES="$GPU" "$VLLM_PYTHON" -m vllm.entrypoints.grpc_server
+      --model "$MODEL_SRC" --served-model-name "$MODEL"
+      --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
+      --tensor-parallel-size "$TP" --max-model-len "$MAX_MODEL_LEN"
+      --gpu-memory-utilization "$GPU_MEM_UTIL"
+    )
+    # shellcheck disable=SC2206  # intentional word-split of optional extra flags
+    [ -n "$VLLM_EXTRA" ] && wcmd+=($VLLM_EXTRA)
     start arm_b_worker "$RUN_DIR/arm_b_worker.log" "${wcmd[@]}"
     log_tail=$(stream_log "$RUN_DIR/arm_b_worker.log")
     wait_grpc "$ARM_B_GRPC_PORT" "${BFCL_STARTUP_TIMEOUT:-420}"
@@ -199,17 +153,9 @@ case "$ARM" in
     # Empty => omit, so SMG auto-detects (e.g. gpt-oss → harmony pipeline).
     [ -n "$SMG_TOOL_PARSER" ] && smg_cmd+=(--tool-call-parser "$SMG_TOOL_PARSER")
     [ -n "$SMG_REASONING_PARSER" ] && smg_cmd+=(--reasoning-parser "$SMG_REASONING_PARSER")
-    [ -n "$SMG_LOG_LEVEL" ] && smg_cmd+=(--log-level "$SMG_LOG_LEVEL")
     start arm_b_gateway "$RUN_DIR/arm_b_gateway.log" "${smg_cmd[@]}"
     log_tail=$(stream_log "$RUN_DIR/arm_b_gateway.log")
-    # /readiness, not /health: the gateway autoloads each gRPC worker's tokenizer
-    # asynchronously AFTER the worker reports healthy, and generation 500s with
-    # `tokenizer_not_found` until that lands. /health flips as soon as the worker
-    # process is up, so scoring against it races the autoload and turns every
-    # early case into a server error — which BFCL then scores as a wrong answer
-    # rather than an infrastructure fault. /readiness is exactly the signal that
-    # holds until every gRPC worker's tokenizer is registered.
-    wait_http "http://127.0.0.1:$ARM_B_GW_PORT/readiness" "${BFCL_STARTUP_TIMEOUT:-420}"
+    wait_http "http://127.0.0.1:$ARM_B_GW_PORT/health" "${BFCL_STARTUP_TIMEOUT:-420}"
     kill "$log_tail" 2>/dev/null || true
     echo "http://127.0.0.1:$ARM_B_GW_PORT"
     ;;

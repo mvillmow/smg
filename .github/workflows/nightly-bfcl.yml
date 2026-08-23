@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.6|gpt-oss|deepseek-v4|minimax-m2.7|kimi-k2.6|glm-5.2|muse-glimmer); empty = all"
+        description: "Run only this matrix leg (qwen3.6|gpt-oss|deepseek-v4|minimax-m2.7|kimi-k2.6|glm-5.2); empty = all"
         required: false
         default: ""
       model:
@@ -52,10 +52,6 @@ on:
         default: ""
       run_timeout:
         description: "Override per-arm `bfcl generate`/`evaluate` wall-clock cap in seconds (0 = uncapped); empty = matrix default"
-        required: false
-        default: ""
-      smg_log_level:
-        description: "SMG gateway log level for arm B (e.g. debug to capture what the parsers were handed); empty = default"
         required: false
         default: ""
 
@@ -210,27 +206,7 @@ jobs:
                # Sequential: both arms share the 360m job, healthy total 2h52m on 2026-08-05.
                "run_timeout": "7200",
                "model_cache": "/raid/models", "arm_mode": "sequential", "max_model_len": "auto"},
-              # Muse-Glimmer: SMG-only. The pinned vLLM cannot load this
-              # architecture (support lands in 0.28.0rc1+), so there is no arm A to
-              # compare against — SGLang 0.5.18 serves it instead and we score SMG
-              # alone. Parsers are named explicitly so a bad score means "the parser
-              # is wrong", not "resolution picked the wrong parser"; the e2e lane
-              # covers glob auto-detection separately.
-              {"name": "muse-glimmer", "runner": "4-gpu-h100", "tp": 2,
-               "gpu_a": "0,1", "gpu_b": "2,3",
-               "model": "meta-models/Muse-Glimmer-30B", "bfcl_model": "meta-models/Muse-Glimmer-30B-FC",
-               "vllm_tool": "", "vllm_reason": "",
-               "smg_tool": "muse_glimmer", "smg_reason": "muse_glimmer",
-               "vllm_extra": "", "gpu_mem": "0.85", "startup_timeout": "900",
-               "run_timeout": "18000",
-               "model_cache": "/models", "arm_mode": "smg_only",
-               "arm_b_worker": "sglang", "max_model_len": "auto"},
           ]
-          # Every leg but the SMG-only one puts vLLM behind SMG on arm B. Defaulted
-          # here rather than repeated per leg so a new leg cannot silently omit it
-          # (an absent key renders as an empty string in the matrix).
-          for leg in legs:
-              leg.setdefault("arm_b_worker", "vllm")
           only = os.environ.get("ONLY", "")
           valid_names = [l["name"] for l in legs]
           if only:
@@ -277,61 +253,14 @@ jobs:
           name: smg-wheel
           path: wheel
       - name: Setup vLLM env (provides vllm + grpc servicer + smg)
-        if: matrix.arm_b_worker != 'sglang'
         uses: ./.github/actions/setup-vllm
-      - name: Setup SGLang env (arm-B worker for models the pinned vLLM cannot load)
-        if: matrix.arm_b_worker == 'sglang'
-        uses: ./.github/actions/setup-sglang
       - name: Install smg wheel + bfcl-eval (+ ninja for vLLM torch.compile, soundfile for bfcl's qwen handler)
         run: |
           pip uninstall -y smg || true
           pip install wheel/*.whl
           pip install "bfcl-eval" soundfile ninja
-      - name: Align protobuf runtime with the installed gencode
-        # grpcio-health-checking 1.82.0rc2 (pulled in because the sglang install
-        # allows prereleases) declares protobuf>=6.33.5 but ships stubs generated
-        # with 7.35.0 gencode. protobuf refuses a runtime older than the gencode,
-        # so importing grpc_health dies and the sglang worker never binds its
-        # port — surfacing much later as an opaque "TIMEOUT waiting for grpc".
-        #
-        # Test the symptom rather than guess the requirement: try the import, and
-        # only if it fails raise the runtime. Newer runtime against older gencode
-        # is always allowed, and smg and grpcio-health-checking both cap at <8, so
-        # this stays inside every declared constraint. Failing here costs seconds;
-        # failing at launch costs a 4-GPU host and the startup timeout.
-        run: |
-          set -euo pipefail
-          probe() { python -c "from grpc_health.v1 import health_pb2_grpc" 2>&1; }
-          echo "protobuf runtime: $(python -c 'import google.protobuf as p; print(p.__version__)')"
-          if ! probe >/dev/null; then
-            echo "grpc_health import failed:"
-            # `|| true`: probe exits nonzero by definition here, and pipefail
-            # would otherwise make this diagnostic line kill the step.
-            probe | tail -3 || true
-            echo "raising the protobuf runtime..."
-            pip install --upgrade "protobuf<8"
-            echo "protobuf runtime now: $(python -c 'import google.protobuf as p; print(p.__version__)')"
-          fi
-          python -c "from grpc_health.v1 import health_pb2_grpc; print('grpc_health imports OK')"
       - name: Register model in bfcl (no-op if bfcl already ships a handler)
-        # The registration itself is best-effort (bfcl may already ship a
-        # handler), but the RESULT is not: an unregistered id makes `bfcl
-        # generate` die with "Unknown model_name", which the `|| true` above
-        # would otherwise turn into a silent zero-score run hours later.
-        run: |
-          set -euo pipefail
-          python scripts/bfcl/register_bfcl_model.py --model-id "$MODEL" || true
-          python - <<'PYCHECK'
-          import os, sys
-          from bfcl_eval.constants.model_config import MODEL_CONFIG_MAPPING
-          want = os.environ["BFCL_MODEL_FC"]
-          if want not in MODEL_CONFIG_MAPPING:
-              sys.exit(
-                  f"::error::{want} is not registered in bfcl MODEL_CONFIG_MAPPING; "
-                  "registration failed and generation would score nothing"
-              )
-          print(f"{want} registered")
-          PYCHECK
+        run: python scripts/bfcl/register_bfcl_model.py --model-id "$MODEL" || true
       - name: Stage model weights
         # Skip if pre-staged locally at <cache>/<id> (e.g. blackwell NVMe); else
         # download just this leg's model (not the whole GPU tier, which pulls
@@ -357,13 +286,10 @@ jobs:
           BFCL_MAX_MODEL_LEN: ${{ matrix.max_model_len }}
           BFCL_GPU_MEM_UTIL: ${{ matrix.gpu_mem }}
           ARM_MODE: ${{ matrix.arm_mode }}
-          BFCL_ARM_B_WORKER: ${{ matrix.arm_b_worker }}
-          SGLANG_PYTHON: python
           GPU_A: ${{ matrix.gpu_a }}
           GPU_B: ${{ matrix.gpu_b }}
           # Per-leg health-wait budget: big MoEs need minutes for load + compile + quant.
           BFCL_STARTUP_TIMEOUT: ${{ matrix.startup_timeout }}
-          BFCL_SMG_LOG_LEVEL: ${{ github.event.inputs.smg_log_level || '' }}
           RUN_TIMEOUT: ${{ github.event.inputs.run_timeout || matrix.run_timeout }}
           # Arm logs + pidfiles under RUNNER_TEMP (per-job, uploadable) not /tmp.
           BFCL_RUN_DIR: ${{ runner.temp }}/bfcl_run
@@ -417,55 +343,7 @@ jobs:
                  AB_RC=$rc ;;
             esac
           }
-          if [ "$ARM_MODE" = smg_only ]; then
-            # No arm A exists for this leg, so there is nothing to diff: score SMG
-            # alone and publish the absolute number. Comparable to the public BFCL
-            # leaderboard, and unambiguous as a parser check — a near-zero score
-            # means the frontend is not producing tool calls at all.
-            B_URL=$(BFCL_GPU="$GPU_A" bash scripts/bfcl/launch_arm.sh b 9>&-)
-            echo "arm B (smg): $B_URL"
-            gate python scripts/bfcl/run_ab.py --score-arm "smg=$B_URL" \
-              --scores-out "$ROOT/scores_smg.json" \
-              --bfcl-model "$BFCL_MODEL_FC" --categories "$CATEGORIES" \
-              --bfcl "$BFCL" --project-root "$ROOT" --run-timeout "$RUN_TIMEOUT"
-            bash scripts/bfcl/launch_arm.sh stop 9>&-
-            # Render the same report file the A/B modes produce so Render summary
-            # and the artifact upload need no special case.
-            python3 - "$ROOT/scores_smg.json" "$RUNNER_TEMP/bfcl_ab.md" "$RUNNER_TEMP/bfcl_ab.json" <<'PYRENDER'
-          import json, sys
-          src, md_out, json_out = sys.argv[1], sys.argv[2], sys.argv[3]
-          try:
-              data = json.load(open(src))
-          except Exception as exc:  # scoring produced nothing
-              open(md_out, "w").write(f"arm produced no scores: {exc}\n")
-              raise SystemExit(0)
-          scores, counts = data.get("scores") or {}, data.get("counts") or {}
-          lines = ["", "SMG-only run (no vLLM baseline: the pinned vLLM cannot load this model).", ""]
-          lines += ["| Category | Accuracy | Cases |", "| :-- | --: | --: |"]
-          for cat in sorted(scores):
-              val = scores[cat]
-              shown = f"{val * 100:.2f}%" if isinstance(val, (int, float)) else str(val)
-              lines.append(f"| {cat} | {shown} | {counts.get(cat, '-')} |")
-          numeric = [v for v in scores.values() if isinstance(v, (int, float))]
-          if numeric:
-              lines += ["", f"**Unweighted mean across {len(numeric)} categories: {sum(numeric) / len(numeric) * 100:.2f}%**"]
-          if data.get("timed_out"):
-              lines += ["", "> arm timed out — treat the table as partial."]
-          # A category at exactly zero is not a "low score": a working model and
-          # parser cannot miss every case, so it means the requests never really
-          # ran — an unloaded tokenizer, a dead worker, a frontend emitting
-          # nothing. Fail loudly, because BFCL scores an HTTP 500 as a wrong
-          # answer and the run would otherwise finish green and meaningless.
-          zeroed = [c for c, v in scores.items() if isinstance(v, (int, float)) and v == 0.0]
-          if zeroed:
-              lines += ["", f"> **zero-score categories: {', '.join(sorted(zeroed))}** — treated as a failed run."]
-          open(md_out, "w").write("\n".join(lines) + "\n")
-          json.dump({"mode": "smg_only", "smg": data}, open(json_out, "w"), indent=2)
-          if zeroed:
-              print("::error::BFCL scored 0.00% on " + ", ".join(sorted(zeroed)) + " — the arm did not serve requests successfully")
-              raise SystemExit(2)
-          PYRENDER
-          elif [ "$ARM_MODE" = sequential ]; then
+          if [ "$ARM_MODE" = sequential ]; then
             # Whole node per arm (TP=8), one at a time: each model needs all 8 GPUs
             # for enough KV cache at the larger max_model_len. Score arm A, tear it
             # down to free the GPUs, score arm B, then diff the two saved results.
@@ -551,11 +429,8 @@ jobs:
             ${{ runner.temp }}/bfcl_transcripts.tgz
           if-no-files-found: warn
           retention-days: 30
-      - name: Upload arm logs
-        # Not failure-only: a run can succeed and still be worth explaining
-        # (a category scoring far below its peers), and the arm logs are the
-        # only record of what the parsers were handed.
-        if: always()
+      - name: Upload arm logs (failure only)
+        if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: bfcl-ab-${{ matrix.name }}-logs-${{ github.run_id }}

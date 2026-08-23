@@ -155,7 +155,7 @@ class TestMuseGlimmerParsing:
 
         ATEM parameters are not incremental JSON, so the parser emits each call
         whole; a regression that streamed partial fragments would produce
-        unparseable arguments here.
+        unparsable arguments here.
         """
         stream = api_client.chat.completions.create(
             model=model,
@@ -188,20 +188,21 @@ class TestMuseGlimmerParsing:
             parsed = json.loads(arguments.get(index, "{}"))
             assert "city" in parsed, f"call {index} lost its arguments: {parsed!r}"
 
-    def test_reasoning_channel_is_not_answered_as_content(self, model, api_client):
-        """Chain-of-thought must not be delivered as the user-facing answer.
+    def test_default_request_never_leaks_framing(self, model, api_client):
+        """The default request path must parse reasoning and strip framing.
 
-        With separate_reasoning off the reasoning is not surfaced as its own
-        field; what matters is that the raw channel framing still never reaches
-        the client.
+        ``separate_reasoning`` defaults to true. Omitting the extension here
+        protects that API default as well as the parser's automatic model-id
+        selection.
         """
         response = api_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "Briefly, why is the sky blue?"}],
             max_tokens=300,
-            extra_body={"separate_reasoning": False},
         )
 
         message = response.choices[0].message
         assert_no_framing("content", message.content)
+        assert_no_framing("reasoning_content", getattr(message, "reasoning_content", None))
         assert message.content, "expected an answer"
+        assert getattr(message, "reasoning_content", None), "expected parsed reasoning"
