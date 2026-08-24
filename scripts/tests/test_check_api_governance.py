@@ -43,7 +43,7 @@ name = "smg-python"
 path = "bindings/python"
 classification = "version-locked-binding"
 semver = false
-release = "none"
+release = "core-version-sync"
 owner = "CODEOWNERS"
 """
     )
@@ -72,13 +72,13 @@ owner = "CODEOWNERS"
             "bindings/python",
             "version-locked-binding",
             False,
-            "none",
+            "core-version-sync",
             "CODEOWNERS",
         ),
     ]
 
 
-def test_packages_from_metadata_normalizes_direct_crates_and_filters_out_of_scope(
+def test_packages_from_metadata_normalizes_crates_and_filters_out_of_scope(
     tmp_path: Path,
 ) -> None:
     module = _load()
@@ -97,6 +97,12 @@ def test_packages_from_metadata_normalizes_direct_crates_and_filters_out_of_scop
                 "targets": [{"kind": ["bin"]}],
             },
             {
+                "name": "nested-library",
+                "manifest_path": str(tmp_path / "crates/foo/bar/Cargo.toml"),
+                "publish": None,
+                "targets": [{"kind": ["lib"]}],
+            },
+            {
                 "name": "private-tool",
                 "manifest_path": str(tmp_path / "tools/private_tool/Cargo.toml"),
                 "publish": [],
@@ -109,9 +115,31 @@ def test_packages_from_metadata_normalizes_direct_crates_and_filters_out_of_scop
 
     assert packages == [
         module.PackageRecord("crates-binary", "crates/binary", False, False),
+        module.PackageRecord("nested-library", "crates/foo/bar", True, True),
         module.PackageRecord("published-library", "crates/library", True, True),
     ]
     assert all(package.name != "private-tool" for package in packages)
+
+
+def test_check_reports_unsupported_schema_before_parsing_package_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    inventory = tmp_path / "inventory.toml"
+    inventory.write_text(
+        """\
+schema-version = 2
+
+[[package]]
+renamed-package-field = "future-schema"
+"""
+    )
+    module = _load()
+    monkeypatch.setattr(module, "INVENTORY_PATH", inventory)
+
+    assert module.main(["--check"]) == 1
+    assert capsys.readouterr().err == (
+        "unsupported API surface inventory schema-version; expected 1\n"
+    )
 
 
 def test_release_crates_reads_workflow_matrix_entries() -> None:

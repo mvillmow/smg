@@ -51,9 +51,8 @@ class InventoryEntry:
     owner: str
 
 
-def load_inventory(path: Path) -> list[InventoryEntry]:
-    """Load inventory entries from the authoritative TOML schema."""
-    data = tomllib.loads(path.read_text())
+def _inventory_entries(data: Mapping[str, Any]) -> list[InventoryEntry]:
+    """Build inventory entries from validated TOML data."""
     return [
         InventoryEntry(
             name=package["name"],
@@ -67,8 +66,13 @@ def load_inventory(path: Path) -> list[InventoryEntry]:
     ]
 
 
+def load_inventory(path: Path) -> list[InventoryEntry]:
+    """Load inventory entries from the authoritative TOML schema."""
+    return _inventory_entries(tomllib.loads(path.read_text()))
+
+
 def packages_from_metadata(metadata: dict[str, Any], repo_root: Path) -> list[PackageRecord]:
-    """Normalize direct ``crates/<directory>`` Cargo packages."""
+    """Normalize Cargo packages whose paths are rooted under ``crates/``."""
     root = repo_root.resolve()
     packages: list[PackageRecord] = []
 
@@ -79,7 +83,7 @@ def packages_from_metadata(metadata: dict[str, Any], repo_root: Path) -> list[Pa
         except ValueError:
             continue
 
-        if len(relative_path.parts) != 2 or relative_path.parts[0] != "crates":
+        if not relative_path.parts or relative_path.parts[0] != "crates":
             continue
 
         packages.append(
@@ -277,21 +281,21 @@ def _cargo_metadata() -> dict[str, Any]:
     return json.loads(completed.stdout)
 
 
-def _inventory_schema_error() -> str | None:
-    data = tomllib.loads(INVENTORY_PATH.read_text())
+def _inventory_schema_error(data: Mapping[str, Any]) -> str | None:
     if data.get("schema-version") != 1:
         return "unsupported API surface inventory schema-version; expected 1"
     return None
 
 
 def _run(command: str) -> list[str]:
-    entries = load_inventory(INVENTORY_PATH)
+    inventory_data = tomllib.loads(INVENTORY_PATH.read_text())
+    schema_error = _inventory_schema_error(inventory_data)
+    if schema_error is not None:
+        return [schema_error]
+
+    entries = _inventory_entries(inventory_data)
     packages = packages_from_metadata(_cargo_metadata(), REPO_ROOT)
     errors = validate_inventory(packages, entries)
-
-    schema_error = _inventory_schema_error()
-    if schema_error is not None:
-        errors.insert(0, schema_error)
 
     if errors:
         return errors
