@@ -473,6 +473,24 @@ impl ToolParser for MuseGlimmerParser {
         text.contains(FUNCTION_CALLS_OPEN) || text.contains(INVOKE_OPEN)
     }
 
+    fn take_unstreamed_normal_text(&mut self) -> String {
+        // The incremental scan intentionally holds an open tool body because a
+        // later chunk may complete its invoke. At end of stream that ambiguity
+        // is gone: finalize the same scanner and return only normal text that
+        // was not already emitted. This also keeps truncated framing out of the
+        // response while preserving the malformed body for diagnosis.
+        let finalized = Self::scan(&self.buffer, &[], true).normal_text;
+        let tail = finalized
+            .get(self.emitted_normal_len..)
+            .unwrap_or_default()
+            .to_string();
+
+        self.buffer.clear();
+        self.emitted_normal_len = 0;
+        self.sent_tool_call_count = 0;
+        tail
+    }
+
     fn reset(&mut self) {
         self.buffer.clear();
         self.emitted_normal_len = 0;
@@ -950,6 +968,33 @@ mod tests {
         // body must not leak as content while it may still become a call.
         assert!(result.calls.is_empty());
         assert!(result.normal_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn end_of_stream_flushes_an_incomplete_invoke_as_content() {
+        let body = format!("{FUNCTION_CALLS_OPEN}<atem:invoke name=\"get_weather\">");
+        let opening = format!("{START}assistant to=get_weather{MESSAGE}{body}");
+
+        let mut parser = MuseGlimmerParser::new();
+        let result = parser.parse_incremental(&opening, &[]).await.unwrap();
+
+        assert!(result.calls.is_empty());
+        assert!(result.normal_text.is_empty());
+        assert_eq!(parser.take_unstreamed_normal_text(), body);
+        assert_eq!(parser.take_unstreamed_normal_text(), "");
+    }
+
+    #[tokio::test]
+    async fn end_of_stream_does_not_reemit_a_completed_open_invoke() {
+        let body = calls_block(&invoke("get_weather", &param("city", "Paris")));
+        let opening = format!("{START}assistant to=get_weather{MESSAGE}{body}");
+
+        let mut parser = MuseGlimmerParser::new();
+        let result = parser.parse_incremental(&opening, &[]).await.unwrap();
+
+        assert_eq!(result.calls.len(), 1);
+        assert!(result.normal_text.is_empty());
+        assert_eq!(parser.take_unstreamed_normal_text(), "");
     }
 
     #[tokio::test]
