@@ -20,7 +20,8 @@ RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github/workflows/release-crates.yml"
 VERSION_REGISTRY_PATH = REPO_ROOT / "scripts/check_release_versions.sh"
 INVENTORY_DOC_PATH = REPO_ROOT / "docs/api-surface-inventory.md"
 
-RELEASE_CRATE = re.compile(r"^\s*(?:-\s*)?crate:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
+RELEASE_CRATE = re.compile(r"^\s*(?:-\s*)?crate:\s*([A-Za-z0-9_-]+)\s*$")
+RELEASE_PATH = re.compile(r"^\s*path:\s*([A-Za-z0-9_./-]+)\s*$")
 VERSION_REGISTRY_ENTRY = re.compile(
     r'^\s*"([A-Za-z0-9_-]+)\|([A-Za-z0-9_./-]+)\|([A-Za-z0-9_-]+)"\s*$'
 )
@@ -100,9 +101,38 @@ def packages_from_metadata(metadata: dict[str, Any], repo_root: Path) -> list[Pa
     return sorted(packages, key=lambda package: package.name)
 
 
-def release_crates(workflow_text: str) -> set[str]:
-    """Return crate names from release-workflow matrix and input entries."""
-    return set(RELEASE_CRATE.findall(workflow_text))
+def release_crates(workflow_text: str) -> dict[str, str]:
+    """Return crate-to-path mappings from release-workflow entries."""
+    registry: dict[str, str] = {}
+    paths: set[str] = set()
+    lines = workflow_text.splitlines()
+
+    for index, line in enumerate(lines):
+        crate_match = RELEASE_CRATE.fullmatch(line)
+        if crate_match is None:
+            continue
+
+        name = crate_match.group(1)
+        path: str | None = None
+        for following in lines[index + 1 :]:
+            stripped = following.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            path_match = RELEASE_PATH.fullmatch(following)
+            if path_match is not None:
+                path = path_match.group(1)
+            break
+
+        if path is None:
+            raise ValueError(f"release-workflow crate has no adjacent path: {name}")
+        if name in registry:
+            raise ValueError(f"duplicate release-workflow crate: {name}")
+        if path in paths:
+            raise ValueError(f"duplicate release-workflow path: {path}")
+        registry[name] = path
+        paths.add(path)
+
+    return registry
 
 
 def version_registry_crates(script_text: str) -> dict[str, str]:
@@ -212,14 +242,22 @@ def validate_inventory(
 
 
 def validate_release_coverage(
-    entries: Sequence[InventoryEntry], workflow_crates: set[str]
+    entries: Sequence[InventoryEntry], workflow_crates: Mapping[str, str]
 ) -> list[str]:
-    """Return governed release entries missing from the release workflow."""
-    return [
-        f"publishable crate missing from release-crates workflow: {entry.name}"
-        for entry in sorted(entries, key=lambda item: item.name)
-        if entry.release == "release-crates" and entry.name not in workflow_crates
-    ]
+    """Return governed release entries missing from or drifting in the workflow."""
+    errors: list[str] = []
+    for entry in sorted(entries, key=lambda item: item.name):
+        if entry.release != "release-crates":
+            continue
+        workflow_path = workflow_crates.get(entry.name)
+        if workflow_path is None:
+            errors.append(f"publishable crate missing from release-crates workflow: {entry.name}")
+        elif workflow_path != entry.path:
+            errors.append(
+                f"release workflow path mismatch for {entry.name}: "
+                f"expected {entry.path}, found {workflow_path}"
+            )
+    return errors
 
 
 def validate_version_registry_coverage(

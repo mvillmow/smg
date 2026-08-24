@@ -156,7 +156,26 @@ jobs:
             path: crates/mcp
 """
 
-    assert module.release_crates(workflow_text) == {"openai-protocol", "smg-mcp"}
+    assert module.release_crates(workflow_text) == {
+        "openai-protocol": "crates/protocols",
+        "smg-mcp": "crates/mcp",
+    }
+
+
+def test_release_crates_rejects_duplicate_names() -> None:
+    module = _load()
+    workflow_text = """\
+jobs:
+  one:
+    crate: known
+    path: crates/known
+  two:
+    crate: known
+    path: crates/not_known
+"""
+
+    with pytest.raises(ValueError, match="duplicate release-workflow crate: known"):
+        module.release_crates(workflow_text)
 
 
 def test_unclassified_crate_is_an_error(tmp_path: Path) -> None:
@@ -264,8 +283,29 @@ def test_publishable_crate_missing_from_release_workflow_fails() -> None:
         )
     ]
 
-    assert module.validate_release_coverage(entries, {"openai-protocol"}) == [
+    assert module.validate_release_coverage(entries, {"openai-protocol": "crates/protocols"}) == [
         "publishable crate missing from release-crates workflow: engine-zmq-client"
+    ]
+
+
+def test_release_workflow_path_must_match_inventory() -> None:
+    module = _load()
+    entries = [
+        module.InventoryEntry(
+            "engine-zmq-client",
+            "crates/engine_zmq_client",
+            "published-library",
+            True,
+            "release-crates",
+            "CODEOWNERS",
+        )
+    ]
+
+    assert module.validate_release_coverage(
+        entries, {"engine-zmq-client": "crates/wrong_package"}
+    ) == [
+        "release workflow path mismatch for engine-zmq-client: "
+        "expected crates/engine_zmq_client, found crates/wrong_package"
     ]
 
 
