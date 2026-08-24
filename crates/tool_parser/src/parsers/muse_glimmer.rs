@@ -251,11 +251,14 @@ impl MuseGlimmerParser {
     }
 
     /// Extract every complete `<atem:invoke>` from a tool-channel body.
-    fn extract_calls(body: &str, tools: &[Tool]) -> Vec<ToolCall> {
+    fn extract_calls(body: &str, tools: &[Tool]) -> (Vec<ToolCall>, Option<usize>) {
         let mut calls = Vec::new();
+        let mut last_call_end = None;
 
         for capture in INVOKE_PATTERN.captures_iter(body) {
-            let (Some(name_match), Some(inner_match)) = (capture.get(1), capture.get(2)) else {
+            let (Some(full_match), Some(name_match), Some(inner_match)) =
+                (capture.get(0), capture.get(1), capture.get(2))
+            else {
                 continue;
             };
             let name = Self::normalize_name(name_match.as_str(), tools);
@@ -277,9 +280,10 @@ impl MuseGlimmerParser {
             calls.push(ToolCall {
                 function: FunctionCall { name, arguments },
             });
+            last_call_end = Some(full_match.end());
         }
 
-        calls
+        (calls, last_call_end)
     }
 
     /// Close a tool segment: harvest its calls, and if it produced none while
@@ -289,7 +293,7 @@ impl MuseGlimmerParser {
         if body.is_empty() {
             return;
         }
-        let calls = Self::extract_calls(body, tools);
+        let (calls, last_call_end) = Self::extract_calls(body, tools);
         if calls.is_empty() {
             if closed {
                 scan.normal_text.push_str(body);
@@ -301,6 +305,14 @@ impl MuseGlimmerParser {
         }
         scan.calls.extend(calls);
         if closed {
+            // A valid call must not make a malformed call after it disappear.
+            // Drop completed-call framing, but surface the unclosed invoke as
+            // normal text just as we do when it is the only invoke in a body.
+            if let Some(tail) = last_call_end.and_then(|end| body.get(end..)) {
+                if let Some(invoke_start) = tail.find(INVOKE_OPEN) {
+                    scan.normal_text.push_str(&tail[invoke_start..]);
+                }
+            }
             body.clear();
         }
     }
@@ -994,6 +1006,22 @@ mod tests {
 
         assert_eq!(result.calls.len(), 1);
         assert!(result.normal_text.is_empty());
+        assert_eq!(parser.take_unstreamed_normal_text(), "");
+    }
+
+    #[tokio::test]
+    async fn end_of_stream_flushes_a_truncated_invoke_after_a_completed_invoke() {
+        let completed = invoke("get_weather", &param("city", "Paris"));
+        let truncated = "<atem:invoke name=\"get_weather\"><atem:parameter name=\"city\">Ber";
+        let body = format!("{FUNCTION_CALLS_OPEN}{completed}{truncated}");
+        let opening = format!("{START}assistant to=get_weather{MESSAGE}{body}");
+
+        let mut parser = MuseGlimmerParser::new();
+        let result = parser.parse_incremental(&opening, &[]).await.unwrap();
+
+        assert_eq!(result.calls.len(), 1);
+        assert!(result.normal_text.is_empty());
+        assert_eq!(parser.take_unstreamed_normal_text(), truncated);
         assert_eq!(parser.take_unstreamed_normal_text(), "");
     }
 
