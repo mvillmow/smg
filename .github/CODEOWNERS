@@ -48,10 +48,7 @@
 /examples/wasm @tonyluj @slin1237
 
 # API stability and generated client contracts
-/docs/api-stability.md @slin1237 @CatherineSue @key4ng
-/docs/api-stability-ci.md @slin1237 @CatherineSue @key4ng
-/docs/api-surface-inventory.md @slin1237 @CatherineSue @key4ng
-/governance @slin1237 @CatherineSue @key4ng
+/governance/ @slin1237 @CatherineSue @key4ng
 /clients/openapi-gen @slin1237 @CatherineSue @key4ng
 /clients/openapi @slin1237 @CatherineSue @key4ng
 /clients/python @slin1237 @CatherineSue @key4ng

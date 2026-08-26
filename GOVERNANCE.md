@@ -37,7 +37,7 @@ crates, release planning, deprecations — are proposed as a GitHub issue or
 design discussion and decided by consensus among the core maintainers.
 
 Public contract changes additionally follow the [API Stability
-Policy](docs/api-stability.md). That policy defines compatibility categories,
+Policy](governance/api-stability.md). That policy defines compatibility categories,
 deprecation windows, version decisions, migration requirements, and the owner path
 for intentional breaking changes.
 

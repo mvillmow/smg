@@ -201,7 +201,7 @@ The command is not available until its implementation lands and is not a blockin
 gate until the rollout status marks it blocking.
 
 [GOV-03 (#2288)](https://github.com/smg-project/smg/issues/2288) tracks
-`docs/api-stability-ci.md`, which defines the pinned tools, exact CI job contracts,
+`governance/api-stability-ci.md`, which defines the pinned tools, exact CI job contracts,
 merge-base selection, artifacts, rollout status, and exception mechanics. The
 required compatibility lanes use `cargo-semver-checks` for governed Rust packages,
 Buf lint and breaking checks for protobuf contracts, and canonical generation and
