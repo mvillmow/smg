@@ -338,15 +338,18 @@ def _run(command: str) -> list[str]:
     if errors:
         return errors
 
+    workflow_crates = release_crates(RELEASE_WORKFLOW_PATH.read_text())
+    errors.extend(validate_release_coverage(entries, workflow_crates))
+    registry_crates = version_registry_crates(VERSION_REGISTRY_PATH.read_text())
+    errors.extend(validate_version_registry_coverage(entries, registry_crates))
+    if errors:
+        return errors
+
     rendered = render_inventory(entries)
     if command == "write-doc":
         INVENTORY_DOC_PATH.write_text(rendered)
         return []
 
-    workflow_crates = release_crates(RELEASE_WORKFLOW_PATH.read_text())
-    errors.extend(validate_release_coverage(entries, workflow_crates))
-    registry_crates = version_registry_crates(VERSION_REGISTRY_PATH.read_text())
-    errors.extend(validate_version_registry_coverage(entries, registry_crates))
     if not INVENTORY_DOC_PATH.exists() or INVENTORY_DOC_PATH.read_text() != rendered:
         errors.append(
             "generated API surface inventory is out of date; "

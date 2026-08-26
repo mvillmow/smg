@@ -379,3 +379,53 @@ def test_render_inventory_is_sorted_and_marks_semver() -> None:
     rendered = module.render_inventory(entries)
     assert rendered.index("`alpha`") < rendered.index("`zeta`")
     assert "| `alpha` | `crates/alpha` | published-library | yes |" in rendered
+
+
+def test_write_doc_rejects_missing_release_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load()
+    inventory = tmp_path / "api-surfaces.toml"
+    inventory.write_text(
+        """\
+schema-version = 1
+
+[[package]]
+name = "known"
+path = "crates/known"
+classification = "published-library"
+semver = true
+release = "release-crates"
+owner = "CODEOWNERS"
+"""
+    )
+    workflow = tmp_path / "release-crates.yml"
+    workflow.write_text("jobs: {}\n")
+    registry = tmp_path / "check_release_versions.sh"
+    registry.write_text('CRATES=(\n    "known|crates/known|known"\n)\n')
+    generated = tmp_path / "api-surface-inventory.md"
+
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(module, "INVENTORY_PATH", inventory)
+    monkeypatch.setattr(module, "RELEASE_WORKFLOW_PATH", workflow)
+    monkeypatch.setattr(module, "VERSION_REGISTRY_PATH", registry)
+    monkeypatch.setattr(module, "INVENTORY_DOC_PATH", generated)
+    monkeypatch.setattr(
+        module,
+        "_cargo_metadata",
+        lambda: {
+            "packages": [
+                {
+                    "name": "known",
+                    "manifest_path": str(tmp_path / "crates/known/Cargo.toml"),
+                    "publish": None,
+                    "targets": [{"kind": ["lib"]}],
+                }
+            ]
+        },
+    )
+
+    assert module._run("write-doc") == [
+        "publishable crate missing from release-crates workflow: known"
+    ]
+    assert not generated.exists()
