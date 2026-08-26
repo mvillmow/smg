@@ -71,11 +71,6 @@ def _inventory_entries(data: Mapping[str, Any]) -> list[InventoryEntry]:
     ]
 
 
-def load_inventory(path: Path) -> list[InventoryEntry]:
-    """Load inventory entries from the authoritative TOML schema."""
-    return _inventory_entries(tomllib.loads(path.read_text()))
-
-
 def packages_from_metadata(metadata: dict[str, Any], repo_root: Path) -> list[PackageRecord]:
     """Normalize Cargo packages whose paths are rooted under ``crates/``."""
     root = repo_root.resolve()

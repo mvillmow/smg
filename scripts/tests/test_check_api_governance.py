@@ -85,6 +85,34 @@ def test_release_and_version_registries_must_match_release_governed_inventory() 
         "release-governed package missing from version registry: known"
     ]
 
+    entries.append(
+        module.InventoryEntry(
+            "private",
+            "crates/private",
+            "quality-only",
+            False,
+            "none",
+            "CODEOWNERS",
+        )
+    )
+    mappings = {
+        "extra": "crates/extra",
+        "known": "crates/wrong",
+        "private": "crates/private",
+    }
+
+    assert module.validate_release_coverage(entries, mappings) == [
+        "release-crates workflow references package absent from inventory: extra",
+        "release-crates workflow references non-release-governed package: private",
+        "release workflow path mismatch for known: "
+        "expected crates/known, found crates/wrong",
+    ]
+    assert module.validate_version_registry_coverage(entries, mappings) == [
+        "version registry references package absent from inventory: extra",
+        "version registry references non-release-governed package: private",
+        "version registry path mismatch for known: expected crates/known, found crates/wrong",
+    ]
+
 
 def test_check_accepts_current_repository_inventory() -> None:
     module = _load()
