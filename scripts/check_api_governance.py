@@ -208,10 +208,7 @@ def validate_inventory(
         if manifest.path not in packages_by_path:
             errors.append(f"crates/ manifest is not a workspace member: {manifest.path}")
         if not manifest.has_workspace_lints:
-            errors.append(
-                "crates/ manifest must use [lints] workspace = true: "
-                f"{manifest.path}"
-            )
+            errors.append(f"crates/ manifest must use [lints] workspace = true: {manifest.path}")
 
     for entry in sorted(entries, key=lambda item: item.name):
         rule = CLASSIFICATION_RULES.get(entry.classification)

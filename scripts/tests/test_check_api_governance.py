@@ -4,7 +4,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).resolve().parents[1] / "check_api_governance.py"
 
 
@@ -31,7 +30,9 @@ def test_crate_manifests_discovers_nested_manifests_and_workspace_lints(tmp_path
     ]
 
 
-def test_validate_inventory_requires_manifest_workspace_membership_classification_and_lints() -> None:
+def test_validate_inventory_requires_manifest_workspace_membership_classification_and_lints() -> (
+    None
+):
     module = _load()
     manifests = [
         module.ManifestRecord("crates/known", True),
@@ -104,8 +105,7 @@ def test_release_and_version_registries_must_match_release_governed_inventory() 
     assert module.validate_release_coverage(entries, mappings) == [
         "release-crates workflow references package absent from inventory: extra",
         "release-crates workflow references non-release-governed package: private",
-        "release workflow path mismatch for known: "
-        "expected crates/known, found crates/wrong",
+        "release workflow path mismatch for known: expected crates/known, found crates/wrong",
     ]
     assert module.validate_version_registry_coverage(entries, mappings) == [
         "version registry references package absent from inventory: extra",
