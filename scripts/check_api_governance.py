@@ -246,6 +246,19 @@ def validate_release_coverage(
 ) -> list[str]:
     """Return governed release entries missing from or drifting in the workflow."""
     errors: list[str] = []
+    entries_by_name = {entry.name: entry for entry in entries}
+
+    for name in sorted(workflow_crates):
+        entry = entries_by_name.get(name)
+        if entry is None:
+            errors.append(
+                f"release-crates workflow references package absent from inventory: {name}"
+            )
+        elif entry.release != "release-crates":
+            errors.append(
+                f"release-crates workflow references non-release-governed package: {name}"
+            )
+
     for entry in sorted(entries, key=lambda item: item.name):
         if entry.release != "release-crates":
             continue
@@ -267,6 +280,15 @@ def validate_version_registry_coverage(
 ) -> list[str]:
     """Return release-governed entries missing from or drifting in CRATES."""
     errors: list[str] = []
+    entries_by_name = {entry.name: entry for entry in entries}
+
+    for name in sorted(registry_crates):
+        entry = entries_by_name.get(name)
+        if entry is None:
+            errors.append(f"version registry references package absent from inventory: {name}")
+        elif entry.release != "release-crates":
+            errors.append(f"version registry references non-release-governed package: {name}")
+
     for entry in sorted(entries, key=lambda item: item.name):
         if entry.release != "release-crates":
             continue

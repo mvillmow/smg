@@ -289,7 +289,7 @@ def test_release_governed_package_missing_from_release_workflow_fails() -> None:
         )
     ]
 
-    assert module.validate_release_coverage(entries, {"openai-protocol": "crates/protocols"}) == [
+    assert module.validate_release_coverage(entries, {}) == [
         "release-governed package missing from release-crates workflow: engine-zmq-client"
     ]
 
@@ -338,7 +338,7 @@ PYTHON_PACKAGES=(
     ("registry_text", "expected"),
     [
         (
-            'CRATES=(\n    "other|crates/other|other"\n)\n',
+            "CRATES=(\n)\n",
             "release-governed package missing from version registry: known",
         ),
         (
@@ -429,3 +429,86 @@ owner = "CODEOWNERS"
         "release-governed package missing from release-crates workflow: known"
     ]
     assert not generated.exists()
+
+
+@pytest.mark.parametrize(
+    ("mapping_source", "mapped_name", "expected"),
+    [
+        (
+            "workflow-missing",
+            "extra",
+            "release-crates workflow references package absent from inventory: extra",
+        ),
+        (
+            "workflow-non-release",
+            "known",
+            "release-crates workflow references non-release-governed package: known",
+        ),
+        (
+            "registry-missing",
+            "extra",
+            "version registry references package absent from inventory: extra",
+        ),
+        (
+            "registry-non-release",
+            "known",
+            "version registry references non-release-governed package: known",
+        ),
+    ],
+)
+def test_check_rejects_reverse_release_mapping_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mapping_source: str,
+    mapped_name: str,
+    expected: str,
+) -> None:
+    module = _load()
+    inventory = tmp_path / "api-surfaces.toml"
+    inventory.write_text(
+        """\
+schema-version = 1
+
+[[package]]
+name = "known"
+path = "crates/known"
+classification = "quality-only"
+semver = false
+release = "none"
+owner = "CODEOWNERS"
+"""
+    )
+    workflow = tmp_path / "release-crates.yml"
+    workflow.write_text(
+        f"jobs:\n  release:\n    crate: {mapped_name}\n    path: crates/{mapped_name}\n"
+        if mapping_source.startswith("workflow")
+        else "jobs: {}\n"
+    )
+    registry = tmp_path / "check_release_versions.sh"
+    registry.write_text(
+        f'CRATES=(\n    "{mapped_name}|crates/{mapped_name}|{mapped_name}"\n)\n'
+        if mapping_source.startswith("registry")
+        else "CRATES=(\n)\n"
+    )
+
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(module, "INVENTORY_PATH", inventory)
+    monkeypatch.setattr(module, "RELEASE_WORKFLOW_PATH", workflow)
+    monkeypatch.setattr(module, "VERSION_REGISTRY_PATH", registry)
+    monkeypatch.setattr(module, "INVENTORY_DOC_PATH", tmp_path / "inventory.md")
+    monkeypatch.setattr(
+        module,
+        "_cargo_metadata",
+        lambda: {
+            "packages": [
+                {
+                    "name": "known",
+                    "manifest_path": str(tmp_path / "crates/known/Cargo.toml"),
+                    "publish": [],
+                    "targets": [{"kind": ["lib"]}],
+                }
+            ]
+        },
+    )
+
+    assert module._run("check") == [expected]
