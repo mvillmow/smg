@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_PATH = REPO_ROOT / "governance/api-surfaces.toml"
 RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github/workflows/release-crates.yml"
 VERSION_REGISTRY_PATH = REPO_ROOT / "scripts/check_release_versions.sh"
-INVENTORY_DOC_PATH = REPO_ROOT / "docs/api-surface-inventory.md"
+INVENTORY_DOC_PATH = REPO_ROOT / "governance/api-surface-inventory.md"
 
 RELEASE_CRATE = re.compile(r"^\s*(?:-\s*)?crate:\s*([A-Za-z0-9_-]+)\s*$")
 RELEASE_PATH = re.compile(r"^\s*path:\s*([A-Za-z0-9_./-]+)\s*$")

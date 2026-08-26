@@ -78,6 +78,12 @@ owner = "CODEOWNERS"
     ]
 
 
+def test_generated_inventory_path_is_under_governance() -> None:
+    module = _load()
+
+    assert module.INVENTORY_DOC_PATH == module.REPO_ROOT / "governance/api-surface-inventory.md"
+
+
 def test_packages_from_metadata_normalizes_crates_and_filters_out_of_scope(
     tmp_path: Path,
 ) -> None:
