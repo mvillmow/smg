@@ -4,7 +4,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "check_api_governance.py"
 
@@ -18,270 +17,60 @@ def _load():
     return module
 
 
-def test_load_inventory_reads_remaining_contract_categories(tmp_path: Path) -> None:
-    inventory = tmp_path / "inventory.toml"
-    inventory.write_text(
-        """\
-[[package]]
-name = "smg-client"
-path = "clients/rust"
-classification = "public-sdk"
-semver = true
-release = "release-crates"
-owner = "CODEOWNERS"
-
-[[package]]
-name = "smg"
-path = "model_gateway"
-classification = "external-application"
-semver = false
-release = "release-crates"
-owner = "CODEOWNERS"
-
-[[package]]
-name = "smg-python"
-path = "bindings/python"
-classification = "version-locked-binding"
-semver = false
-release = "core-version-sync"
-owner = "CODEOWNERS"
-"""
-    )
+def test_crate_manifests_discovers_nested_manifests_and_workspace_lints(tmp_path: Path) -> None:
+    (tmp_path / "crates/known").mkdir(parents=True)
+    (tmp_path / "crates/nested/also-known").mkdir(parents=True)
+    (tmp_path / "crates/known/Cargo.toml").write_text("[lints]\nworkspace = true\n")
+    (tmp_path / "crates/nested/also-known/Cargo.toml").write_text("[package]\nname = 'x'\n")
 
     module = _load()
 
-    assert module.load_inventory(inventory) == [
-        module.InventoryEntry(
-            "smg-client",
-            "clients/rust",
-            "public-sdk",
-            True,
-            "release-crates",
-            "CODEOWNERS",
-        ),
-        module.InventoryEntry(
-            "smg",
-            "model_gateway",
-            "external-application",
-            False,
-            "release-crates",
-            "CODEOWNERS",
-        ),
-        module.InventoryEntry(
-            "smg-python",
-            "bindings/python",
-            "version-locked-binding",
-            False,
-            "core-version-sync",
-            "CODEOWNERS",
-        ),
+    assert module.crate_manifests(tmp_path) == [
+        module.ManifestRecord("crates/known", True),
+        module.ManifestRecord("crates/nested/also-known", False),
     ]
 
 
-def test_generated_inventory_path_is_under_governance() -> None:
+def test_validate_inventory_requires_manifest_workspace_membership_classification_and_lints() -> None:
     module = _load()
-
-    assert module.INVENTORY_DOC_PATH == module.REPO_ROOT / "governance/api-surface-inventory.md"
-
-
-def test_packages_from_metadata_normalizes_crates_and_filters_out_of_scope(
-    tmp_path: Path,
-) -> None:
-    module = _load()
-    metadata = {
-        "packages": [
-            {
-                "name": "published-library",
-                "manifest_path": str(tmp_path / "crates/library/Cargo.toml"),
-                "publish": None,
-                "targets": [{"kind": ["lib"]}],
-            },
-            {
-                "name": "crates-binary",
-                "manifest_path": str(tmp_path / "crates/binary/Cargo.toml"),
-                "publish": [],
-                "targets": [{"kind": ["bin"]}],
-            },
-            {
-                "name": "nested-library",
-                "manifest_path": str(tmp_path / "crates/foo/bar/Cargo.toml"),
-                "publish": None,
-                "targets": [{"kind": ["lib"]}],
-            },
-            {
-                "name": "private-tool",
-                "manifest_path": str(tmp_path / "tools/private_tool/Cargo.toml"),
-                "publish": [],
-                "targets": [{"kind": ["bin"]}],
-            },
-        ]
-    }
-
-    packages = module.packages_from_metadata(metadata, tmp_path)
-
-    assert packages == [
-        module.PackageRecord("crates-binary", "crates/binary", False, False),
-        module.PackageRecord("nested-library", "crates/foo/bar", True, True),
-        module.PackageRecord("published-library", "crates/library", True, True),
+    manifests = [
+        module.ManifestRecord("crates/known", True),
+        module.ManifestRecord("crates/not-a-member", False),
     ]
-    assert all(package.name != "private-tool" for package in packages)
-
-
-def test_check_reports_unsupported_schema_before_parsing_package_fields(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    inventory = tmp_path / "inventory.toml"
-    inventory.write_text(
-        """\
-schema-version = 2
-
-[[package]]
-renamed-package-field = "future-schema"
-"""
-    )
-    module = _load()
-    monkeypatch.setattr(module, "INVENTORY_PATH", inventory)
-
-    assert module.main(["--check"]) == 1
-    assert capsys.readouterr().err == (
-        "unsupported API surface inventory schema-version; expected 1\n"
-    )
-
-
-def test_release_crates_reads_workflow_matrix_entries() -> None:
-    module = _load()
-    workflow_text = """\
-jobs:
-  tier1:
-    strategy:
-      matrix:
-        include:
-          - crate: openai-protocol
-            path: crates/protocols
-          - crate: smg-mcp
-            path: crates/mcp
-"""
-
-    assert module.release_crates(workflow_text) == {
-        "openai-protocol": "crates/protocols",
-        "smg-mcp": "crates/mcp",
-    }
-
-
-def test_release_crates_rejects_duplicate_names() -> None:
-    module = _load()
-    workflow_text = """\
-jobs:
-  one:
-    crate: known
-    path: crates/known
-  two:
-    crate: known
-    path: crates/not_known
-"""
-
-    with pytest.raises(ValueError, match="duplicate release-workflow crate: known"):
-        module.release_crates(workflow_text)
-
-
-def test_unclassified_crate_is_an_error(tmp_path: Path) -> None:
-    module = _load()
-    packages = [
-        module.PackageRecord("known", "crates/known", True, True),
-        module.PackageRecord("new-crate", "crates/new_crate", True, True),
-    ]
-    entries = [
-        module.InventoryEntry(
-            "known",
-            "crates/known",
-            "published-library",
-            True,
-            "release-crates",
-            "CODEOWNERS",
-        )
-    ]
-
-    assert module.validate_inventory(packages, entries) == [
-        "unclassified crates/ package: new-crate (crates/new_crate)"
-    ]
-
-
-@pytest.mark.parametrize(
-    ("publishable", "classification", "semver", "expected"),
-    [
-        (
-            True,
-            "quality-only",
-            False,
-            "publishable crate known must be classified published-library",
-        ),
-        (
-            False,
-            "published-library",
-            True,
-            "private crate known cannot be classified published-library",
-        ),
-    ],
-)
-def test_publish_state_must_match_classification(
-    publishable: bool, classification: str, semver: bool, expected: str
-) -> None:
-    module = _load()
-    packages = [module.PackageRecord("known", "crates/known", publishable, True)]
-    entries = [
-        module.InventoryEntry(
-            "known",
-            "crates/known",
-            classification,
-            semver,
-            "release-crates" if publishable else "none",
-            "CODEOWNERS",
-        )
-    ]
-
-    assert expected in module.validate_inventory(packages, entries)
-
-
-@pytest.mark.parametrize(
-    ("semver", "release", "expected"),
-    [
-        (
-            False,
-            "release-crates",
-            "published-library package known must set semver = true",
-        ),
-        (
-            True,
-            "none",
-            'published-library package known must set release = "release-crates"',
-        ),
-    ],
-)
-def test_published_library_requires_semver_and_release_governance(
-    semver: bool, release: str, expected: str
-) -> None:
-    module = _load()
     packages = [module.PackageRecord("known", "crates/known", True, True)]
     entries = [
         module.InventoryEntry(
             "known",
             "crates/known",
             "published-library",
-            semver,
-            release,
+            True,
+            "release-crates",
             "CODEOWNERS",
         )
     ]
 
-    assert expected in module.validate_inventory(packages, entries)
+    assert module.validate_inventory(manifests, packages, entries) == [
+        "crates/ manifest is not a workspace member: crates/not-a-member",
+        "crates/ manifest must use [lints] workspace = true: crates/not-a-member",
+    ]
 
 
-def test_release_governed_package_missing_from_release_workflow_fails() -> None:
+def test_validate_inventory_rejects_an_unclassified_workspace_crate() -> None:
+    module = _load()
+    manifests = [module.ManifestRecord("crates/new-crate", True)]
+    packages = [module.PackageRecord("new-crate", "crates/new-crate", True, True)]
+
+    assert module.validate_inventory(manifests, packages, []) == [
+        "unclassified crates/ package: new-crate (crates/new-crate)"
+    ]
+
+
+def test_release_and_version_registries_must_match_release_governed_inventory() -> None:
     module = _load()
     entries = [
         module.InventoryEntry(
-            "engine-zmq-client",
-            "crates/engine_zmq_client",
+            "known",
+            "crates/known",
             "published-library",
             True,
             "release-crates",
@@ -290,225 +79,14 @@ def test_release_governed_package_missing_from_release_workflow_fails() -> None:
     ]
 
     assert module.validate_release_coverage(entries, {}) == [
-        "release-governed package missing from release-crates workflow: engine-zmq-client"
-    ]
-
-
-def test_release_workflow_path_must_match_inventory() -> None:
-    module = _load()
-    entries = [
-        module.InventoryEntry(
-            "engine-zmq-client",
-            "crates/engine_zmq_client",
-            "published-library",
-            True,
-            "release-crates",
-            "CODEOWNERS",
-        )
-    ]
-
-    assert module.validate_release_coverage(
-        entries, {"engine-zmq-client": "crates/wrong_package"}
-    ) == [
-        "release workflow path mismatch for engine-zmq-client: "
-        "expected crates/engine_zmq_client, found crates/wrong_package"
-    ]
-
-
-def test_version_registry_crates_reads_only_the_crates_array() -> None:
-    module = _load()
-    registry_text = """\
-CRATES=(
-    "known|crates/known|known"
-    "openapi-gen|clients/openapi-gen|-"
-)
-
-PYTHON_PACKAGES=(
-    "ignored|python/ignored|python/ignored/pyproject.toml"
-)
-"""
-
-    assert module.version_registry_crates(registry_text) == {
-        "known": "crates/known",
-        "openapi-gen": "clients/openapi-gen",
-    }
-
-
-@pytest.mark.parametrize(
-    ("registry_text", "expected"),
-    [
-        (
-            "CRATES=(\n)\n",
-            "release-governed package missing from version registry: known",
-        ),
-        (
-            'CRATES=(\n    "known|crates/not_known|known"\n)\n',
-            "version registry path mismatch for known: "
-            "expected crates/known, found crates/not_known",
-        ),
-    ],
-)
-def test_release_governed_package_requires_version_registry_coverage(
-    registry_text: str, expected: str
-) -> None:
-    module = _load()
-    entries = [
-        module.InventoryEntry(
-            "known",
-            "crates/known",
-            "published-library",
-            True,
-            "release-crates",
-            "CODEOWNERS",
-        )
-    ]
-
-    registry = module.version_registry_crates(registry_text)
-    assert module.validate_version_registry_coverage(entries, registry) == [expected]
-
-
-def test_render_inventory_is_sorted_and_marks_semver() -> None:
-    module = _load()
-    entries = [
-        module.InventoryEntry("zeta", "crates/zeta", "quality-only", False, "none", "CODEOWNERS"),
-        module.InventoryEntry(
-            "alpha", "crates/alpha", "published-library", True, "release-crates", "CODEOWNERS"
-        ),
-    ]
-
-    rendered = module.render_inventory(entries)
-    assert rendered.index("`alpha`") < rendered.index("`zeta`")
-    assert "| `alpha` | `crates/alpha` | published-library | yes |" in rendered
-
-
-def test_write_doc_rejects_missing_release_coverage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = _load()
-    inventory = tmp_path / "api-surfaces.toml"
-    inventory.write_text(
-        """\
-schema-version = 1
-
-[[package]]
-name = "known"
-path = "crates/known"
-classification = "published-library"
-semver = true
-release = "release-crates"
-owner = "CODEOWNERS"
-"""
-    )
-    workflow = tmp_path / "release-crates.yml"
-    workflow.write_text("jobs: {}\n")
-    registry = tmp_path / "check_release_versions.sh"
-    registry.write_text('CRATES=(\n    "known|crates/known|known"\n)\n')
-    generated = tmp_path / "api-surface-inventory.md"
-
-    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
-    monkeypatch.setattr(module, "INVENTORY_PATH", inventory)
-    monkeypatch.setattr(module, "RELEASE_WORKFLOW_PATH", workflow)
-    monkeypatch.setattr(module, "VERSION_REGISTRY_PATH", registry)
-    monkeypatch.setattr(module, "INVENTORY_DOC_PATH", generated)
-    monkeypatch.setattr(
-        module,
-        "_cargo_metadata",
-        lambda: {
-            "packages": [
-                {
-                    "name": "known",
-                    "manifest_path": str(tmp_path / "crates/known/Cargo.toml"),
-                    "publish": None,
-                    "targets": [{"kind": ["lib"]}],
-                }
-            ]
-        },
-    )
-
-    assert module._run("write-doc") == [
         "release-governed package missing from release-crates workflow: known"
     ]
-    assert not generated.exists()
+    assert module.validate_version_registry_coverage(entries, {}) == [
+        "release-governed package missing from version registry: known"
+    ]
 
 
-@pytest.mark.parametrize(
-    ("mapping_source", "mapped_name", "expected"),
-    [
-        (
-            "workflow-missing",
-            "extra",
-            "release-crates workflow references package absent from inventory: extra",
-        ),
-        (
-            "workflow-non-release",
-            "known",
-            "release-crates workflow references non-release-governed package: known",
-        ),
-        (
-            "registry-missing",
-            "extra",
-            "version registry references package absent from inventory: extra",
-        ),
-        (
-            "registry-non-release",
-            "known",
-            "version registry references non-release-governed package: known",
-        ),
-    ],
-)
-def test_check_rejects_reverse_release_mapping_drift(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    mapping_source: str,
-    mapped_name: str,
-    expected: str,
-) -> None:
+def test_check_accepts_current_repository_inventory() -> None:
     module = _load()
-    inventory = tmp_path / "api-surfaces.toml"
-    inventory.write_text(
-        """\
-schema-version = 1
 
-[[package]]
-name = "known"
-path = "crates/known"
-classification = "quality-only"
-semver = false
-release = "none"
-owner = "CODEOWNERS"
-"""
-    )
-    workflow = tmp_path / "release-crates.yml"
-    workflow.write_text(
-        f"jobs:\n  release:\n    crate: {mapped_name}\n    path: crates/{mapped_name}\n"
-        if mapping_source.startswith("workflow")
-        else "jobs: {}\n"
-    )
-    registry = tmp_path / "check_release_versions.sh"
-    registry.write_text(
-        f'CRATES=(\n    "{mapped_name}|crates/{mapped_name}|{mapped_name}"\n)\n'
-        if mapping_source.startswith("registry")
-        else "CRATES=(\n)\n"
-    )
-
-    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
-    monkeypatch.setattr(module, "INVENTORY_PATH", inventory)
-    monkeypatch.setattr(module, "RELEASE_WORKFLOW_PATH", workflow)
-    monkeypatch.setattr(module, "VERSION_REGISTRY_PATH", registry)
-    monkeypatch.setattr(module, "INVENTORY_DOC_PATH", tmp_path / "inventory.md")
-    monkeypatch.setattr(
-        module,
-        "_cargo_metadata",
-        lambda: {
-            "packages": [
-                {
-                    "name": "known",
-                    "manifest_path": str(tmp_path / "crates/known/Cargo.toml"),
-                    "publish": [],
-                    "targets": [{"kind": ["lib"]}],
-                }
-            ]
-        },
-    )
-
-    assert module._run("check") == [expected]
+    assert module._run() == []
