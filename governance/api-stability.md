@@ -86,8 +86,9 @@ base.
 - Removed fields and enum values reserve both their numbers and names.
 - An RPC cannot be removed or changed incompatibly in place; introduce a versioned
   replacement instead.
-- Additive optional fields, messages, enum values, and RPCs are permitted when
-  generated consumers continue to compile or import.
+- Additive optional fields, messages, enum values, and RPCs are permitted only when
+  supported generated consumers continue to compile or import, parse the expanded
+  contract, and operate correctly with the additions.
 
 An addition is additive only under that generated-consumer condition. Marking and
 retaining an existing field, enum value, or RPC while a replacement is available is
