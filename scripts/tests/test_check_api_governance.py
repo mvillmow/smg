@@ -276,7 +276,7 @@ def test_published_library_requires_semver_and_release_governance(
     assert expected in module.validate_inventory(packages, entries)
 
 
-def test_publishable_crate_missing_from_release_workflow_fails() -> None:
+def test_release_governed_package_missing_from_release_workflow_fails() -> None:
     module = _load()
     entries = [
         module.InventoryEntry(
@@ -290,7 +290,7 @@ def test_publishable_crate_missing_from_release_workflow_fails() -> None:
     ]
 
     assert module.validate_release_coverage(entries, {"openai-protocol": "crates/protocols"}) == [
-        "publishable crate missing from release-crates workflow: engine-zmq-client"
+        "release-governed package missing from release-crates workflow: engine-zmq-client"
     ]
 
 
@@ -426,6 +426,6 @@ owner = "CODEOWNERS"
     )
 
     assert module._run("write-doc") == [
-        "publishable crate missing from release-crates workflow: known"
+        "release-governed package missing from release-crates workflow: known"
     ]
     assert not generated.exists()

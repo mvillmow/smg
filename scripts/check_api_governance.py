@@ -251,7 +251,9 @@ def validate_release_coverage(
             continue
         workflow_path = workflow_crates.get(entry.name)
         if workflow_path is None:
-            errors.append(f"publishable crate missing from release-crates workflow: {entry.name}")
+            errors.append(
+                f"release-governed package missing from release-crates workflow: {entry.name}"
+            )
         elif workflow_path != entry.path:
             errors.append(
                 f"release workflow path mismatch for {entry.name}: "
