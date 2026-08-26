@@ -31,6 +31,15 @@ keys, defaults, exit behavior, and machine-consumed output are also contracts.
   contract, including a failure to compile, import, send, parse, or operate as
   before.
 
+For HTTP/OpenAPI, a new route or optional input or response field is additive only
+when existing supported clients continue to send, parse, and operate correctly.
+Removing a route or method, making an input required, narrowing accepted input, or
+changing response, error, streaming media type, or authentication semantics is
+breaking. For CLI and configuration, a new optional flag or key is additive only
+when its default preserves behavior and output. Removing, renaming, retyping, making
+required, narrowing accepted values, or changing the meaning of a flag or key is
+breaking, as is changing a default, exit behavior, or machine-consumed output.
+
 For Rust crates at 1.0 or later, a breaking public API change requires a major
 release. Before 1.0, patch releases remain compatible and a breaking change requires
 the next minor release. Protobuf field numbers and meanings remain immutable; removed
@@ -39,34 +48,38 @@ requires a versioned replacement.
 
 ## Deprecation and intentional breaks
 
-Normal removal follows deprecation for at least two published minor releases and 90
-days, whichever is later. The deprecation documentation identifies the replacement
-and migration path. An emergency security change may shorten the window only when its
-pull request records the reason, affected versions, approvers, and replacement path.
+For published Rust crates, normal removal follows deprecation for at least two minor
+releases and 90 days, whichever is later. Other stable contracts retain the old
+behavior for a documented, contract-appropriate window of at least 90 days and use
+their established version or release mechanism. The deprecation documentation
+identifies the replacement and migration path. An emergency security change may
+shorten the window only when its pull request records the reason, affected versions,
+approvers, and replacement path.
 
 An intentional break requires the `api-break-approved` label, the affected contract
-and classification, the applicable major or pre-1.0 minor version decision, release
-notes, a concrete migration path, and approval from the applicable CODEOWNER and a
-Core Maintainer acting as release owner. If one person fills both roles, a second Core
-Maintainer approves. Exceptions must be narrow, documented, owned, and expire within
-90 days; silent waivers and broad local weakenings are not exceptions.
+and classification, and the version, versioned-replacement, or release action
+required for that surface. The change also requires release notes, a concrete
+migration path, and approval from the applicable CODEOWNER and a Core Maintainer
+acting as release owner. If one person fills both roles, a second Core Maintainer
+approves. Exceptions must be narrow, documented, owned, and expire within 90 days;
+silent waivers and broad local weakenings are not exceptions.
 
 ## Enforcement
 
 The repository's existing workspace checks enforce package quality:
 
 ```bash
-cargo +nightly fmt --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo +nightly fmt -- --check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
-The inventory checker confirms all `crates/**` manifests remain covered and that
-release and version registries agree with governed packages:
+The inventory gate must fail when a regular `crates/**` package is missing from
+the authoritative inventory or workspace, does not inherit workspace lints, or
+disagrees with governed release and version metadata. The maintained checker and
+its focused tests live with the inventory implementation.
 
-```bash
-python3 scripts/check_api_governance.py --check
-```
-
-Dedicated compatibility checks enforce the published Rust/SDK, protobuf, and
-HTTP/OpenAPI boundaries directly in the existing pull-request workflow.
+Today, `grpc-proto-build-check` builds and imports the generated Python gRPC package,
+while `build-wheel` generates the OpenAPI document and Python client. The separately
+tracked inventory, Rust/SDK SemVer, protobuf compatibility, and HTTP/OpenAPI contract
+jobs become enforced only when they feed the existing pull-request `finish` job.
