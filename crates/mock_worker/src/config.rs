@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::engine::EngineParams;
+use crate::{engine::EngineParams, sim::SimParams};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -36,8 +36,17 @@ pub struct Config {
     /// When true, each worker runs the realistic continuous-batching engine
     /// simulator ([`EngineParams`]); when false, the cheap canned path.
     pub realistic: bool,
+    /// When true, each HTTP worker runs the scale-simulation engine
+    /// ([`SimParams`]): SGLang-native `/generate`, prefix-cache accounting,
+    /// analytic timing. gRPC/ZMQ workers fall back to canned behavior.
+    pub sim: bool,
     /// Engine-simulator parameters (only used when `realistic`).
     pub engine: EngineParams,
+    /// Scale-simulation parameters (only used when `sim`). The shared
+    /// `--prefill-tps/--max-running/--kv-tokens/--block-size` flags write
+    /// both engine structs, so each mode keeps its own defaults while an
+    /// explicit flag applies to whichever mode runs.
+    pub sim_params: SimParams,
 }
 
 impl Config {
@@ -57,7 +66,9 @@ impl Config {
             gen_delay: Duration::from_millis(0),
             output_tokens: 8,
             realistic: false,
+            sim: false,
             engine: EngineParams::default(),
+            sim_params: SimParams::default(),
         };
 
         let mut args = std::env::args().skip(1);
@@ -79,16 +90,36 @@ impl Config {
                     cfg.gen_delay = Duration::from_millis(parse(value(&mut args, &flag)?, &flag)?);
                 }
                 "--output-tokens" => cfg.output_tokens = parse(value(&mut args, &flag)?, &flag)?,
-                "--engine" => {
-                    cfg.realistic = match value(&mut args, &flag)?.as_str() {
-                        "realistic" => true,
-                        "canned" => false,
-                        other => {
-                            return Err(format!("--engine must be canned|realistic, got {other}"))
-                        }
+                "--engine" => match value(&mut args, &flag)?.as_str() {
+                    "realistic" => (cfg.realistic, cfg.sim) = (true, false),
+                    "sim" => (cfg.realistic, cfg.sim) = (false, true),
+                    "canned" => (cfg.realistic, cfg.sim) = (false, false),
+                    other => {
+                        return Err(format!(
+                            "--engine must be canned|realistic|sim, got {other}"
+                        ))
                     }
+                },
+                "--sim-itl-ms" => {
+                    cfg.sim_params.itl_ms = parse(value(&mut args, &flag)?, &flag)?;
                 }
-                "--prefill-tps" => cfg.engine.prefill_tps = parse(value(&mut args, &flag)?, &flag)?,
+                "--sim-ttft-base-ms" => {
+                    cfg.sim_params.ttft_base_ms = parse(value(&mut args, &flag)?, &flag)?;
+                }
+                "--image-placeholder-id" => {
+                    cfg.sim_params.image_placeholder_id = parse(value(&mut args, &flag)?, &flag)?;
+                }
+                "--image-tokens-per-image" => {
+                    cfg.sim_params.image_tokens_per_image = parse(value(&mut args, &flag)?, &flag)?;
+                }
+                "--image-bytes-per-token" => {
+                    cfg.sim_params.image_bytes_per_token = parse(value(&mut args, &flag)?, &flag)?;
+                }
+                "--prefill-tps" => {
+                    let tps: f64 = parse(value(&mut args, &flag)?, &flag)?;
+                    cfg.engine.prefill_tps = tps;
+                    cfg.sim_params.prefill_tps = tps;
+                }
                 "--decode-base-ms" => {
                     cfg.engine.decode_base_ms = parse(value(&mut args, &flag)?, &flag)?;
                 }
@@ -98,11 +129,21 @@ impl Config {
                 "--prefill-chunk" => {
                     cfg.engine.prefill_chunk_tokens = parse(value(&mut args, &flag)?, &flag)?;
                 }
-                "--max-running" => cfg.engine.max_running = parse(value(&mut args, &flag)?, &flag)?,
-                "--kv-tokens" => {
-                    cfg.engine.kv_capacity_tokens = parse(value(&mut args, &flag)?, &flag)?;
+                "--max-running" => {
+                    let n: usize = parse(value(&mut args, &flag)?, &flag)?;
+                    cfg.engine.max_running = n;
+                    cfg.sim_params.max_running = n;
                 }
-                "--block-size" => cfg.engine.block_size = parse(value(&mut args, &flag)?, &flag)?,
+                "--kv-tokens" => {
+                    let n: u64 = parse(value(&mut args, &flag)?, &flag)?;
+                    cfg.engine.kv_capacity_tokens = n;
+                    cfg.sim_params.kv_capacity_tokens = n;
+                }
+                "--block-size" => {
+                    let n: u32 = parse(value(&mut args, &flag)?, &flag)?;
+                    cfg.engine.block_size = n;
+                    cfg.sim_params.block_size = n as usize;
+                }
                 "--prefix-cache" => {
                     cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?
                 }
@@ -160,7 +201,7 @@ fn usage() -> String {
        --output-tokens <n>      output tokens per request when unspecified (default 8)\n\
      \n\
      Realistic engine simulator (continuous batching; opt-in):\n\
-       --engine <canned|realistic>  engine mode (default canned)\n\
+       --engine <canned|realistic|sim>  engine mode (default canned)\n\
        --prefill-tps <f>        prefill throughput, tokens/sec (default 8000)\n\
        --decode-base-ms <f>     fixed decode-step latency, ms (default 6.0)\n\
        --decode-per-req-ms <f>  added decode-step latency per running req (default 0.35)\n\
@@ -168,6 +209,15 @@ fn usage() -> String {
        --max-running <n>        max concurrent running requests (default 256)\n\
        --kv-tokens <n>          KV cache capacity in tokens (default 524288)\n\
        --block-size <n>         cache block/page size in tokens (default 16)\n\
-       --prefix-cache <bool>    enable prefix caching + KV events (default true)"
+       --prefix-cache <bool>    enable prefix caching + KV events (default true)\n\
+     \n\
+     Scale-simulation engine (SGLang-native /generate; HTTP only; opt-in):\n\
+       --sim-itl-ms <f>              per-output-token latency, ms (default 43)\n\
+       --sim-ttft-base-ms <f>        fixed pre-first-token overhead, ms (default 30)\n\
+       --image-placeholder-id <id>   image placeholder token id (default 151655)\n\
+       --image-tokens-per-image <n>  appended tokens per extra image; 0 = by size (default 0)\n\
+       --image-bytes-per-token <n>   payload bytes per derived image token (default 2800)\n\
+       (shares --prefill-tps --max-running --kv-tokens --block-size; sim\n\
+        defaults: kv 1200000 tokens, block 128)"
         .to_string()
 }

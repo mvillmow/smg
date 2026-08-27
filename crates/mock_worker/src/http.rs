@@ -33,12 +33,15 @@ use tokio::{net::TcpListener, sync::mpsc};
 use crate::{
     config::Config,
     engine::{self, Engine, NewRequest},
+    sim::{self, SimWorker},
 };
 
 /// Per-listener HTTP state: shared config plus an optional engine simulator.
 pub struct AppState {
     cfg: Arc<Config>,
     engine: Option<Engine>,
+    /// Scale-simulation worker (`--engine sim`); `None` in the other modes.
+    sim: Option<Arc<SimWorker>>,
 }
 
 /// Build the router serving the mock HTTP worker contract.
@@ -48,7 +51,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
-        .route("/generate", post(chat_completions))
+        .route("/generate", post(generate))
         .route("/v1/loads", get(loads))
         .with_state(state)
 }
@@ -64,7 +67,10 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
     };
     // One simulated engine per listener (i.e. per virtual worker).
     let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
-    let state = Arc::new(AppState { cfg, engine });
+    let sim = cfg
+        .sim
+        .then(|| SimWorker::new(cfg.sim_params.clone(), port));
+    let state = Arc::new(AppState { cfg, engine, sim });
     if let Err(e) = axum::serve(listener, router(state)).await {
         tracing::error!("http worker {port} stopped: {e}");
     }
@@ -90,6 +96,25 @@ async fn models(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn loads(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(sim) = &state.sim {
+        let s = sim.load();
+        let value = json!({
+            "dp_rank": 0,
+            "num_running_reqs": s.num_running_reqs,
+            "num_waiting_reqs": s.num_waiting_reqs,
+            "num_waiting_uncached_tokens": s.num_waiting_uncached_tokens,
+            "num_total_reqs": s.num_running_reqs + s.num_waiting_reqs,
+            "num_used_tokens": s.num_used_tokens,
+            "max_total_num_tokens": s.max_total_num_tokens,
+            "token_usage": s.token_usage,
+            "gen_throughput": s.gen_throughput,
+            "cache_hit_rate": s.cache_hit_rate,
+            "utilization": s.token_usage,
+            "max_running_requests": s.max_running_requests,
+        });
+        return Json(json!({ "timestamp": "", "dp_rank_count": 1, "loads": [value] }))
+            .into_response();
+    }
     let load = state.engine.as_ref().map(|e| e.load());
     let value = match load {
         Some(s) => json!({
@@ -140,6 +165,70 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Re
 
 async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     handle(Endpoint::Completions, state, body).await
+}
+
+/// `/generate`: SGLang-native semantics in sim mode; the historical
+/// chat-shaped alias in canned/realistic modes (existing rigs depend on it).
+async fn generate(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    match &state.sim {
+        Some(sim) => sim_generate(Arc::clone(sim), &state.cfg, body).await,
+        None => handle(Endpoint::Chat, state, body).await,
+    }
+}
+
+/// Sim-mode `/generate`: parse the SGLang request shape, drop the (large)
+/// body immediately, admit into the per-worker simulator, then answer on
+/// the analytic timeline — first SSE frame at TTFT, completion at the end
+/// of decode. All accounting is released by the admission guard even when
+/// the client disconnects mid-stream.
+async fn sim_generate(sim: Arc<SimWorker>, cfg: &Config, body: Bytes) -> Response {
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    drop(body);
+    let stream_requested = parsed
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let input_ids = sim::extract_input_ids(&parsed)
+        .unwrap_or_else(|| synth_token_ids(&extract_prompt_text(&parsed)));
+    let images = sim::extract_images(&parsed);
+    let max_new = sim::extract_max_new_tokens(&parsed).unwrap_or(cfg.output_tokens);
+    let effective = sim.effective_sequence(&input_ids, &images);
+    drop(parsed);
+
+    let adm = sim.admit(effective, max_new).await;
+    if !stream_requested {
+        tokio::time::sleep(adm.ttft + adm.decode).await;
+        return Json(sim::native_response(&adm, true)).into_response();
+    }
+
+    enum St {
+        Ttft(sim::Admitted),
+        Decode(sim::Admitted),
+        Done,
+        End,
+    }
+    let body = stream::unfold(St::Ttft(adm), |st| async move {
+        match st {
+            St::Ttft(adm) => {
+                tokio::time::sleep(adm.ttft).await;
+                let frame = sim::native_response(&adm, false);
+                Some((
+                    Ok::<_, Infallible>(Event::default().data(frame.to_string())),
+                    St::Decode(adm),
+                ))
+            }
+            St::Decode(adm) => {
+                tokio::time::sleep(adm.decode).await;
+                let frame = sim::native_response(&adm, true);
+                // `adm` drops here: admission slot + KV pin released, full
+                // sequence folded into the prefix cache.
+                Some((Ok(Event::default().data(frame.to_string())), St::Done))
+            }
+            St::Done => Some((Ok(Event::default().data("[DONE]")), St::End)),
+            St::End => None,
+        }
+    });
+    Sse::new(body).into_response()
 }
 
 async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Response {
