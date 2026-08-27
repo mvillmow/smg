@@ -37,6 +37,62 @@ SCENARIOS = {
         ("hash-ingress", {"loadgen.ingress": "hash"}, None),
         ("random-ingress", {"loadgen.ingress": "random"}, None),
     ],
+    # What does it take to sustain >= 0.80 aggregate cached/prompt? The
+    # aggregate is (1-f)*prefix_share + f*followup_ratio where f is the
+    # follow-up share of requests — a traffic property. Legs: today's
+    # 1.5-turn mix; a ~5-6-turn conversational mix; the same plus a larger
+    # shared prefix; and the same with the SMG placement TTL below the
+    # think time — the config trap that silently forfeits the hits.
+    "hit-rate-calibration": [
+        ("baseline-1p5turn", {}, None),
+        (
+            "multiturn",
+            {
+                "loadgen.t2_ratio": 0.85,
+                "loadgen.max_turns": 8,
+                "loadgen.t2_suffix_tokens": 256,
+            },
+            None,
+        ),
+        (
+            "multiturn-prefix4k",
+            {
+                "loadgen.t2_ratio": 0.85,
+                "loadgen.max_turns": 8,
+                "loadgen.t2_suffix_tokens": 256,
+                "loadgen.system_prefix_tokens": 4096,
+            },
+            None,
+        ),
+        (
+            "multiturn-ttl-trap",
+            {
+                "loadgen.t2_ratio": 0.85,
+                "loadgen.max_turns": 8,
+                "loadgen.t2_suffix_tokens": 256,
+                "loadgen.think_secs": 6,
+                "smg_flags": [
+                    "--policy", "cache_aware",
+                    "--cache-index", "hash",
+                    "--cache-threshold", "0.60",
+                    "--block-size", "128",
+                    "--cache-boundaries", "3072,4096,6144,8192,12288,16384",
+                    "--balance-abs-threshold", "8",
+                    "--balance-rel-threshold", "1.2",
+                    "--overlap-decay", "1.0",
+                    "--disable-retries",
+                    "--upstream-http2",
+                    "--max-concurrent-requests", "180000",
+                    "--queue-size", "512",
+                    "--queue-timeout-secs", "5",
+                    "--worker-overload-waiting-requests", "64",
+                    "--worker-overload-token-usage", "0.9",
+                    "--cache-ttl-secs", "2",
+                ],
+            },
+            None,
+        ),
+    ],
     # The hash placement index is LOCAL to each SMG: turn-2 affinity only
     # survives if turn 2 reaches the same SMG. This isolates that effect.
     # Does a smaller SMG fleet raise cache hit rates? With sticky turns the
@@ -132,11 +188,25 @@ def extract_rows(report):
     for metric in ("ttft_ms", "e2e_ms"):
         for pct in ("p50", "p90", "p99"):
             rows["%s_%s" % (metric, pct)] = _get(summary, metric, pct)
-    for turn in ("turn1", "turn2"):
+    for turn in ("turn1", "turn2", "followup"):
         rows[turn + " cached ratio (loadgen)"] = _get(
             summary, "turns", turn, "cached_ratio_mean"
         )
+    # Aggregate mean cached/prompt over all requests, from the per-turn
+    # blocks (turn1 + all follow-ups), weighted by request count.
+    parts = []
+    for block in ("turn1", "followup"):
+        n = _get(summary, "turns", block, "ok")
+        r = _get(summary, "turns", block, "cached_ratio_mean")
+        if isinstance(n, int) and n > 0 and isinstance(r, (int, float)):
+            parts.append((n, r))
+    total_n = sum(n for n, _ in parts)
+    rows["AGGREGATE cached/prompt"] = (
+        round(sum(n * r for n, r in parts) / total_n, 4) if total_n else None
+    )
+    rows["mean turns/session"] = summary.get("mean_turns_per_session")
     rows["t2 same-worker (loadgen)"] = summary.get("turn2_same_worker_rate")
+    rows["followup same-worker"] = summary.get("followup_same_worker_rate")
     rows["t1 max worker share"] = _get(summary, "turn1_workers", "max_share")
     rows["t1 entropy (norm)"] = _get(summary, "turn1_workers", "normalized_entropy")
     for turn in ("turn1", "turn2"):

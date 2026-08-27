@@ -121,6 +121,47 @@ pub fn summarize(
         Some(t2_matches.iter().filter(|&&same| same).count() as f64 / t2_matches.len() as f64)
     };
 
+    // Consecutive-turn stickiness across ALL follow-up turns: each turn t is
+    // compared with its session's turn t-1 worker (from the whole run).
+    let mut turn_ports: HashMap<(u64, u8), u64> = HashMap::new();
+    for record in records {
+        if record.is_ok() {
+            if let Some(port) = record.worker_port {
+                turn_ports
+                    .entry((record.session, record.turn))
+                    .or_insert(port);
+            }
+        }
+    }
+    let followup_matches: Vec<bool> = ok
+        .iter()
+        .filter(|r| r.turn >= 2)
+        .filter_map(|r| {
+            let port = r.worker_port?;
+            Some(port == *turn_ports.get(&(r.session, r.turn - 1))?)
+        })
+        .collect();
+    let followup_same_worker_rate = if followup_matches.is_empty() {
+        None
+    } else {
+        Some(
+            followup_matches.iter().filter(|&&same| same).count() as f64
+                / followup_matches.len() as f64,
+        )
+    };
+
+    // Mean turns per session, over sessions with at least one recorded turn.
+    let mut max_turn: HashMap<u64, u8> = HashMap::new();
+    for record in records {
+        let entry = max_turn.entry(record.session).or_insert(0);
+        *entry = (*entry).max(record.turn);
+    }
+    let mean_turns = if max_turn.is_empty() {
+        None
+    } else {
+        Some(max_turn.values().map(|&t| f64::from(t)).sum::<f64>() / max_turn.len() as f64)
+    };
+
     let mut worker_counts: BTreeMap<u64, u64> = BTreeMap::new();
     for record in ok.iter().filter(|r| r.turn == 1) {
         if let Some(port) = record.worker_port {
@@ -179,10 +220,13 @@ pub fn summarize(
         "ttft_ms": stats(&ttfts),
         "e2e_ms": stats(&e2es),
         "turns": {
-            "turn1": turn_block(&measured, 1),
-            "turn2": turn_block(&measured, 2),
+            "turn1": turn_block(&measured, Some(1)),
+            "turn2": turn_block(&measured, Some(2)),
+            "followup": turn_block(&measured, None),
         },
         "turn2_same_worker_rate": same_worker_rate,
+        "followup_same_worker_rate": followup_same_worker_rate,
+        "mean_turns_per_session": mean_turns,
         "turn1_workers": {
             "distinct": distinct,
             "max_share": max_share,
@@ -202,6 +246,7 @@ fn config_json(args: &Args) -> Value {
         "stream": args.stream,
         "http2": args.http2,
         "conns_per_origin": args.conns_per_origin,
+        "max_turns": args.max_turns,
         "ingress": args.ingress.as_str(),
         "turn2_ingress": args.turn2_ingress.as_str(),
         "routing_key_reuse": args.routing_key_reuse,
@@ -230,11 +275,16 @@ fn cdf_json(anchors: &[(u32, f64)]) -> Vec<Value> {
         .collect()
 }
 
-fn turn_block(measured: &[&RequestRecord], turn: u8) -> Value {
+/// Stats over one exact turn (`Some(n)`) or every follow-up turn (`None`,
+/// i.e. turn >= 2).
+fn turn_block(measured: &[&RequestRecord], turn: Option<u8>) -> Value {
     let of_turn: Vec<&RequestRecord> = measured
         .iter()
         .copied()
-        .filter(|r| r.turn == turn)
+        .filter(|r| match turn {
+            Some(t) => r.turn == t,
+            None => r.turn >= 2,
+        })
         .collect();
     let ok: Vec<&RequestRecord> = of_turn.iter().copied().filter(|r| r.is_ok()).collect();
     let ratios: Vec<f64> = ok.iter().filter_map(|r| r.cached_ratio()).collect();

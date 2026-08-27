@@ -48,8 +48,14 @@ pub struct Args {
     pub duration_secs: u64,
     /// Poisson session arrival rate.
     pub session_rps: f64,
-    /// Probability a session sends a turn-2 request.
+    /// Per-turn continue probability: after each turn the session sends
+    /// another with this probability (name kept from the two-turn contract,
+    /// where it was exactly the turn-2 probability).
     pub t2_ratio: f64,
+    /// Hard cap on turns per session; context growth also ends a session
+    /// when the next turn would exceed `--prompt-max` (the model's
+    /// context-window limit stands in for both).
+    pub max_turns: u32,
     /// Mean of the exponential think time between turn 1 and turn 2.
     pub think_secs: f64,
     /// Request SSE streaming responses (TTFT is only measurable when true).
@@ -112,6 +118,7 @@ impl Args {
             stream: true,
             http2: false,
             conns_per_origin: 4,
+            max_turns: 2,
             ingress: Ingress::Hash,
             turn2_ingress: Turn2Ingress::Same,
             routing_key_reuse: 0.0,
@@ -151,6 +158,7 @@ impl Args {
                 "--conns-per-origin" => {
                     cfg.conns_per_origin = parse(value(&mut args, &flag)?, &flag)?;
                 }
+                "--max-turns" => cfg.max_turns = parse(value(&mut args, &flag)?, &flag)?,
                 "--ingress" => {
                     cfg.ingress = match value(&mut args, &flag)?.as_str() {
                         "hash" => Ingress::Hash,
@@ -304,6 +312,8 @@ fn usage() -> String {
        --stream <bool>              request SSE streaming responses (default true)\n\
        --http2 <bool>               HTTP/2 prior knowledge to the SMGs (default false)\n\
        --conns-per-origin <n>       connections per SMG, round-robined (default 4)\n\
+       --max-turns <n>              turn cap per session; each turn continues with\n\
+                                    probability --t2-ratio (default 2)\n\
        --ingress <hash|random>      turn-1 SMG choice (default hash)\n\
        --turn2-ingress <same|hash|random>  turn-2 SMG choice (default same)\n\
        --routing-key-reuse <f>      fraction of sessions sharing one of 32 keys (default 0.0)\n\

@@ -51,8 +51,9 @@ pub fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Run one session: turn 1, then with probability `--t2-ratio` a think-time
-/// pause and turn 2 extending the turn-1 context with its returned output.
+/// Run one session: turn 1, then after each turn continue with probability
+/// `--t2-ratio` (up to `--max-turns`), each new turn extending the context
+/// with the previous turn's returned output plus a fresh suffix.
 pub async fn run(ctx: Arc<Ctx>, sid: u64) {
     let args = &ctx.args;
     let session_seed = dist::sub_seed(dist::sub_seed(args.seed, dist::SALT_SESSION), sid);
@@ -93,60 +94,63 @@ pub async fn run(ctx: Arc<Ctx>, sid: u64) {
         Ingress::Random => rng.next_index(n),
     };
 
-    // Draw the whole turn-2 plan up front so the session's random stream does
-    // not depend on the turn-1 outcome.
-    let t2_draw = rng.next_f64();
-    let think = rng.next_exp(args.think_secs);
-    let max_new_2 = ctx.output_cdf.sample(rng.next_f64());
-    let t2_smg_random = rng.next_index(n);
+    // Turn loop: each turn extends the context with the previous turn's
+    // returned output plus a fresh suffix; the session ends on the continue
+    // draw, the turn cap, a failed turn, or when the next context would
+    // exceed the model window (`--prompt-max`).
+    let mut context = input_ids;
+    let mut turn: u32 = 1;
+    let mut smg = t1_smg;
+    loop {
+        let max_new = if turn == 1 {
+            max_new_1
+        } else {
+            ctx.output_cdf.sample(rng.next_f64())
+        };
+        let output_ids = send_turn(
+            &ctx,
+            &TurnRequest {
+                sid,
+                session_seed,
+                turn: turn.min(u32::from(u8::MAX)) as u8,
+                key: &key,
+                smg,
+                input_ids: &context,
+                max_new,
+            },
+        )
+        .await;
 
-    let output_ids = send_turn(
-        &ctx,
-        &TurnRequest {
-            sid,
-            session_seed,
-            turn: 1,
-            key: &key,
-            smg: t1_smg,
-            input_ids: &input_ids,
-            max_new: max_new_1,
-        },
-    )
-    .await;
+        let cont = rng.next_f64() < args.t2_ratio;
+        let think = rng.next_exp(args.think_secs);
+        if !cont || turn >= args.max_turns {
+            return;
+        }
+        // A failed turn has no output to extend; the session ends there.
+        let Some(output_ids) = output_ids else {
+            return;
+        };
+        let suffix = args.t2_suffix_tokens as usize;
+        if context.len() + output_ids.len() + suffix > args.prompt_max as usize {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs_f64(think)).await;
 
-    if t2_draw >= args.t2_ratio {
-        return;
+        context.extend(output_ids);
+        context.extend(dist::token_ids(
+            dist::sub_seed(
+                dist::sub_seed(session_seed, dist::SALT_SUFFIX),
+                u64::from(turn),
+            ),
+            suffix,
+        ));
+        turn += 1;
+        smg = match args.turn2_ingress {
+            Turn2Ingress::Same => t1_smg,
+            Turn2Ingress::Hash => (dist::hash_str(&key) % n as u64) as usize,
+            Turn2Ingress::Random => rng.next_index(n),
+        };
     }
-    // A failed turn 1 has no output to extend; the session ends there.
-    let Some(output_ids) = output_ids else {
-        return;
-    };
-    tokio::time::sleep(Duration::from_secs_f64(think)).await;
-
-    let mut t2_ids = input_ids;
-    t2_ids.extend(output_ids);
-    t2_ids.extend(dist::token_ids(
-        dist::sub_seed(session_seed, dist::SALT_SUFFIX),
-        args.t2_suffix_tokens as usize,
-    ));
-    let t2_smg = match args.turn2_ingress {
-        Turn2Ingress::Same => t1_smg,
-        Turn2Ingress::Hash => (dist::hash_str(&key) % n as u64) as usize,
-        Turn2Ingress::Random => t2_smg_random,
-    };
-    send_turn(
-        &ctx,
-        &TurnRequest {
-            sid,
-            session_seed,
-            turn: 2,
-            key: &key,
-            smg: t2_smg,
-            input_ids: &t2_ids,
-            max_new: max_new_2,
-        },
-    )
-    .await;
 }
 
 struct TurnRequest<'a> {
