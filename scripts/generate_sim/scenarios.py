@@ -37,6 +37,16 @@ SCENARIOS = {
         ("hash-ingress", {"loadgen.ingress": "hash"}, None),
         ("random-ingress", {"loadgen.ingress": "random"}, None),
     ],
+    # The hash placement index is LOCAL to each SMG: turn-2 affinity only
+    # survives if turn 2 reaches the same SMG. This isolates that effect.
+    "turn2-same-vs-random-smg": [
+        ("t2-same-smg", {"loadgen.turn2_ingress": "same"}, None),
+        (
+            "t2-random-smg",
+            {"loadgen.ingress": "random", "loadgen.turn2_ingress": "random"},
+            None,
+        ),
+    ],
     "cold-vs-warm-prefix": [
         ("cold", {"loadgen.system_prefix_tokens": 0}, None),
         ("warm", {"loadgen.system_prefix_tokens": 2048}, None),
