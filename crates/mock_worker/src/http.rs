@@ -195,9 +195,11 @@ async fn sim_generate(sim: Arc<SimWorker>, cfg: &Config, body: Bytes) -> Respons
     let effective = sim.effective_sequence(&input_ids, &images);
     drop(parsed);
 
-    let adm = sim.admit(effective, max_new).await;
+    let mut adm = sim.admit(effective, max_new).await;
     if !stream_requested {
-        tokio::time::sleep(adm.ttft + adm.decode).await;
+        tokio::time::sleep(adm.ttft).await;
+        adm.finish_prefill();
+        tokio::time::sleep(adm.decode).await;
         return Json(sim::native_response(&adm, true)).into_response();
     }
 
@@ -209,8 +211,9 @@ async fn sim_generate(sim: Arc<SimWorker>, cfg: &Config, body: Bytes) -> Respons
     }
     let body = stream::unfold(St::Ttft(adm), |st| async move {
         match st {
-            St::Ttft(adm) => {
+            St::Ttft(mut adm) => {
                 tokio::time::sleep(adm.ttft).await;
+                adm.finish_prefill();
                 let frame = sim::native_response(&adm, false);
                 Some((
                     Ok::<_, Infallible>(Event::default().data(frame.to_string())),

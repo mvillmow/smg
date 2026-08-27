@@ -112,9 +112,19 @@ pub struct Admitted {
     pub request_id: String,
     pub worker_port: u16,
     /// Held for the request's lifetime; dropping it releases admission and
-    /// KV accounting and folds the sequence into the cache. Never read —
-    /// its Drop is the point.
-    _guard: CompletionGuard,
+    /// KV accounting and folds the finished sequence into the cache.
+    guard: CompletionGuard,
+}
+
+impl Admitted {
+    /// Mark simulated prefill complete: only now do the prompt's blocks
+    /// enter the shared prefix cache (a concurrent request must not hit KV
+    /// that hasn't been computed), and the request's private KV claim
+    /// shrinks to its output reservation — the prompt blocks are accounted
+    /// by the cache from here on, never in both places. Idempotent.
+    pub fn finish_prefill(&mut self) {
+        self.guard.finish_prefill();
+    }
 }
 
 impl SimWorker {
@@ -137,7 +147,13 @@ impl SimWorker {
 
     pub fn load(&self) -> SimLoad {
         let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let used = st.running_tokens + st.cache.tokens(self.params.block_size);
+        // Reported usage covers RUNNING work only: the prefix cache is
+        // evictable headroom, and engines report it that way (the
+        // production sample — 38 running, 41% usage — only reconciles if
+        // cached-but-idle KV is excluded). Counting the cache here drives
+        // usage to 1.0 at steady state and trips the gateway's overload
+        // veto fleet-wide, which production does not observe.
+        let used = st.running_tokens;
         let cap = self.params.kv_capacity_tokens.max(1);
         SimLoad {
             num_running_reqs: st.running as i64,
@@ -152,6 +168,14 @@ impl SimWorker {
             cache_hit_rate: st.hit_rate_ewma,
             max_running_requests: self.params.max_running as i64,
         }
+    }
+
+    /// Test-only view of the evictable prefix-cache size in tokens (not
+    /// part of reported usage; see [`Self::load`]).
+    #[cfg(test)]
+    fn cache_tokens_for_test(&self) -> u64 {
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.cache.tokens(self.params.block_size)
     }
 
     /// Effective cached sequence: `input_ids` with each placeholder run
@@ -221,20 +245,24 @@ impl SimWorker {
             .expect("admission semaphore never closes");
 
         let prompt_tokens = effective.len();
-        let seq_tokens = prompt_tokens as u64 + u64::from(max_new);
-        let cached_tokens = {
+        // Private KV claim while running: the uncached prompt (owned by this
+        // request until prefill completes and the blocks move to the shared
+        // cache) plus the output reservation. Cached prompt blocks are
+        // already accounted by the cache, never counted twice.
+        let cached_tokens;
+        let private_tokens;
+        {
             let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
             st.waiting -= 1;
             st.waiting_uncached_tokens -= uncached_estimate;
             st.running += 1;
-            st.running_tokens += seq_tokens;
             let cached = st
                 .cache
                 .match_prefix(&effective, self.params.block_size)
                 .min(prompt_tokens);
-            // Prompt blocks are cached from admission on, so concurrent
-            // requests sharing a prefix hit each other's work.
-            st.cache.insert_chain(&effective, self.params.block_size);
+            cached_tokens = cached;
+            private_tokens = (prompt_tokens - cached) as u64 + u64::from(max_new);
+            st.running_tokens += private_tokens;
             let ratio = if prompt_tokens == 0 {
                 0.0
             } else {
@@ -246,8 +274,7 @@ impl SimWorker {
                 .kv_capacity_tokens
                 .saturating_sub(st.running_tokens);
             st.cache.evict_to(budget, self.params.block_size);
-            cached
-        };
+        }
 
         let uncached = (prompt_tokens - cached_tokens) as f64;
         let ttft = Duration::from_secs_f64(
@@ -268,11 +295,13 @@ impl SimWorker {
             decode,
             request_id: format!("sim-{}-{request_seed:016x}", self.port),
             worker_port: self.port,
-            _guard: CompletionGuard {
+            guard: CompletionGuard {
                 worker: Arc::clone(self),
                 effective,
                 output_ids: output_ids.clone(),
-                seq_tokens,
+                uncached_prompt_tokens: (prompt_tokens - cached_tokens) as u64,
+                output_reservation: u64::from(max_new),
+                prefill_done: false,
                 permit: Some(permit),
             },
             output_ids,
@@ -282,16 +311,41 @@ impl SimWorker {
 
 static NEXT_SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
-/// Releases a request's admission slot and KV pin, and folds its full
-/// sequence (prompt ⊕ output) into the prefix cache — turn-2 affinity
-/// depends on turn-1 output being cached. Runs on normal completion AND on
-/// client disconnect (response stream dropped).
+/// Releases a request's admission slot and KV pin. Cache publication is
+/// staged: nothing at admission; the prompt's blocks at prefill completion
+/// (`finish_prefill`); the full sequence (prompt ⊕ output — later-turn
+/// affinity depends on the output being cached) at completion. A request
+/// dropped before prefill completes publishes nothing. Runs on normal
+/// completion AND on client disconnect (response stream dropped).
 struct CompletionGuard {
     worker: Arc<SimWorker>,
     effective: Vec<u32>,
     output_ids: Vec<u32>,
-    seq_tokens: u64,
+    /// Private KV still claimed for the prompt; moves to the shared cache's
+    /// account at prefill completion.
+    uncached_prompt_tokens: u64,
+    output_reservation: u64,
+    prefill_done: bool,
     permit: Option<OwnedSemaphorePermit>,
+}
+
+impl CompletionGuard {
+    fn finish_prefill(&mut self) {
+        if self.prefill_done {
+            return;
+        }
+        self.prefill_done = true;
+        let params = self.worker.params.clone();
+        let mut st = self.worker.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.cache.insert_chain(&self.effective, params.block_size);
+        // The prompt blocks now live in the cache's account; release the
+        // private claim so they are never counted twice.
+        st.running_tokens = st
+            .running_tokens
+            .saturating_sub(self.uncached_prompt_tokens);
+        let budget = params.kv_capacity_tokens.saturating_sub(st.running_tokens);
+        st.cache.evict_to(budget, params.block_size);
+    }
 }
 
 impl Drop for CompletionGuard {
@@ -299,10 +353,18 @@ impl Drop for CompletionGuard {
         let params = self.worker.params.clone();
         let mut st = self.worker.state.lock().unwrap_or_else(|p| p.into_inner());
         st.running = st.running.saturating_sub(1);
-        st.running_tokens = st.running_tokens.saturating_sub(self.seq_tokens);
-        let mut full = std::mem::take(&mut self.effective);
-        full.extend_from_slice(&self.output_ids);
-        st.cache.insert_chain(&full, params.block_size);
+        if self.prefill_done {
+            st.running_tokens = st.running_tokens.saturating_sub(self.output_reservation);
+            let mut full = std::mem::take(&mut self.effective);
+            full.extend_from_slice(&self.output_ids);
+            st.cache.insert_chain(&full, params.block_size);
+        } else {
+            // Dropped before prefill finished: nothing was computed, nothing
+            // is published; release the whole private claim.
+            st.running_tokens = st
+                .running_tokens
+                .saturating_sub(self.uncached_prompt_tokens + self.output_reservation);
+        }
         let budget = params.kv_capacity_tokens.saturating_sub(st.running_tokens);
         st.cache.evict_to(budget, params.block_size);
         drop(st);
@@ -504,19 +566,74 @@ mod tests {
     async fn repeat_prompt_hits_cache() {
         let w = SimWorker::new(params(4), 9100);
         let ids: Vec<u32> = (0..64).collect();
-        let a = w.admit(ids.clone(), 4).await;
+        let mut a = w.admit(ids.clone(), 4).await;
         assert_eq!(a.cached_tokens, 0);
+        a.finish_prefill();
         drop(a);
         let b = w.admit(ids, 4).await;
         assert_eq!(b.cached_tokens, 64, "identical prompt must fully hit");
     }
 
     #[tokio::test]
+    async fn cache_not_published_before_prefill_completes() {
+        // A cold request's prompt must not be hittable while its prefill is
+        // still simulated as running, and never if it aborts before then.
+        let w = SimWorker::new(params(4), 9100);
+        let ids: Vec<u32> = (0..64).collect();
+        let mut a = w.admit(ids.clone(), 4).await;
+        let b = w.admit(ids.clone(), 4).await;
+        assert_eq!(b.cached_tokens, 0, "concurrent cold request must miss");
+        drop(b);
+
+        a.finish_prefill();
+        let c = w.admit(ids.clone(), 4).await;
+        assert_eq!(c.cached_tokens, 64, "after prefill the prompt is cached");
+        drop(c);
+        drop(a);
+
+        // An aborted-before-prefill request publishes nothing.
+        let novel: Vec<u32> = (5000..5064).collect();
+        let aborted = w.admit(novel.clone(), 4).await;
+        drop(aborted);
+        let d = w.admit(novel, 4).await;
+        assert_eq!(d.cached_tokens, 0, "aborted prefill must not publish KV");
+    }
+
+    #[tokio::test]
+    async fn prompt_kv_never_counted_in_both_running_and_cache() {
+        // 64-token cold prompt + 8 reserved output, block 4. Running usage
+        // is 72 at admission (all private); prefill completion MOVES the
+        // prompt claim to the evictable cache (running 8, cache 64) rather
+        // than duplicating it; completion leaves everything cached and
+        // nothing running. Reported usage covers running work only.
+        let w = SimWorker::new(params(4), 9100);
+        let mut a = w.admit((0..64).collect(), 8).await;
+        assert_eq!(w.load().num_used_tokens, 72);
+        assert_eq!(w.cache_tokens_for_test(), 0);
+        a.finish_prefill();
+        assert_eq!(
+            w.load().num_used_tokens,
+            8,
+            "only the output reservation stays running"
+        );
+        assert_eq!(w.cache_tokens_for_test(), 64, "prompt moved to the cache");
+        drop(a);
+        assert_eq!(w.load().num_used_tokens, 0);
+        assert_eq!(
+            w.cache_tokens_for_test(),
+            72,
+            "prompt \u{2295} output cached"
+        );
+        assert_eq!(w.load().num_running_reqs, 0);
+    }
+
+    #[tokio::test]
     async fn turn_two_hits_turn_one_prompt_and_output() {
         let w = SimWorker::new(params(4), 9100);
         let t1: Vec<u32> = (0..64).collect();
-        let a = w.admit(t1.clone(), 8).await;
+        let mut a = w.admit(t1.clone(), 8).await;
         let output = a.output_ids.clone();
+        a.finish_prefill();
         drop(a); // completion caches prompt ⊕ output
         let mut t2 = t1;
         t2.extend_from_slice(&output);
@@ -543,7 +660,8 @@ mod tests {
         assert_eq!(eff_a[..16], ids[..16], "text before the image is untouched");
 
         // Same text, different image ⇒ the cache misses past the image.
-        let a = w.admit(eff_a.clone(), 2).await;
+        let mut a = w.admit(eff_a.clone(), 2).await;
+        a.finish_prefill();
         drop(a);
         let b = w.admit(eff_b, 2).await;
         assert_eq!(b.cached_tokens, 16, "hit stops at the image boundary");
@@ -586,14 +704,16 @@ mod tests {
             9100,
         );
         for start in (0..2000u32).step_by(100) {
-            let a = w.admit((start..start + 64).collect(), 4).await;
+            let mut a = w.admit((start..start + 64).collect(), 4).await;
+            a.finish_prefill();
             drop(a);
         }
-        let load = w.load();
         assert!(
-            load.num_used_tokens as u64 <= 256,
+            w.cache_tokens_for_test() <= 256,
             "cache must evict to capacity"
         );
+        let load = w.load();
+        assert_eq!(load.num_used_tokens, 0, "nothing running after completion");
         assert!(load.token_usage <= 1.0);
     }
 

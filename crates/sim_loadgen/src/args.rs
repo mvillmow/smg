@@ -56,6 +56,9 @@ pub struct Args {
     /// when the next turn would exceed `--prompt-max` (the model's
     /// context-window limit stands in for both).
     pub max_turns: u32,
+    /// Per-request client timeout; a wedged stream records status 0 instead
+    /// of hanging the end-of-run drain.
+    pub request_timeout_secs: u64,
     /// Mean of the exponential think time between turn 1 and turn 2.
     pub think_secs: f64,
     /// Request SSE streaming responses (TTFT is only measurable when true).
@@ -107,9 +110,10 @@ pub struct Args {
 }
 
 impl Args {
-    /// Parse the configuration from `std::env::args`, falling back to defaults.
-    pub fn from_args() -> Result<Self, String> {
-        let mut cfg = Self {
+    /// Flag defaults; the single source `from_args` mutates and tests build
+    /// synthetic configs from.
+    pub(crate) fn defaults() -> Self {
+        Self {
             smg_urls: Vec::new(),
             duration_secs: 60,
             session_rps: 5.0,
@@ -119,6 +123,7 @@ impl Args {
             http2: false,
             conns_per_origin: 4,
             max_turns: 2,
+            request_timeout_secs: 300,
             ingress: Ingress::Hash,
             turn2_ingress: Turn2Ingress::Same,
             routing_key_reuse: 0.0,
@@ -137,7 +142,12 @@ impl Args {
             warmup_secs: 0,
             seed: 42,
             out: "sim_out".to_string(),
-        };
+        }
+    }
+
+    /// Parse the configuration from `std::env::args`, falling back to defaults.
+    pub fn from_args() -> Result<Self, String> {
+        let mut cfg = Self::defaults();
 
         let mut args = std::env::args().skip(1);
         while let Some(flag) = args.next() {
@@ -159,6 +169,9 @@ impl Args {
                     cfg.conns_per_origin = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--max-turns" => cfg.max_turns = parse(value(&mut args, &flag)?, &flag)?,
+                "--request-timeout-secs" => {
+                    cfg.request_timeout_secs = parse(value(&mut args, &flag)?, &flag)?;
+                }
                 "--ingress" => {
                     cfg.ingress = match value(&mut args, &flag)?.as_str() {
                         "hash" => Ingress::Hash,
@@ -314,6 +327,7 @@ fn usage() -> String {
        --conns-per-origin <n>       connections per SMG, round-robined (default 4)\n\
        --max-turns <n>              turn cap per session; each turn continues with\n\
                                     probability --t2-ratio (default 2)\n\
+       --request-timeout-secs <n>   per-request client timeout (default 300)\n\
        --ingress <hash|random>      turn-1 SMG choice (default hash)\n\
        --turn2-ingress <same|hash|random>  turn-2 SMG choice (default same)\n\
        --routing-key-reuse <f>      fraction of sessions sharing one of 32 keys (default 0.0)\n\

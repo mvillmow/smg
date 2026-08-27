@@ -43,6 +43,29 @@ pub struct Ctx {
     pub errors: AtomicU64,
 }
 
+/// Turn-1 SMG index for a routing key under hash ingress — the stand-in for
+/// ingress consistent hashing, so it must be a pure function of the key.
+pub(crate) fn hash_smg(key: &str, smg_count: usize) -> usize {
+    (dist::hash_str(key) % smg_count.max(1) as u64) as usize
+}
+
+/// Whether the session sends another turn after `turn`.
+pub(crate) fn session_continues(cont_draw: bool, turn: u32, max_turns: u32) -> bool {
+    cont_draw && turn < max_turns
+}
+
+/// Whether the next turn's context (current ⊕ output ⊕ suffix) still fits
+/// the model window; a session that would exceed it ends, standing in for
+/// the context-length limit.
+pub(crate) fn next_context_fits(
+    context_len: usize,
+    output_len: usize,
+    suffix_len: usize,
+    prompt_max: u32,
+) -> bool {
+    context_len + output_len + suffix_len <= prompt_max as usize
+}
+
 /// Milliseconds since the Unix epoch.
 pub fn epoch_ms() -> u64 {
     SystemTime::now()
@@ -90,7 +113,7 @@ pub async fn run(ctx: Arc<Ctx>, sid: u64) {
 
     let n = args.smg_urls.len();
     let t1_smg = match args.ingress {
-        Ingress::Hash => (dist::hash_str(&key) % n as u64) as usize,
+        Ingress::Hash => hash_smg(&key, n),
         Ingress::Random => rng.next_index(n),
     };
 
@@ -123,7 +146,7 @@ pub async fn run(ctx: Arc<Ctx>, sid: u64) {
 
         let cont = rng.next_f64() < args.t2_ratio;
         let think = rng.next_exp(args.think_secs);
-        if !cont || turn >= args.max_turns {
+        if !session_continues(cont, turn, args.max_turns) {
             return;
         }
         // A failed turn has no output to extend; the session ends there.
@@ -131,7 +154,7 @@ pub async fn run(ctx: Arc<Ctx>, sid: u64) {
             return;
         };
         let suffix = args.t2_suffix_tokens as usize;
-        if context.len() + output_ids.len() + suffix > args.prompt_max as usize {
+        if !next_context_fits(context.len(), output_ids.len(), suffix, args.prompt_max) {
             return;
         }
         tokio::time::sleep(Duration::from_secs_f64(think)).await;
@@ -147,7 +170,7 @@ pub async fn run(ctx: Arc<Ctx>, sid: u64) {
         turn += 1;
         smg = match args.turn2_ingress {
             Turn2Ingress::Same => t1_smg,
-            Turn2Ingress::Hash => (dist::hash_str(&key) % n as u64) as usize,
+            Turn2Ingress::Hash => hash_smg(&key, n),
             Turn2Ingress::Random => rng.next_index(n),
         };
     }
@@ -365,4 +388,45 @@ async fn consume_sse(
         }
     }
     Ok((ttft_ms, last))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_ingress_is_deterministic_and_spreads() {
+        // Same key always maps to the same SMG (ingress stickiness)...
+        for key in ["sess-1", "sess-2", "shared-7"] {
+            assert_eq!(hash_smg(key, 8), hash_smg(key, 8));
+        }
+        // ...and distinct keys reach every SMG (no degenerate hashing).
+        let mut seen = [false; 8];
+        for sid in 0..256 {
+            seen[hash_smg(&format!("sess-{sid}"), 8)] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "keys must spread over all SMGs");
+        // A single SMG never divides by zero.
+        assert_eq!(hash_smg("sess-1", 1), 0);
+    }
+
+    #[test]
+    fn session_continuation_respects_draw_and_turn_cap() {
+        assert!(session_continues(true, 1, 2), "draw passed, under cap");
+        assert!(
+            !session_continues(false, 1, 8),
+            "failed draw ends the session"
+        );
+        assert!(!session_continues(true, 2, 2), "turn cap ends the session");
+        assert!(session_continues(true, 7, 8));
+        assert!(!session_continues(true, 8, 8));
+    }
+
+    #[test]
+    fn context_window_caps_session_growth() {
+        assert!(next_context_fits(10_000, 2000, 256, 24_576));
+        assert!(!next_context_fits(23_000, 2000, 256, 24_576));
+        // Exactly at the window still fits.
+        assert!(next_context_fits(24_000, 500, 76, 24_576));
+    }
 }

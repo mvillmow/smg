@@ -143,3 +143,52 @@ pub fn base64_blob(seed: u64, len: usize) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cdf_hits_its_anchors_exactly_and_stays_monotonic() {
+        let cdf = PiecewiseCdf::new(
+            256,
+            &[(5000, 0.216), (10_000, 0.530), (20_000, 0.994)],
+            32_000,
+        );
+        // Inverse-CDF at each anchor's cumulative probability returns the
+        // anchor's token count — the property that makes the sampled
+        // distribution match the production percentiles.
+        assert_eq!(cdf.sample(0.216), 5000);
+        assert_eq!(cdf.sample(0.530), 10_000);
+        assert_eq!(cdf.sample(0.994), 20_000);
+        assert_eq!(cdf.sample(0.0), 256);
+        assert_eq!(cdf.sample(1.0), 32_000);
+
+        let mut prev = 0;
+        for i in 0..=1000 {
+            let v = cdf.sample(f64::from(i) / 1000.0);
+            assert!(v >= prev, "inverse CDF must be monotonic");
+            assert!((256..=32_000).contains(&v));
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn derived_streams_are_deterministic_and_independent() {
+        // Same seed → identical stream (turn-2 image regeneration and
+        // cross-run reproducibility depend on this).
+        assert_eq!(token_ids(7, 32), token_ids(7, 32));
+        assert_eq!(base64_blob(7, 64), base64_blob(7, 64));
+        // Different salts under one seed give unrelated streams.
+        assert_ne!(
+            token_ids(sub_seed(42, SALT_PREFIX), 32),
+            token_ids(sub_seed(42, SALT_PAD), 32)
+        );
+        // Blob is exactly the requested length and base64-alphabet only.
+        let blob = base64_blob(9, 257);
+        assert_eq!(blob.len(), 257);
+        assert!(blob
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/'));
+    }
+}

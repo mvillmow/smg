@@ -104,18 +104,22 @@ async fn main() -> ExitCode {
         aux.spawn(progress(ctx, run_start));
     }
 
-    // Open-loop Poisson arrivals: sleep an exponential inter-arrival gap, then
-    // spawn the session regardless of how many are already in flight.
+    // Open-loop Poisson arrivals on an ABSOLUTE schedule: each arrival time
+    // is the running sum of exponential gaps, and the spawner sleeps until
+    // that instant. Sleeping per-gap instead would add the timer's minimum
+    // resolution to every gap and undershoot high rates by 20-30%.
     let deadline = run_start + Duration::from_secs(cli.duration_secs);
     let mut arrivals = dist::Rng::new(dist::sub_seed(cli.seed, dist::SALT_ARRIVAL));
     let mut sessions: JoinSet<()> = JoinSet::new();
     let mut spawned: u64 = 0;
+    let mut next_arrival = run_start;
     loop {
         let gap = arrivals.next_exp(1.0 / cli.session_rps);
-        tokio::time::sleep(Duration::from_secs_f64(gap)).await;
-        if Instant::now() >= deadline {
+        next_arrival += Duration::from_secs_f64(gap);
+        if next_arrival >= deadline {
             break;
         }
+        tokio::time::sleep_until(next_arrival.into()).await;
         sessions.spawn(session::run(ctx.clone(), spawned));
         spawned += 1;
     }
@@ -181,9 +185,19 @@ fn build_clients(cli: &Args) -> Result<Vec<reqwest::Client>, reqwest::Error> {
             let mut builder = reqwest::Client::builder()
                 .pool_idle_timeout(Some(Duration::from_secs(90)))
                 .pool_max_idle_per_host(4096)
+                // A wedged stream must fail, not hang the end-of-run drain.
+                .timeout(Duration::from_secs(cli.request_timeout_secs))
                 .tcp_nodelay(true);
             if cli.http2 {
-                builder = builder.http2_prior_knowledge();
+                // Hundreds of concurrent multi-hundred-KB uploads share each
+                // connection; the h2 defaults (64 KiB stream / 1 MiB conn
+                // windows) throttle body upload long before the gateway is
+                // the bottleneck and show up as server-side 408s.
+                builder = builder
+                    .http2_prior_knowledge()
+                    .http2_adaptive_window(true)
+                    .http2_initial_stream_window_size(4 * 1024 * 1024)
+                    .http2_initial_connection_window_size(32 * 1024 * 1024);
             }
             builder.build()
         })

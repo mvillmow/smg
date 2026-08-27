@@ -19,8 +19,10 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
+import platform
 import re
 import statistics
 import subprocess
@@ -49,6 +51,11 @@ METRIC_PREFIXES = (
     "smg_http_connections_active",
     "smg_admission_queue_rejected_total",
     "smg_worker_selection_total",
+    # With --routing-key-override, follow-up turns route through the sticky
+    # pin, which shows up here (occupied_hit/occupied_miss/vacant/...) —
+    # cache-aware debug lines then cover only delegated (turn-1) decisions.
+    "smg_manual_policy_branch_total",
+    "smg_routing_key_source_total",
 )
 
 BRANCH_RE = re.compile(r'branch="?([A-Za-z0-9_.-]+)"?')
@@ -495,6 +502,9 @@ def analyze_requests(path, workers_total):
     for turn, ts in sorted(turn_stats.items()):
         turns["turn%d" % turn] = {
             "requests": ts["n"],
+            # Raw sums so every ratio in the tables is verifiable.
+            "prompt_tokens_sum": ts["prompt"],
+            "cached_tokens_sum": ts["cached"],
             "cached_over_prompt": round(ts["cached"] / ts["prompt"], 4) if ts["prompt"] else None,
             "hit_rate": round(ts["hits"] / ts["n"], 4) if ts["n"] else None,
             "imbalance": imbalance(per_turn_worker.get(turn, Counter()), workers_total),
@@ -513,6 +523,7 @@ def summarize_samples(path, smg_count):
         for _ in range(smg_count)
     ]
     last_counters = [{"rejected": 0.0, "selections": 0.0} for _ in range(smg_count)]
+    sticky_branches = [{} for _ in range(smg_count)]
     if not path.exists():
         return []
     with open(path, errors="replace") as f:
@@ -543,6 +554,10 @@ def summarize_samples(path, smg_count):
                         rejected += val
                     elif key.startswith("smg_worker_selection_total"):
                         selections += val
+                    elif key.startswith("smg_manual_policy_branch_total"):
+                        m = BRANCH_RE.search(key)
+                        if m:
+                            sticky_branches[idx][m.group(1)] = val
                 if metrics:
                     s["queue_depth"].append(depth)
                     s["conns"].append(conns)
@@ -570,6 +585,9 @@ def summarize_samples(path, smg_count):
                 "http_connections_active": agg(s["conns"]),
                 "rejected_total": last_counters[idx]["rejected"],
                 "worker_selection_total": last_counters[idx]["selections"],
+                # Final counter values: sticky-session outcomes under
+                # --routing-key-override (occupied_hit = pinned follow-up).
+                "sticky_branches": sticky_branches[idx],
             }
         )
     return out
@@ -738,6 +756,34 @@ def write_markdown(report, path):
 # ---- orchestration ----------------------------------------------------------
 
 
+def _git(args):
+    try:
+        return (
+            subprocess.run(
+                ["git"] + args,
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            ).stdout.strip()
+            or None
+        )
+    except OSError:
+        return None
+
+
+def _sha256(path):
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
 def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
     """Full run: build -> mocks -> SMGs -> register -> loadgen -> report.
 
@@ -771,7 +817,24 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
     time.sleep(1)
 
     children = []
-    meta = {"smg_bin": str(smg_bin), "started_at": datetime.now().isoformat()}
+    meta = {
+        "smg_bin": str(smg_bin),
+        "started_at": datetime.now().isoformat(),
+        # Provenance: enough to reproduce or audit any table built from this
+        # run — repo state, exact binaries, profile content, and seed.
+        "git_commit": _git(["rev-parse", "HEAD"]),
+        "git_dirty": bool(_git(["status", "--porcelain"])),
+        "binary_sha256": {
+            "smg": _sha256(smg_bin),
+            "mock-worker": _sha256(mock_bin),
+            "sim-loadgen": _sha256(loadgen_bin),
+        },
+        "profile_sha256": hashlib.sha256(
+            json.dumps(profile, sort_keys=True).encode()
+        ).hexdigest(),
+        "loadgen_seed": profile.get("loadgen", {}).get("seed"),
+        "host": platform.platform(),
+    }
     stop = threading.Event()
     sampler = None
     try:

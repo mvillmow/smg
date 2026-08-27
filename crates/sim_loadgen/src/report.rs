@@ -224,6 +224,9 @@ pub fn summarize(
             "turn2": turn_block(&measured, Some(2)),
             "followup": turn_block(&measured, None),
         },
+        // All turns together; `cached_token_ratio` here is THE number to
+        // compare with backend cached-token telemetry.
+        "overall": overall_block(&measured),
         "turn2_same_worker_rate": same_worker_rate,
         "followup_same_worker_rate": followup_same_worker_rate,
         "mean_turns_per_session": mean_turns,
@@ -247,6 +250,7 @@ fn config_json(args: &Args) -> Value {
         "http2": args.http2,
         "conns_per_origin": args.conns_per_origin,
         "max_turns": args.max_turns,
+        "request_timeout_secs": args.request_timeout_secs,
         "ingress": args.ingress.as_str(),
         "turn2_ingress": args.turn2_ingress.as_str(),
         "routing_key_reuse": args.routing_key_reuse,
@@ -275,6 +279,29 @@ fn cdf_json(anchors: &[(u32, f64)]) -> Vec<Value> {
         .collect()
 }
 
+/// Stats over every measured request regardless of turn.
+fn overall_block(measured: &[&RequestRecord]) -> Value {
+    let ok: Vec<&RequestRecord> = measured.iter().copied().filter(|r| r.is_ok()).collect();
+    let ratios: Vec<f64> = ok.iter().filter_map(|r| r.cached_ratio()).collect();
+    let prompt_sum: u64 = ok
+        .iter()
+        .filter(|r| r.cached_tokens.is_some())
+        .map(|r| r.prompt_tokens as u64)
+        .sum();
+    let cached_sum: u64 = ok.iter().filter_map(|r| r.cached_tokens).sum();
+    json!({
+        "ok": ok.len(),
+        "prompt_tokens_sum": prompt_sum,
+        "cached_tokens_sum": cached_sum,
+        "cached_token_ratio": if prompt_sum > 0 {
+            Value::from(cached_sum as f64 / prompt_sum as f64)
+        } else {
+            Value::Null
+        },
+        "cached_ratio_request_mean": mean(&ratios),
+    })
+}
+
 /// Stats over one exact turn (`Some(n)`) or every follow-up turn (`None`,
 /// i.e. turn >= 2).
 fn turn_block(measured: &[&RequestRecord], turn: Option<u8>) -> Value {
@@ -293,12 +320,28 @@ fn turn_block(measured: &[&RequestRecord], turn: Option<u8>) -> Value {
     } else {
         Some(ratios.iter().filter(|&&r| r >= CACHE_HIT_RATIO).count() as f64 / ratios.len() as f64)
     };
+    // Token-weighted ratio (Σcached/Σprompt) is the number comparable with
+    // backend cached-token telemetry; the per-request mean is kept under its
+    // own name because long prompts weigh the two differently.
+    let prompt_sum: u64 = ok
+        .iter()
+        .filter(|r| r.cached_tokens.is_some())
+        .map(|r| r.prompt_tokens as u64)
+        .sum();
+    let cached_sum: u64 = ok.iter().filter_map(|r| r.cached_tokens).sum();
     let ttfts: Vec<f64> = ok.iter().filter_map(|r| r.ttft_ms).collect();
     let e2es: Vec<f64> = ok.iter().map(|r| r.e2e_ms).collect();
     json!({
         "count": of_turn.len(),
         "ok": ok.len(),
-        "cached_ratio_mean": mean(&ratios),
+        "prompt_tokens_sum": prompt_sum,
+        "cached_tokens_sum": cached_sum,
+        "cached_token_ratio": if prompt_sum > 0 {
+            Value::from(cached_sum as f64 / prompt_sum as f64)
+        } else {
+            Value::Null
+        },
+        "cached_ratio_request_mean": mean(&ratios),
         "hit_rate": hit_rate,
         "ttft_ms": stats(&ttfts),
         "e2e_ms": stats(&e2es),
@@ -330,4 +373,74 @@ fn stats(values: &[f64]) -> Value {
         "p90": pct(0.90),
         "p99": pct(0.99),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(turn: u8, session: u64, worker: u64, prompt: usize, cached: u64) -> RequestRecord {
+        RequestRecord {
+            turn,
+            session,
+            key: format!("sess-{session}"),
+            smg: 0,
+            worker_port: Some(worker),
+            prompt_tokens: prompt,
+            cached_tokens: Some(cached),
+            completion_tokens: Some(8),
+            max_new: 8,
+            ttft_ms: Some(10.0),
+            e2e_ms: 100.0,
+            status: 200,
+            start_ms: 1000,
+        }
+    }
+
+    fn args() -> Args {
+        let mut args = Args::defaults();
+        args.smg_urls = vec!["http://127.0.0.1:30000".to_string()];
+        args
+    }
+
+    #[test]
+    fn token_weighted_ratio_is_not_the_request_mean() {
+        // One fully-cached short prompt + one uncached long prompt: the
+        // request mean says 0.5, the token-weighted ratio says 0.1. Backend
+        // telemetry is token-weighted, so the summary must carry both under
+        // distinct names.
+        let records = vec![rec(1, 1, 9001, 100, 100), rec(1, 2, 9002, 900, 0)];
+        let summary = summarize(&args(), &records, 0, 10.0, 2);
+        let t1 = &summary["turns"]["turn1"];
+        assert_eq!(t1["prompt_tokens_sum"], 1000);
+        assert_eq!(t1["cached_tokens_sum"], 100);
+        let token_weighted = t1["cached_token_ratio"].as_f64().unwrap();
+        let request_mean = t1["cached_ratio_request_mean"].as_f64().unwrap();
+        assert!((token_weighted - 0.1).abs() < 1e-9);
+        assert!((request_mean - 0.5).abs() < 1e-9);
+        let overall = &summary["overall"];
+        assert!((overall["cached_token_ratio"].as_f64().unwrap() - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn consecutive_turn_stickiness_and_mean_turns() {
+        // Session 1: three turns all on 9001 (two sticky follow-ups).
+        // Session 2: turn 2 moves workers (one non-sticky follow-up).
+        let records = vec![
+            rec(1, 1, 9001, 1000, 0),
+            rec(2, 1, 9001, 2000, 1900),
+            rec(3, 1, 9001, 3000, 2900),
+            rec(1, 2, 9001, 1000, 0),
+            rec(2, 2, 9002, 2000, 100),
+        ];
+        let summary = summarize(&args(), &records, 0, 10.0, 2);
+        let followup_rate = summary["followup_same_worker_rate"].as_f64().unwrap();
+        assert!((followup_rate - 2.0 / 3.0).abs() < 1e-9);
+        // turn2_same_worker_rate keeps its original turn-2-vs-turn-1 meaning.
+        assert!((summary["turn2_same_worker_rate"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+        let mean_turns = summary["mean_turns_per_session"].as_f64().unwrap();
+        assert!((mean_turns - 2.5).abs() < 1e-9);
+        // Follow-up block spans turns 2 and 3.
+        assert_eq!(summary["turns"]["followup"]["ok"], 3);
+    }
 }

@@ -25,10 +25,81 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sim  # noqa: E402
 
+# Multi-turn conversational traffic at the SAME total request rate as the
+# 1.5-turn baseline (305 sessions/s x ~1.5 turns ~= 110 x ~4.15 turns):
+# turn-mix comparisons must hold request RPS constant, not session RPS.
+MULTITURN = {
+    "loadgen.session_rps": 110,
+    "loadgen.t2_ratio": 0.85,
+    "loadgen.max_turns": 8,
+    "loadgen.t2_suffix_tokens": 256,
+}
+
+
+def patch_smg_flags(flags, patches):
+    """Return a copy of `flags` with each `--flag: value` replaced in place
+    (or appended). Scenario legs that must differ in exactly one gateway
+    setting go through here, so the rest of the flag list is shared by
+    construction."""
+    out = list(flags)
+    for flag, value in patches.items():
+        if flag in out:
+            idx = out.index(flag)
+            if value is None:
+                continue
+            out[idx + 1] = str(value)
+        else:
+            out.append(flag)
+            if value is not None:
+                out.append(str(value))
+    return out
+
+
 # Leg: (label, {dotted override: value}, smg_bin slot: None | "a" | "b").
-# smg1-vs-smg8 keeps the same session_rps: aggregate rps is a loadgen-side
-# property, so halving the gateway count concentrates rather than shrinks load.
+# The special override key "smg_flag_overrides" patches individual gateway
+# flags via patch_smg_flags. smg1-vs-smg8 keeps the same session_rps:
+# aggregate rps is a loadgen-side property, so halving the gateway count
+# concentrates rather than shrinks load.
 SCENARIOS = {
+    # Production sticky-session assignment A/B: delegate (pin the worker the
+    # policy chose for turn 1) vs min_group (pin the group-least-keys
+    # worker). Everything else identical.
+    "assignment-mode-ab": [
+        ("delegate", {}, None),
+        (
+            "min-group",
+            {"smg_flag_overrides": {"--assignment-mode": "min_group"}},
+            None,
+        ),
+    ],
+    # Controlled TTL comparison: traffic identical (think fixed at 6 s
+    # compressed = 60 s production), ONLY --cache-ttl-secs differs. 18 s is
+    # the production 180 s under 10x time compression; 2 s puts the TTL
+    # below the think time.
+    "ttl-controlled": [
+        (
+            "ttl-18s",
+            dict(
+                MULTITURN,
+                **{
+                    "loadgen.think_secs": 6,
+                    "smg_flag_overrides": {"--cache-ttl-secs": "18"},
+                },
+            ),
+            None,
+        ),
+        (
+            "ttl-2s",
+            dict(
+                MULTITURN,
+                **{
+                    "loadgen.think_secs": 6,
+                    "smg_flag_overrides": {"--cache-ttl-secs": "2"},
+                },
+            ),
+            None,
+        ),
+    ],
     "smg1-vs-smg8": [
         ("smg1", {"smg_count": 1}, None),
         ("smg8", {"smg_count": 8}, None),
@@ -37,59 +108,17 @@ SCENARIOS = {
         ("hash-ingress", {"loadgen.ingress": "hash"}, None),
         ("random-ingress", {"loadgen.ingress": "random"}, None),
     ],
-    # What does it take to sustain >= 0.80 aggregate cached/prompt? The
+    # What does it take to sustain >= 0.80 aggregate cached tokens? The
     # aggregate is (1-f)*prefix_share + f*followup_ratio where f is the
-    # follow-up share of requests — a traffic property. Legs: today's
-    # 1.5-turn mix; a ~5-6-turn conversational mix; the same plus a larger
-    # shared prefix; and the same with the SMG placement TTL below the
-    # think time — the config trap that silently forfeits the hits.
+    # follow-up share of requests — a traffic property. Request RPS is held
+    # constant across legs (see MULTITURN). TTL effects live in the separate
+    # ttl-controlled scenario so this one varies traffic shape only.
     "hit-rate-calibration": [
         ("baseline-1p5turn", {}, None),
-        (
-            "multiturn",
-            {
-                "loadgen.t2_ratio": 0.85,
-                "loadgen.max_turns": 8,
-                "loadgen.t2_suffix_tokens": 256,
-            },
-            None,
-        ),
+        ("multiturn", dict(MULTITURN), None),
         (
             "multiturn-prefix4k",
-            {
-                "loadgen.t2_ratio": 0.85,
-                "loadgen.max_turns": 8,
-                "loadgen.t2_suffix_tokens": 256,
-                "loadgen.system_prefix_tokens": 4096,
-            },
-            None,
-        ),
-        (
-            "multiturn-ttl-trap",
-            {
-                "loadgen.t2_ratio": 0.85,
-                "loadgen.max_turns": 8,
-                "loadgen.t2_suffix_tokens": 256,
-                "loadgen.think_secs": 6,
-                "smg_flags": [
-                    "--policy", "cache_aware",
-                    "--cache-index", "hash",
-                    "--cache-threshold", "0.60",
-                    "--block-size", "128",
-                    "--cache-boundaries", "3072,4096,6144,8192,12288,16384",
-                    "--balance-abs-threshold", "8",
-                    "--balance-rel-threshold", "1.2",
-                    "--overlap-decay", "1.0",
-                    "--disable-retries",
-                    "--upstream-http2",
-                    "--max-concurrent-requests", "180000",
-                    "--queue-size", "512",
-                    "--queue-timeout-secs", "5",
-                    "--worker-overload-waiting-requests", "64",
-                    "--worker-overload-token-usage", "0.9",
-                    "--cache-ttl-secs", "2",
-                ],
-            },
+            dict(MULTITURN, **{"loadgen.system_prefix_tokens": 4096}),
             None,
         ),
     ],
@@ -188,22 +217,26 @@ def extract_rows(report):
     for metric in ("ttft_ms", "e2e_ms"):
         for pct in ("p50", "p90", "p99"):
             rows["%s_%s" % (metric, pct)] = _get(summary, metric, pct)
-    for turn in ("turn1", "turn2", "followup"):
-        rows[turn + " cached ratio (loadgen)"] = _get(
-            summary, "turns", turn, "cached_ratio_mean"
-        )
-    # Aggregate mean cached/prompt over all requests, from the per-turn
-    # blocks (turn1 + all follow-ups), weighted by request count.
-    parts = []
-    for block in ("turn1", "followup"):
-        n = _get(summary, "turns", block, "ok")
-        r = _get(summary, "turns", block, "cached_ratio_mean")
-        if isinstance(n, int) and n > 0 and isinstance(r, (int, float)):
-            parts.append((n, r))
-    total_n = sum(n for n, _ in parts)
-    rows["AGGREGATE cached/prompt"] = (
-        round(sum(n * r for n, r in parts) / total_n, 4) if total_n else None
+    # Token-weighted (sum cached / sum prompt) is THE number comparable with
+    # backend cached-token telemetry; the per-request mean is a different
+    # statistic and is reported under its own name.
+    rows["AGG cached tokens (sum/sum)"] = _get(summary, "overall", "cached_token_ratio")
+    rows["AGG cached (request mean)"] = _get(
+        summary, "overall", "cached_ratio_request_mean"
     )
+    for turn in ("turn1", "followup"):
+        rows[turn + " cached tokens (sum/sum)"] = _get(
+            summary, "turns", turn, "cached_token_ratio"
+        )
+        rows[turn + " cached (request mean)"] = _get(
+            summary, "turns", turn, "cached_ratio_request_mean"
+        )
+        rows[turn + " prompt tokens sum"] = _get(
+            summary, "turns", turn, "prompt_tokens_sum"
+        )
+        rows[turn + " cached tokens sum"] = _get(
+            summary, "turns", turn, "cached_tokens_sum"
+        )
     rows["mean turns/session"] = summary.get("mean_turns_per_session")
     rows["t2 same-worker (loadgen)"] = summary.get("turn2_same_worker_rate")
     rows["followup same-worker"] = summary.get("followup_same_worker_rate")
@@ -220,6 +253,17 @@ def extract_rows(report):
     rows["hash_hit share"] = (
         round(hash_hit / total_decisions, 4) if total_decisions else None
     )
+    # Sticky-session outcomes (--routing-key-override): occupied_hit is a
+    # follow-up landing on its pinned worker; vacant is a fresh key.
+    sticky = {}
+    for s in samples:
+        for name, count in (s.get("sticky_branches") or {}).items():
+            sticky[name] = sticky.get(name, 0) + count
+    sticky_total = sum(sticky.values())
+    rows["sticky occupied_hit share"] = (
+        round(sticky.get("occupied_hit", 0) / sticky_total, 4) if sticky_total else None
+    )
+    rows["sticky cap_respill count"] = sticky.get("cap_respill", 0) if sticky else None
     rows["rss peak MiB (max smg)"] = (
         round(max(rss_peaks) / 1024, 1) if rss_peaks else None
     )
@@ -268,27 +312,69 @@ def cmd_compare(args):
     scenario_dir = out_root / ("%s-%s-%s" % (args.scenario, base.get("name", "run"), stamp))
 
     leg_results = []
+    built = args.skip_build
     for idx, (label, overrides, slot) in enumerate(legs):
-        profile = json.loads(json.dumps(base))  # deep copy: legs must not leak
-        for key, val in overrides.items():
-            sim.apply_override(profile, key, val)
-        for raw in args.override:
-            key, val = sim.parse_override_arg(raw)
-            sim.apply_override(profile, key, val)
-        sim.log("scenario %s leg %d/%d: %s" % (args.scenario, idx + 1, len(legs), label))
-        run_dir = sim.run_profile(
-            profile,
-            scenario_dir / label,
-            smg_bin=bins[slot],
-            # Build once, in the first leg; later legs reuse the binaries.
-            skip_build=args.skip_build or idx > 0,
-        )
-        with open(Path(run_dir) / "report.json") as f:
-            leg_results.append((label, extract_rows(json.load(f))))
-        time.sleep(2)
+        seed_rows = []
+        for seed_idx in range(args.seeds):
+            profile = json.loads(json.dumps(base))  # deep copy: legs must not leak
+            flag_patches = None
+            for key, val in overrides.items():
+                if key == "smg_flag_overrides":
+                    flag_patches = val
+                else:
+                    sim.apply_override(profile, key, val)
+            if flag_patches:
+                profile["smg_flags"] = patch_smg_flags(profile["smg_flags"], flag_patches)
+            for raw in args.override:
+                key, val = sim.parse_override_arg(raw)
+                sim.apply_override(profile, key, val)
+            base_seed = int(profile.get("loadgen", {}).get("seed", 42))
+            sim.apply_override(profile, "loadgen.seed", base_seed + seed_idx)
+            sim.log(
+                "scenario %s leg %d/%d: %s seed %d/%d"
+                % (args.scenario, idx + 1, len(legs), label, seed_idx + 1, args.seeds)
+            )
+            run_dir = sim.run_profile(
+                profile,
+                scenario_dir / label / ("seed-%d" % (base_seed + seed_idx)),
+                smg_bin=bins[slot],
+                skip_build=built,
+            )
+            built = True  # binaries exist after the first run
+            with open(Path(run_dir) / "report.json") as f:
+                seed_rows.append(extract_rows(json.load(f)))
+            time.sleep(2)
+        with open(scenario_dir / label / "seed-rows.json", "w") as f:
+            json.dump(seed_rows, f, indent=2)
+        leg_results.append((label, aggregate_seed_rows(seed_rows)))
 
     write_compare_md(args.scenario, leg_results, scenario_dir / "compare.md")
     sim.log("compare: %s" % (scenario_dir / "compare.md"))
+
+
+def aggregate_seed_rows(seed_rows):
+    """Mean ± 95% CI half-width across seeds for numeric rows; single-seed
+    runs and non-numeric rows pass through the first value."""
+    if len(seed_rows) == 1:
+        return seed_rows[0]
+    keys = []
+    for rows in seed_rows:
+        for key in rows:
+            if key not in keys:
+                keys.append(key)
+    out = {}
+    for key in keys:
+        vals = [r.get(key) for r in seed_rows]
+        nums = [v for v in vals if isinstance(v, (int, float))]
+        if len(nums) == len(seed_rows):
+            n = len(nums)
+            m = sum(nums) / n
+            var = sum((v - m) ** 2 for v in nums) / (n - 1)
+            half = 1.96 * (var**0.5) / (n**0.5)
+            out[key] = "%.4g ±%.2g" % (m, half)
+        else:
+            out[key] = vals[0]
+    return out
 
 
 def main():
@@ -305,6 +391,12 @@ def main():
     cmp_p.add_argument("--smg-bin-a", help="gateway binary A (policy-ab)")
     cmp_p.add_argument("--smg-bin-b", help="gateway binary B (policy-ab)")
     cmp_p.add_argument("--out-root", help="parent dir for the scenario run dirs")
+    cmp_p.add_argument(
+        "--seeds",
+        type=int,
+        default=3,
+        help="loadgen seeds per leg; rows report mean ±95%% CI (default 3)",
+    )
     cmp_p.add_argument(
         "--override",
         action="append",
