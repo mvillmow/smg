@@ -30,7 +30,10 @@ const TOKENS_HINT_CAP: usize = 512;
 /// Shared state every session task needs.
 pub struct Ctx {
     pub args: Arc<Args>,
-    pub client: reqwest::Client,
+    /// One client per configured connection-per-origin; requests
+    /// round-robin so h2 streams spread over several connections.
+    pub clients: Vec<reqwest::Client>,
+    pub next_client: AtomicU64,
     pub limiter: Arc<Semaphore>,
     pub records: UnboundedSender<RequestRecord>,
     pub prompt_cdf: PiecewiseCdf,
@@ -197,8 +200,8 @@ async fn send_turn(ctx: &Ctx, req: &TurnRequest<'_>) -> Option<Vec<u32>> {
     let url = format!("{}/generate", args.smg_urls[req.smg]);
     let start_ms = epoch_ms();
     let started = Instant::now();
-    let mut request = ctx
-        .client
+    let pick = ctx.next_client.fetch_add(1, Ordering::Relaxed) as usize % ctx.clients.len();
+    let mut request = ctx.clients[pick]
         .post(&url)
         .header("content-type", "application/json")
         .header("x-smg-routing-key", req.key);

@@ -201,6 +201,7 @@ fn config_json(args: &Args) -> Value {
         "think_secs": args.think_secs,
         "stream": args.stream,
         "http2": args.http2,
+        "conns_per_origin": args.conns_per_origin,
         "ingress": args.ingress.as_str(),
         "turn2_ingress": args.turn2_ingress.as_str(),
         "routing_key_reuse": args.routing_key_reuse,

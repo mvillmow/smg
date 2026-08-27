@@ -39,6 +39,31 @@ SCENARIOS = {
     ],
     # The hash placement index is LOCAL to each SMG: turn-2 affinity only
     # survives if turn 2 reaches the same SMG. This isolates that effect.
+    # Does a smaller SMG fleet raise cache hit rates? With sticky turns the
+    # placement index fragmentation shouldn't matter; with scattered turns
+    # the chance of landing on the SMG that holds the placement is 1/K.
+    "fleet-size-sweep": [
+        ("smg2-sticky", {"smg_count": 2}, None),
+        ("smg8-sticky", {"smg_count": 8}, None),
+        (
+            "smg2-t2random",
+            {
+                "smg_count": 2,
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+            },
+            None,
+        ),
+        (
+            "smg8-t2random",
+            {
+                "smg_count": 8,
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+            },
+            None,
+        ),
+    ],
     "turn2-same-vs-random-smg": [
         ("t2-same-smg", {"loadgen.turn2_ingress": "same"}, None),
         (

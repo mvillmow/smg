@@ -56,8 +56,8 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let client = match build_client(&cli) {
-        Ok(client) => client,
+    let clients = match build_clients(&cli) {
+        Ok(clients) => clients,
         Err(e) => {
             eprintln!("failed to build HTTP client: {e}");
             return ExitCode::from(2);
@@ -85,7 +85,8 @@ async fn main() -> ExitCode {
 
     let ctx = Arc::new(Ctx {
         args: cli.clone(),
-        client,
+        clients,
+        next_client: AtomicU64::new(0),
         limiter: Arc::new(Semaphore::new(cli.max_inflight.min(Semaphore::MAX_PERMITS))),
         records: records_tx,
         prompt_cdf: PiecewiseCdf::new(PROMPT_LOW_TOKENS, &cli.prompt_cdf, cli.prompt_max),
@@ -169,18 +170,24 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// One shared client for every SMG: large idle pool so the h1 mode can keep
-/// per-stream connections warm across session turnover; `--http2` multiplexes
-/// all streams over one connection per SMG instead.
-fn build_client(cli: &Args) -> Result<reqwest::Client, reqwest::Error> {
-    let mut builder = reqwest::Client::builder()
-        .pool_idle_timeout(Some(Duration::from_secs(90)))
-        .pool_max_idle_per_host(4096)
-        .tcp_nodelay(true);
-    if cli.http2 {
-        builder = builder.http2_prior_knowledge();
-    }
-    builder.build()
+/// `--conns-per-origin` independent clients, round-robined per request. Each
+/// keeps a large idle pool so the h1 mode reuses per-stream connections;
+/// `--http2` multiplexes each client's streams over ONE connection per SMG,
+/// so the client count bounds concurrent streams per origin — without it a
+/// small gateway count throttles the generator instead of the gateway.
+fn build_clients(cli: &Args) -> Result<Vec<reqwest::Client>, reqwest::Error> {
+    (0..cli.conns_per_origin.max(1))
+        .map(|_| {
+            let mut builder = reqwest::Client::builder()
+                .pool_idle_timeout(Some(Duration::from_secs(90)))
+                .pool_max_idle_per_host(4096)
+                .tcp_nodelay(true);
+            if cli.http2 {
+                builder = builder.http2_prior_knowledge();
+            }
+            builder.build()
+        })
+        .collect()
 }
 
 /// Progress line to stderr every 10 s with the instantaneous completion rate.

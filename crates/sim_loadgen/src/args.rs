@@ -56,6 +56,11 @@ pub struct Args {
     pub stream: bool,
     /// Speak HTTP/2 prior knowledge to the SMGs (multiplexed streams).
     pub http2: bool,
+    /// Independent connections per SMG origin (requests round-robin across
+    /// them). In `--http2` mode each client multiplexes ONE connection per
+    /// origin, so this bounds concurrent streams per SMG; without it a
+    /// small gateway count throttles the generator, not the gateway.
+    pub conns_per_origin: usize,
     /// Turn-1 SMG choice.
     pub ingress: Ingress,
     /// Turn-2 SMG choice.
@@ -106,6 +111,7 @@ impl Args {
             think_secs: 30.0,
             stream: true,
             http2: false,
+            conns_per_origin: 4,
             ingress: Ingress::Hash,
             turn2_ingress: Turn2Ingress::Same,
             routing_key_reuse: 0.0,
@@ -142,6 +148,9 @@ impl Args {
                 "--think-secs" => cfg.think_secs = parse(value(&mut args, &flag)?, &flag)?,
                 "--stream" => cfg.stream = parse(value(&mut args, &flag)?, &flag)?,
                 "--http2" => cfg.http2 = parse(value(&mut args, &flag)?, &flag)?,
+                "--conns-per-origin" => {
+                    cfg.conns_per_origin = parse(value(&mut args, &flag)?, &flag)?;
+                }
                 "--ingress" => {
                     cfg.ingress = match value(&mut args, &flag)?.as_str() {
                         "hash" => Ingress::Hash,
@@ -294,6 +303,7 @@ fn usage() -> String {
        --think-secs <f>             mean exponential think time before turn 2 (default 30)\n\
        --stream <bool>              request SSE streaming responses (default true)\n\
        --http2 <bool>               HTTP/2 prior knowledge to the SMGs (default false)\n\
+       --conns-per-origin <n>       connections per SMG, round-robined (default 4)\n\
        --ingress <hash|random>      turn-1 SMG choice (default hash)\n\
        --turn2-ingress <same|hash|random>  turn-2 SMG choice (default same)\n\
        --routing-key-reuse <f>      fraction of sessions sharing one of 32 keys (default 0.0)\n\
