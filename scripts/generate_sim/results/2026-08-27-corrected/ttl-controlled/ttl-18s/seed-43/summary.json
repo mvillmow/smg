@@ -1,0 +1,200 @@
+{
+  "config": {
+    "smg_urls": [
+      "http://127.0.0.1:30000",
+      "http://127.0.0.1:30001",
+      "http://127.0.0.1:30002",
+      "http://127.0.0.1:30003",
+      "http://127.0.0.1:30004",
+      "http://127.0.0.1:30005",
+      "http://127.0.0.1:30006",
+      "http://127.0.0.1:30007"
+    ],
+    "duration_secs": 150,
+    "session_rps": 110.0,
+    "t2_ratio": 0.85,
+    "think_secs": 6.0,
+    "stream": true,
+    "http2": true,
+    "conns_per_origin": 16,
+    "max_turns": 8,
+    "request_timeout_secs": 300,
+    "ingress": "hash",
+    "turn2_ingress": "same",
+    "routing_key_reuse": 0.0,
+    "system_prefix_tokens": 2048,
+    "image_count": 1,
+    "image_bytes": 62000,
+    "image_placeholder_id": 151655,
+    "image_placeholder_run": 256,
+    "t2_suffix_tokens": 256,
+    "prompt_cdf": [
+      [
+        5000,
+        0.216
+      ],
+      [
+        10000,
+        0.53
+      ],
+      [
+        20000,
+        0.994
+      ]
+    ],
+    "prompt_max": 24576,
+    "output_cdf": [
+      [
+        1000,
+        0.351
+      ],
+      [
+        2000,
+        0.513
+      ],
+      [
+        5000,
+        0.998
+      ]
+    ],
+    "output_max": 6144,
+    "tokens_hint": false,
+    "max_inflight": 50000,
+    "warmup_secs": 0,
+    "seed": 43,
+    "out": "/Users/simolin/workspace/smg/target/generate-sim/ttl-controlled-local-small-20260827-144234/ttl-18s/seed-43"
+  },
+  "totals": {
+    "sessions": 16304,
+    "requests": 66966,
+    "errors": {}
+  },
+  "elapsed_secs": 311.404943917,
+  "achieved_rps": 215.0447554161141,
+  "ttft_ms": {
+    "mean": 31.301090157497786,
+    "p50": 8.149750000000001,
+    "p90": 118.455459,
+    "p99": 218.289458
+  },
+  "e2e_ms": {
+    "mean": 9215.05481354123,
+    "p50": 8360.680084,
+    "p90": 18929.1705,
+    "p99": 21310.812209000003
+  },
+  "turns": {
+    "turn1": {
+      "count": 16304,
+      "ok": 16304,
+      "prompt_tokens_sum": 164203543,
+      "cached_tokens_sum": 33114112,
+      "cached_token_ratio": 0.20166502741052306,
+      "cached_ratio_request_mean": 0.3084537369481697,
+      "hit_rate": 0.3283856722276742,
+      "ttft_ms": {
+        "mean": 103.36537621927121,
+        "p50": 95.682417,
+        "p90": 201.819583,
+        "p99": 226.78595900000002
+      },
+      "e2e_ms": {
+        "mean": 9275.64791097618,
+        "p50": 8412.144875,
+        "p90": 19004.552375,
+        "p99": 21345.649
+      }
+    },
+    "turn2": {
+      "count": 13847,
+      "ok": 13847,
+      "prompt_tokens_sum": 171708250,
+      "cached_tokens_sum": 166147072,
+      "cached_token_ratio": 0.9676126336387448,
+      "cached_ratio_request_mean": 0.9580476182785291,
+      "hit_rate": 0.9983389903950314,
+      "ttft_ms": {
+        "mean": 7.823290729833182,
+        "p50": 7.468958000000001,
+        "p90": 9.2035,
+        "p99": 11.192209
+      },
+      "e2e_ms": {
+        "mean": 9211.152958251676,
+        "p50": 8405.5235,
+        "p90": 18946.700917000002,
+        "p99": 21335.46475
+      }
+    },
+    "followup": {
+      "count": 50662,
+      "ok": 50662,
+      "prompt_tokens_sum": 776524977,
+      "cached_tokens_sum": 755932160,
+      "cached_token_ratio": 0.9734808053701536,
+      "cached_ratio_request_mean": 0.9680338966174117,
+      "hit_rate": 0.9982432592475623,
+      "ttft_ms": {
+        "mean": 8.109425399865787,
+        "p50": 7.680625,
+        "p90": 9.583625,
+        "p99": 12.179917
+      },
+      "e2e_ms": {
+        "mean": 9195.554796554541,
+        "p50": 8346.032875,
+        "p90": 18911.37775,
+        "p99": 21298.841125
+      }
+    }
+  },
+  "overall": {
+    "ok": 66966,
+    "prompt_tokens_sum": 940728520,
+    "cached_tokens_sum": 789046272,
+    "cached_token_ratio": 0.8387608701392406,
+    "cached_ratio_request_mean": 0.8074480034291349
+  },
+  "turn2_same_worker_rate": 1.0,
+  "followup_same_worker_rate": 1.0,
+  "mean_turns_per_session": 4.107335623159961,
+  "turn1_workers": {
+    "distinct": 120,
+    "max_share": 0.00926153091265947,
+    "normalized_entropy": 0.999887375318731
+  },
+  "per_smg_requests": [
+    {
+      "url": "http://127.0.0.1:30000",
+      "requests": 8638
+    },
+    {
+      "url": "http://127.0.0.1:30001",
+      "requests": 8386
+    },
+    {
+      "url": "http://127.0.0.1:30002",
+      "requests": 8448
+    },
+    {
+      "url": "http://127.0.0.1:30003",
+      "requests": 8646
+    },
+    {
+      "url": "http://127.0.0.1:30004",
+      "requests": 8047
+    },
+    {
+      "url": "http://127.0.0.1:30005",
+      "requests": 8206
+    },
+    {
+      "url": "http://127.0.0.1:30006",
+      "requests": 8548
+    },
+    {
+      "url": "http://127.0.0.1:30007",
+      "requests": 8047
+    }
+  ]
+}

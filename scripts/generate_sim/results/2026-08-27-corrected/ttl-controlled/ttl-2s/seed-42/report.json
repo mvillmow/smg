@@ -1,0 +1,705 @@
+{
+  "profile": {
+    "name": "local-small",
+    "description": "Laptop profile at production worker pressure: 8 SMGs x 120 workers, ~30-38 concurrent requests per worker (target ~460 req/s at 8.9 s mean lifetime under 10x time compression), 10x body compression (62 KB images). Live production topology is 10 SMGs; 8 is the requested experiment default (smg_count is a knob).",
+    "smg_count": 8,
+    "workers_total": 120,
+    "mock_processes": 1,
+    "model_id": "mock-model",
+    "duration_secs": 150,
+    "warmup_secs": 20,
+    "sample_interval_secs": 5,
+    "sample_fds": true,
+    "readiness_fraction": 0.99,
+    "readiness_timeout_secs": 120,
+    "mock": {
+      "engine": "sim",
+      "block_size": 256,
+      "sim_itl_ms": 4.3,
+      "sim_ttft_base_ms": 0,
+      "prefill_tps": 80000,
+      "max_running": 80,
+      "kv_tokens": 1200000,
+      "image_placeholder_id": 151655,
+      "image_tokens_per_image": 0,
+      "image_bytes_per_token": 2800
+    },
+    "smg_flags": [
+      "--policy",
+      "cache_aware",
+      "--cache-index",
+      "hash",
+      "--cache-threshold",
+      "0.60",
+      "--block-size",
+      "128",
+      "--cache-boundaries",
+      "3072,4096,6144,8192,12288,16384",
+      "--balance-abs-threshold",
+      "8",
+      "--balance-rel-threshold",
+      "1.2",
+      "--overlap-decay",
+      "1.0",
+      "--disable-retries",
+      "--upstream-http2",
+      "--max-concurrent-requests",
+      "180000",
+      "--queue-size",
+      "512",
+      "--queue-timeout-secs",
+      "5",
+      "--worker-overload-waiting-requests",
+      "64",
+      "--worker-overload-token-usage",
+      "0.9",
+      "--routing-key-override",
+      "--assignment-mode",
+      "delegate",
+      "--cache-ttl-secs",
+      "2"
+    ],
+    "loadgen": {
+      "session_rps": 110,
+      "t2_ratio": 0.85,
+      "max_turns": 8,
+      "think_secs": 6,
+      "system_prefix_tokens": 2048,
+      "prompt_cdf": "5000:0.216,10000:0.530,20000:0.994",
+      "prompt_max": 24576,
+      "output_cdf": "1000:0.351,2000:0.513,5000:0.998",
+      "output_max": 6144,
+      "t2_suffix_tokens": 256,
+      "image_bytes": 62000,
+      "image_count": 1,
+      "ingress": "hash",
+      "turn2_ingress": "same",
+      "routing_key_reuse": 0.0,
+      "tokens_hint": false,
+      "stream": true,
+      "http2": true,
+      "conns_per_origin": 16,
+      "max_inflight": 50000,
+      "seed": 42
+    }
+  },
+  "run_dir": "/Users/simolin/workspace/smg/target/generate-sim/ttl-controlled-local-small-20260827-144234/ttl-2s/seed-42",
+  "loadgen_summary": {
+    "config": {
+      "smg_urls": [
+        "http://127.0.0.1:30000",
+        "http://127.0.0.1:30001",
+        "http://127.0.0.1:30002",
+        "http://127.0.0.1:30003",
+        "http://127.0.0.1:30004",
+        "http://127.0.0.1:30005",
+        "http://127.0.0.1:30006",
+        "http://127.0.0.1:30007"
+      ],
+      "duration_secs": 150,
+      "session_rps": 110.0,
+      "t2_ratio": 0.85,
+      "think_secs": 6.0,
+      "stream": true,
+      "http2": true,
+      "conns_per_origin": 16,
+      "max_turns": 8,
+      "request_timeout_secs": 300,
+      "ingress": "hash",
+      "turn2_ingress": "same",
+      "routing_key_reuse": 0.0,
+      "system_prefix_tokens": 2048,
+      "image_count": 1,
+      "image_bytes": 62000,
+      "image_placeholder_id": 151655,
+      "image_placeholder_run": 256,
+      "t2_suffix_tokens": 256,
+      "prompt_cdf": [
+        [
+          5000,
+          0.216
+        ],
+        [
+          10000,
+          0.53
+        ],
+        [
+          20000,
+          0.994
+        ]
+      ],
+      "prompt_max": 24576,
+      "output_cdf": [
+        [
+          1000,
+          0.351
+        ],
+        [
+          2000,
+          0.513
+        ],
+        [
+          5000,
+          0.998
+        ]
+      ],
+      "output_max": 6144,
+      "tokens_hint": false,
+      "max_inflight": 50000,
+      "warmup_secs": 0,
+      "seed": 42,
+      "out": "/Users/simolin/workspace/smg/target/generate-sim/ttl-controlled-local-small-20260827-144234/ttl-2s/seed-42"
+    },
+    "totals": {
+      "sessions": 16470,
+      "requests": 67311,
+      "errors": {}
+    },
+    "elapsed_secs": 312.48047475,
+    "achieved_rps": 215.40865890533533,
+    "ttft_ms": {
+      "mean": 31.422546291363943,
+      "p50": 8.165375000000001,
+      "p90": 119.024417,
+      "p99": 219.068792
+    },
+    "e2e_ms": {
+      "mean": 9198.878750560954,
+      "p50": 8306.972917,
+      "p90": 18914.647875,
+      "p99": 21320.271209000002
+    },
+    "turns": {
+      "turn1": {
+        "count": 16470,
+        "ok": 16470,
+        "prompt_tokens_sum": 165539248,
+        "cached_tokens_sum": 33462272,
+        "cached_token_ratio": 0.20214101733747153,
+        "cached_ratio_request_mean": 0.3088395104414779,
+        "hit_rate": 0.33357619914996967,
+        "ttft_ms": {
+          "mean": 103.09915106891293,
+          "p50": 94.836709,
+          "p90": 202.167125,
+          "p99": 226.95162499999998
+        },
+        "e2e_ms": {
+          "mean": 9229.332441205392,
+          "p50": 8289.318207999999,
+          "p90": 18808.073875000002,
+          "p99": 21394.019624999997
+        }
+      },
+      "turn2": {
+        "count": 14008,
+        "ok": 14008,
+        "prompt_tokens_sum": 173259786,
+        "cached_tokens_sum": 167507456,
+        "cached_token_ratio": 0.9667993933687532,
+        "cached_ratio_request_mean": 0.9573518534378593,
+        "hit_rate": 0.9979297544260423,
+        "ttft_ms": {
+          "mean": 7.888698865362658,
+          "p50": 7.445708,
+          "p90": 9.183166,
+          "p99": 11.137834
+        },
+        "e2e_ms": {
+          "mean": 9178.84857703768,
+          "p50": 8251.823957999999,
+          "p90": 18924.210375000002,
+          "p99": 21289.453125
+        }
+      },
+      "followup": {
+        "count": 50841,
+        "ok": 50841,
+        "prompt_tokens_sum": 775893567,
+        "cached_tokens_sum": 754862592,
+        "cached_token_ratio": 0.9728945104142099,
+        "cached_ratio_request_mean": 0.967459684691639,
+        "hit_rate": 0.997816722723786,
+        "ttft_ms": {
+          "mean": 8.202828333687332,
+          "p50": 7.686,
+          "p90": 9.584708000000001,
+          "p99": 12.484709
+        },
+        "e2e_ms": {
+          "mean": 9189.013242704803,
+          "p50": 8313.559458,
+          "p90": 18935.7435,
+          "p99": 21289.453125
+        }
+      }
+    },
+    "overall": {
+      "ok": 67311,
+      "prompt_tokens_sum": 941432815,
+      "cached_tokens_sum": 788324864,
+      "cached_token_ratio": 0.8373670977253964,
+      "cached_ratio_request_mean": 0.8063051294198516
+    },
+    "turn2_same_worker_rate": 1.0,
+    "followup_same_worker_rate": 1.0,
+    "mean_turns_per_session": 4.086885245901639,
+    "turn1_workers": {
+      "distinct": 120,
+      "max_share": 0.00904675166970249,
+      "normalized_entropy": 0.9998654209667793
+    },
+    "per_smg_requests": [
+      {
+        "url": "http://127.0.0.1:30000",
+        "requests": 8608
+      },
+      {
+        "url": "http://127.0.0.1:30001",
+        "requests": 8506
+      },
+      {
+        "url": "http://127.0.0.1:30002",
+        "requests": 8535
+      },
+      {
+        "url": "http://127.0.0.1:30003",
+        "requests": 8661
+      },
+      {
+        "url": "http://127.0.0.1:30004",
+        "requests": 8187
+      },
+      {
+        "url": "http://127.0.0.1:30005",
+        "requests": 7947
+      },
+      {
+        "url": "http://127.0.0.1:30006",
+        "requests": 8646
+      },
+      {
+        "url": "http://127.0.0.1:30007",
+        "requests": 8221
+      }
+    ]
+  },
+  "requests": {
+    "overall_imbalance": {
+      "requests": 67311,
+      "distinct_workers": 120,
+      "workers_total": 120,
+      "cov_fleet": 0.0392,
+      "max_over_mean_fleet": 1.12,
+      "cov_observed": 0.0392
+    },
+    "turns": {
+      "turn1": {
+        "requests": 16470,
+        "prompt_tokens_sum": 165539248,
+        "cached_tokens_sum": 33462272,
+        "cached_over_prompt": 0.2021,
+        "hit_rate": 0.3336,
+        "imbalance": {
+          "requests": 16470,
+          "distinct_workers": 120,
+          "workers_total": 120,
+          "cov_fleet": 0.0359,
+          "max_over_mean_fleet": 1.09,
+          "cov_observed": 0.0359
+        }
+      },
+      "turn2": {
+        "requests": 14008,
+        "prompt_tokens_sum": 173259786,
+        "cached_tokens_sum": 167507456,
+        "cached_over_prompt": 0.9668,
+        "hit_rate": 0.9979,
+        "imbalance": {
+          "requests": 14008,
+          "distinct_workers": 120,
+          "workers_total": 120,
+          "cov_fleet": 0.036,
+          "max_over_mean_fleet": 1.1,
+          "cov_observed": 0.036
+        }
+      },
+      "turn3": {
+        "requests": 11391,
+        "prompt_tokens_sum": 161939474,
+        "cached_tokens_sum": 157264640,
+        "cached_over_prompt": 0.9711,
+        "hit_rate": 0.9975,
+        "imbalance": {
+          "requests": 11391,
+          "distinct_workers": 120,
+          "workers_total": 120,
+          "cov_fleet": 0.0471,
+          "max_over_mean_fleet": 1.16,
+          "cov_observed": 0.0471
+        }
+      },
+      "turn4": {
+        "requests": 8781,
+        "prompt_tokens_sum": 137701228,
+        "cached_tokens_sum": 134137856,
+        "cached_over_prompt": 0.9741,
+        "hit_rate": 0.9984,
+        "imbalance": {
+          "requests": 8781,
+          "distinct_workers": 120,
+          "workers_total": 120,
+          "cov_fleet": 0.061,
+          "max_over_mean_fleet": 1.15,
+          "cov_observed": 0.061
+        }
+      },
+      "turn5": {
+        "requests": 6567,
+        "prompt_tokens_sum": 111592961,
+        "cached_tokens_sum": 108890880,
+        "cached_over_prompt": 0.9758,
+        "hit_rate": 0.9982,
+        "imbalance": {
+          "requests": 6567,
+          "distinct_workers": 120,
+          "workers_total": 120,
+          "cov_fleet": 0.0877,
+          "max_over_mean_fleet": 1.21,
+          "cov_observed": 0.0877
+        }
+      },
+      "turn6": {
+        "requests": 4698,
+        "prompt_tokens_sum": 85342094,
+        "cached_tokens_sum": 83293184,
+        "cached_over_prompt": 0.976,
+        "hit_rate": 0.9966,
+        "imbalance": {
+          "requests": 4698,
+          "distinct_workers": 120,
+          "workers_total": 120,
+          "cov_fleet": 0.1244,
+          "max_over_mean_fleet": 1.28,
+          "cov_observed": 0.1244
+        }
+      },
+      "turn7": {
+        "requests": 3287,
+        "prompt_tokens_sum": 63563120,
+        "cached_tokens_sum": 62186240,
+        "cached_over_prompt": 0.9783,
+        "hit_rate": 0.9979,
+        "imbalance": {
+          "requests": 3287,
+          "distinct_workers": 120,
+          "workers_total": 120,
+          "cov_fleet": 0.1527,
+          "max_over_mean_fleet": 1.42,
+          "cov_observed": 0.1527
+        }
+      },
+      "turn8": {
+        "requests": 2109,
+        "prompt_tokens_sum": 42494904,
+        "cached_tokens_sum": 41582336,
+        "cached_over_prompt": 0.9785,
+        "hit_rate": 0.9976,
+        "imbalance": {
+          "requests": 2109,
+          "distinct_workers": 120,
+          "workers_total": 120,
+          "cov_fleet": 0.2141,
+          "max_over_mean_fleet": 1.59,
+          "cov_observed": 0.2141
+        }
+      }
+    },
+    "t2_sessions": 14008,
+    "t2_same_worker_rate": 1.0
+  },
+  "samples": [
+    {
+      "idx": 0,
+      "rss_kib": {
+        "peak": 141808,
+        "mean": 128716
+      },
+      "cpu_pct": {
+        "peak": 10.8,
+        "mean": 3.2
+      },
+      "fds": {
+        "peak": 403,
+        "mean": 259
+      },
+      "queue_depth": {
+        "peak": 0.0,
+        "mean": 0
+      },
+      "http_connections_active": {
+        "peak": 545.0,
+        "mean": 253
+      },
+      "rejected_total": 0.0,
+      "worker_selection_total": 8608.0,
+      "sticky_branches": {
+        "vacant": 2072.0,
+        "occupied_hit": 6536.0
+      }
+    },
+    {
+      "idx": 1,
+      "rss_kib": {
+        "peak": 136080,
+        "mean": 120664
+      },
+      "cpu_pct": {
+        "peak": 10.7,
+        "mean": 3.0
+      },
+      "fds": {
+        "peak": 416,
+        "mean": 260
+      },
+      "queue_depth": {
+        "peak": 0.0,
+        "mean": 0
+      },
+      "http_connections_active": {
+        "peak": 531.0,
+        "mean": 249
+      },
+      "rejected_total": 0.0,
+      "worker_selection_total": 8506.0,
+      "sticky_branches": {
+        "vacant": 2091.0,
+        "occupied_hit": 6415.0
+      }
+    },
+    {
+      "idx": 2,
+      "rss_kib": {
+        "peak": 151744,
+        "mean": 129724
+      },
+      "cpu_pct": {
+        "peak": 10.6,
+        "mean": 3.0
+      },
+      "fds": {
+        "peak": 412,
+        "mean": 257
+      },
+      "queue_depth": {
+        "peak": 0.0,
+        "mean": 0
+      },
+      "http_connections_active": {
+        "peak": 543.0,
+        "mean": 248
+      },
+      "rejected_total": 0.0,
+      "worker_selection_total": 8535.0,
+      "sticky_branches": {
+        "vacant": 2077.0,
+        "occupied_hit": 6458.0
+      }
+    },
+    {
+      "idx": 3,
+      "rss_kib": {
+        "peak": 146368,
+        "mean": 122472
+      },
+      "cpu_pct": {
+        "peak": 11.1,
+        "mean": 3.0
+      },
+      "fds": {
+        "peak": 402,
+        "mean": 258
+      },
+      "queue_depth": {
+        "peak": 0.0,
+        "mean": 0
+      },
+      "http_connections_active": {
+        "peak": 545.0,
+        "mean": 250
+      },
+      "rejected_total": 0.0,
+      "worker_selection_total": 8661.0,
+      "sticky_branches": {
+        "vacant": 2113.0,
+        "occupied_hit": 6548.0
+      }
+    },
+    {
+      "idx": 4,
+      "rss_kib": {
+        "peak": 138592,
+        "mean": 117818
+      },
+      "cpu_pct": {
+        "peak": 10.7,
+        "mean": 2.9
+      },
+      "fds": {
+        "peak": 415,
+        "mean": 253
+      },
+      "queue_depth": {
+        "peak": 0.0,
+        "mean": 0
+      },
+      "http_connections_active": {
+        "peak": 538.0,
+        "mean": 237
+      },
+      "rejected_total": 0.0,
+      "worker_selection_total": 8187.0,
+      "sticky_branches": {
+        "vacant": 2010.0,
+        "occupied_hit": 6177.0
+      }
+    },
+    {
+      "idx": 5,
+      "rss_kib": {
+        "peak": 152752,
+        "mean": 132143
+      },
+      "cpu_pct": {
+        "peak": 10.8,
+        "mean": 2.8
+      },
+      "fds": {
+        "peak": 414,
+        "mean": 255
+      },
+      "queue_depth": {
+        "peak": 0.0,
+        "mean": 0
+      },
+      "http_connections_active": {
+        "peak": 503.0,
+        "mean": 232
+      },
+      "rejected_total": 0.0,
+      "worker_selection_total": 7947.0,
+      "sticky_branches": {
+        "vacant": 1999.0,
+        "occupied_hit": 5948.0
+      }
+    },
+    {
+      "idx": 6,
+      "rss_kib": {
+        "peak": 147136,
+        "mean": 130110
+      },
+      "cpu_pct": {
+        "peak": 10.5,
+        "mean": 3.0
+      },
+      "fds": {
+        "peak": 413,
+        "mean": 258
+      },
+      "queue_depth": {
+        "peak": 0.0,
+        "mean": 0
+      },
+      "http_connections_active": {
+        "peak": 525.0,
+        "mean": 249
+      },
+      "rejected_total": 0.0,
+      "worker_selection_total": 8646.0,
+      "sticky_branches": {
+        "vacant": 2130.0,
+        "occupied_hit": 6516.0
+      }
+    },
+    {
+      "idx": 7,
+      "rss_kib": {
+        "peak": 147936,
+        "mean": 130957
+      },
+      "cpu_pct": {
+        "peak": 10.6,
+        "mean": 2.9
+      },
+      "fds": {
+        "peak": 415,
+        "mean": 256
+      },
+      "queue_depth": {
+        "peak": 0.0,
+        "mean": 0
+      },
+      "http_connections_active": {
+        "peak": 542.0,
+        "mean": 241
+      },
+      "rejected_total": 0.0,
+      "worker_selection_total": 8221.0,
+      "sticky_branches": {
+        "vacant": 1978.0,
+        "occupied_hit": 6243.0
+      }
+    }
+  ],
+  "cache_aware_branches": [
+    {
+      "idx": 0,
+      "branches": {
+        "min_load_fallback": 2072
+      }
+    },
+    {
+      "idx": 1,
+      "branches": {
+        "min_load_fallback": 2091
+      }
+    },
+    {
+      "idx": 2,
+      "branches": {
+        "min_load_fallback": 2077
+      }
+    },
+    {
+      "idx": 3,
+      "branches": {
+        "min_load_fallback": 2113
+      }
+    },
+    {
+      "idx": 4,
+      "branches": {
+        "min_load_fallback": 2010
+      }
+    },
+    {
+      "idx": 5,
+      "branches": {
+        "min_load_fallback": 1999
+      }
+    },
+    {
+      "idx": 6,
+      "branches": {
+        "min_load_fallback": 2130
+      }
+    },
+    {
+      "idx": 7,
+      "branches": {
+        "min_load_fallback": 1978
+      }
+    }
+  ]
+}
