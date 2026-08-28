@@ -35,6 +35,24 @@
   "ok": 62562,
   "prompt_tokens_sum": 680092519
  },
+ "kv-events/event-affine": {
+  "cached_token_ratio": 0.4614935098101879,
+  "cached_tokens_sum": 313198592,
+  "ok": 62562,
+  "prompt_tokens_sum": 678663048
+ },
+ "kv-events/event-sprayed": {
+  "cached_token_ratio": 0.4675963906316302,
+  "cached_tokens_sum": 317001728,
+  "ok": 62532,
+  "prompt_tokens_sum": 677938783
+ },
+ "kv-events/sticky-control": {
+  "cached_token_ratio": 0.4271120355782231,
+  "cached_tokens_sum": 289105664,
+  "ok": 62414,
+  "prompt_tokens_sum": 676884845
+ },
  "radix-replica/text-affine": {
   "cached_token_ratio": 0.40989183719922223,
   "cached_tokens_sum": 278134272,

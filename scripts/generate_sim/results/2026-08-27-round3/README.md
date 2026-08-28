@@ -128,6 +128,46 @@ Findings:
   same-worker, CoV 0.02–0.08) while streaming bodies (RSS 130 MiB vs
   366–615 MiB buffered). No reason to switch modes for this traffic.
 
+## kv-events — worker-broadcast cache events (gRPC), the radix rematch
+
+Same fleet shape as radix-replica, but the mock workers serve gRPC and
+stream real KV cache events (`SubscribeKvEvents` → `PositionalIndexer`):
+every gateway replica independently hears every worker's cache ground
+truth — no gateway-to-gateway sync, no shared store. Gateways run IGW
+mode (dynamic gRPC registration), tree index, no sticky override on the
+event legs; loadgen non-streaming, no images, and no reliance on routing
+keys at all for the event legs.
+
+| leg | AGG (Σ/Σ) | follow-up cached | same-worker | overall CoV |
+|---|---|---|---|---|
+| events, affine ingress, 8 SMG | 0.4623 ±0.0026 | 0.917 | 0.941 | 0.25 |
+| **events, sprayed ingress, 8 SMG** | **0.4653 ±0.0063** | **0.928** | **0.958** | 0.36 |
+| sticky-control (override on, tree vacant) | 0.4324 ±0.012 | 0.837 | 1.000 | 0.96 |
+
+Findings:
+
+- **Worker broadcast repairs sprayed ingress completely.** The
+  approximate tree collapsed to 0.257 follow-up cached / 0.107
+  same-worker under spray; with events the same spray holds 0.928 /
+  0.958 — statistically indistinguishable from the affine leg. Replica
+  count and ingress affinity stop mattering because every replica
+  converges on the same worker-reported truth.
+- **No dedicated index storage is needed** for accurate multi-replica
+  prediction: the workers are the storage, and the per-replica indexes
+  are caches of their broadcasts. The cost is the gRPC event stream (one
+  per gateway×worker pair) and IGW mode.
+- Event routing with sprayed ingress and NO routing keys reaches 0.465
+  aggregate — within a point of the production sticky config's 0.473 —
+  at the price of wider balance (CoV 0.36 vs 0.02–0.08) and the gRPC
+  worker requirement. For HTTP fleets the sticky-key conclusion stands.
+- The sticky-control leg exposes an interaction: with the override ON and
+  a tree index, vacant placements route by tree affinity and concentrate
+  — only ~65 of 120 workers ever pinned, CoV 0.96, follow-up cached down
+  to 0.837 (hot workers evict more), e2e p50 +7%. The production config
+  avoids this because its hash index cannot engage on the streamed path
+  (placement falls back to least-load). Sticky override + tree index is
+  a combination to avoid.
+
 ## hint-sticky — production config + routing-tokens hint
 
 Three seeded baseline-profile runs (latest main) with

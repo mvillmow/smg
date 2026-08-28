@@ -1,0 +1,36 @@
+{
+  "smg_bin": "smg",
+  "started_at": "2026-08-27T22:49:00.339681",
+  "git_commit": "ba9561a49887ece78eddf1cec825bbd14dee6100",
+  "git_dirty": false,
+  "binary_sha256": {
+    "smg": "28d420de6aeda257b64e5cf27c3b9c6ae5fd6f26b4f0761f4f2f81625d8b156f",
+    "mock-worker": "b6644d2344a0eceb4928617b0a832dd2d9c247f12fbf94880ac68d696ee0d571",
+    "sim-loadgen": "0ee121c46246cb81e011582e41de3e96a6a15e95b5efc81fb7d2069ca3c92fd3"
+  },
+  "profile_sha256": "b74e5b8caa9f7033b9ee3df0fc7f6d1bd653f9c804644dbcea0469ee83a08c76",
+  "loadgen_seed": 42,
+  "host": "macOS-26.3-arm64-arm-64bit-Mach-O",
+  "registered": {
+    "30000": 120,
+    "30001": 120,
+    "30002": 120,
+    "30003": 120,
+    "30004": 120,
+    "30005": 120,
+    "30006": 120,
+    "30007": 120
+  },
+  "ready": {
+    "30000": 120,
+    "30001": 120,
+    "30002": 120,
+    "30003": 120,
+    "30004": 120,
+    "30005": 120,
+    "30006": 120,
+    "30007": 120
+  },
+  "loadgen_exit": 0,
+  "finished_at": "2026-08-27T22:52:53.330629"
+}
