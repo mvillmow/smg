@@ -555,15 +555,6 @@ fn fnv64(bytes: &[u8]) -> u64 {
     h
 }
 
-fn fnv64_u32(ids: &[u32]) -> u64 {
-    let mut h = FNV_SEED;
-    for &id in ids.iter().take(64) {
-        h ^= u64::from(id);
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
-
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);

@@ -289,6 +289,7 @@ fn config_json(args: &Args) -> Value {
         "output_cdf": cdf_json(&args.output_cdf),
         "output_max": args.output_max,
         "tokens_hint": args.tokens_hint,
+        "payload": args.payload.as_str(),
         "max_inflight": args.max_inflight,
         "warmup_secs": args.warmup_secs,
         "seed": args.seed,

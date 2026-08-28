@@ -515,3 +515,26 @@ fn next_request_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!("mock-http-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_prompts_derive_stable_prefix_preserving_ids() {
+        // The loadgen's text payload is the token context space-joined as
+        // decimal words; extending the context must extend the derived ids
+        // so prefix-cache accounting matches the ids path semantically.
+        let turn1 = synth_token_ids("12 3");
+        let turn2 = synth_token_ids("12 3 45");
+        assert_eq!(turn1.len(), 2);
+        assert_eq!(turn2.len(), 3);
+        assert_eq!(turn2[..2], turn1[..], "shared text head, shared id head");
+        // Distinct words diverge (word identity, not position).
+        assert_ne!(synth_token_ids("12 4")[1], turn1[1]);
+
+        // The `text` field is one of the accepted prompt carriers.
+        let v: Value = serde_json::from_str(r#"{"text":"12 3 45"}"#).unwrap();
+        assert_eq!(synth_token_ids(&extract_prompt_text(&v)), turn2);
+    }
+}

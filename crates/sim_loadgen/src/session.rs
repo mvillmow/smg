@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc::UnboundedSender, Semaphore};
 
 use crate::{
-    args::{Args, Ingress, Turn2Ingress},
+    args::{Args, Ingress, Payload, Turn2Ingress},
     dist::{self, PiecewiseCdf, Rng},
     report::RequestRecord,
 };
@@ -213,7 +213,13 @@ async fn send_turn(ctx: &Ctx, req: &TurnRequest<'_>) -> Option<Vec<u32>> {
             )
         })
         .collect();
-    let body = build_body(req.input_ids, &images, req.max_new, args.stream);
+    let body = build_body(
+        req.input_ids,
+        &images,
+        req.max_new,
+        args.stream,
+        args.payload,
+    );
     drop(images);
 
     let hint = args.tokens_hint.then(|| {
@@ -321,17 +327,45 @@ async fn send_turn(ctx: &Ctx, req: &TurnRequest<'_>) -> Option<Vec<u32>> {
 /// Serialize the request body by hand: the multi-hundred-KB image strings are
 /// appended directly instead of being copied through an intermediate
 /// `serde_json::Value` (the base64 alphabet needs no JSON escaping).
-fn build_body(input_ids: &[u32], images: &[String], max_new: u32, stream: bool) -> String {
+///
+/// `Payload::Text` sends the same token context as a `text` field of
+/// space-joined decimal words instead of `input_ids`. Appending tokens
+/// appends text, so a turn's context is a string prefix of the next turn's
+/// and prefix matching survives the format change. The gateway then routes
+/// on its approximate string tree; the mock re-derives one stable id per
+/// word. Image placeholders are only expanded on the ids path, so text runs
+/// should use `--image-count 0`.
+fn build_body(
+    input_ids: &[u32],
+    images: &[String],
+    max_new: u32,
+    stream: bool,
+    payload: Payload,
+) -> String {
     let image_len: usize = images.iter().map(|image| image.len() + 3).sum();
     let mut body = String::with_capacity(image_len + input_ids.len() * 7 + 96);
-    body.push_str("{\"input_ids\":[");
-    for (i, id) in input_ids.iter().enumerate() {
-        if i > 0 {
-            body.push(',');
+    match payload {
+        Payload::Ids => {
+            body.push_str("{\"input_ids\":[");
+            for (i, id) in input_ids.iter().enumerate() {
+                if i > 0 {
+                    body.push(',');
+                }
+                let _ = write!(body, "{id}");
+            }
+            body.push(']');
         }
-        let _ = write!(body, "{id}");
+        Payload::Text => {
+            body.push_str("{\"text\":\"");
+            for (i, id) in input_ids.iter().enumerate() {
+                if i > 0 {
+                    body.push(' ');
+                }
+                let _ = write!(body, "{id}");
+            }
+            body.push('"');
+        }
     }
-    body.push(']');
     if !images.is_empty() {
         body.push_str(",\"image_data\":[");
         for (i, image) in images.iter().enumerate() {
@@ -433,5 +467,26 @@ mod tests {
         assert!(!next_context_fits(23_000, 2000, 256, 24_576));
         // Exactly at the window still fits.
         assert!(next_context_fits(24_000, 500, 76, 24_576));
+    }
+
+    #[test]
+    fn text_payload_is_valid_json_and_prefix_preserving() {
+        let turn1 = build_body(&[12, 3], &[], 8, false, Payload::Text);
+        let turn2 = build_body(&[12, 3, 45], &[], 8, false, Payload::Text);
+        let v1: serde_json::Value = serde_json::from_str(&turn1).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&turn2).unwrap();
+        assert_eq!(v1["text"], "12 3");
+        assert_eq!(v2["text"], "12 3 45");
+        assert!(v1.get("input_ids").is_none(), "text mode must omit ids");
+        // Extending the token context extends the text — the string tree
+        // sees turn 1 as a prefix of turn 2.
+        assert!(v2["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(v1["text"].as_str().unwrap()));
+        // The ids path is untouched by the payload switch.
+        let ids: serde_json::Value =
+            serde_json::from_str(&build_body(&[12, 3], &[], 8, false, Payload::Ids)).unwrap();
+        assert_eq!(ids["input_ids"], serde_json::json!([12, 3]));
     }
 }

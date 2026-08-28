@@ -39,6 +39,27 @@ impl Turn2Ingress {
     }
 }
 
+/// Wire format for the prompt in the `/generate` body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Payload {
+    /// Pre-tokenized `input_ids` — the gateway routes on its token tree
+    /// (or the hash index / sticky override when those are configured).
+    Ids,
+    /// Untokenized `text`: the token context space-joined as decimal words.
+    /// The gateway routes on its approximate string tree; the mock worker
+    /// re-derives one stable id per word, so prefix reuse is preserved.
+    Text,
+}
+
+impl Payload {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ids => "ids",
+            Self::Text => "text",
+        }
+    }
+}
+
 /// Configuration for one load-generation run.
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -103,6 +124,8 @@ pub struct Args {
     pub output_max: u32,
     /// Send `x-smg-routing-tokens` (first <=512 input ids) with each request.
     pub tokens_hint: bool,
+    /// Prompt wire format: `ids` (default) or `text`.
+    pub payload: Payload,
     /// Global cap on in-flight requests (a permit per request, not session).
     pub max_inflight: usize,
     /// Requests finishing this early are excluded from summary stats.
@@ -143,6 +166,7 @@ impl Args {
             output_cdf: vec![(1000, 0.351), (2000, 0.513), (5000, 0.998)],
             output_max: 8192,
             tokens_hint: false,
+            payload: Payload::Ids,
             max_inflight: 200_000,
             warmup_secs: 0,
             seed: 42,
@@ -219,6 +243,13 @@ impl Args {
                 "--output-cdf" => cfg.output_cdf = parse_cdf(&value(&mut args, &flag)?, &flag)?,
                 "--output-max" => cfg.output_max = parse(value(&mut args, &flag)?, &flag)?,
                 "--tokens-hint" => cfg.tokens_hint = parse(value(&mut args, &flag)?, &flag)?,
+                "--payload" => {
+                    cfg.payload = match value(&mut args, &flag)?.as_str() {
+                        "ids" => Payload::Ids,
+                        "text" => Payload::Text,
+                        other => return Err(format!("--payload must be ids|text, got {other}")),
+                    }
+                }
                 "--max-inflight" => cfg.max_inflight = parse(value(&mut args, &flag)?, &flag)?,
                 "--warmup-secs" => cfg.warmup_secs = parse(value(&mut args, &flag)?, &flag)?,
                 "--seed" => cfg.seed = parse(value(&mut args, &flag)?, &flag)?,

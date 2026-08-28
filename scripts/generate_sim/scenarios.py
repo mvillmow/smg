@@ -36,13 +36,29 @@ MULTITURN = {
 }
 
 
+# Shared gateway-flag patch for the radix-replica legs: route on the
+# approximate radix tree with no sticky short-circuit. False removes a flag.
+RADIX_TREE_FLAGS = {
+    "--cache-index": "tree",
+    "--routing-key-override": False,
+    "--assignment-mode": False,
+}
+
+
 def patch_smg_flags(flags, patches):
     """Return a copy of `flags` with each `--flag: value` replaced in place
-    (or appended). Scenario legs that must differ in exactly one gateway
-    setting go through here, so the rest of the flag list is shared by
+    (or appended); a value of False removes the flag (and its value when it
+    has one). Scenario legs that must differ in exactly one gateway setting
+    go through here, so the rest of the flag list is shared by
     construction."""
     out = list(flags)
     for flag, value in patches.items():
+        if value is False:
+            if flag in out:
+                idx = out.index(flag)
+                span = 2 if idx + 1 < len(out) and not out[idx + 1].startswith("--") else 1
+                del out[idx : idx + span]
+            continue
         if flag in out:
             idx = out.index(flag)
             if value is None:
@@ -150,6 +166,78 @@ SCENARIOS = {
             None,
         ),
         ("shared-keys", {"loadgen.routing_key_reuse": 1.0}, None),
+    ],
+    # Approximate radix trees (cache_index=tree) are PER-REPLICA state: each
+    # gateway learns only from its own placements — over HTTP there are no
+    # worker KV events and no gateway-to-gateway sync. These legs drop the
+    # sticky override so cache_aware actually consults the tree, and vary
+    # (a) the index input — pre-tokenized ids (token tree) vs raw text
+    # (string tree), (b) whether a session's turns stay on one SMG (hash
+    # ingress, like a consistent-hashing LB) or spray uniformly (random),
+    # and (c) the replica count. Prediction accuracy should collapse only
+    # when per-replica trees AND sprayed sessions combine. token-hint keeps
+    # the body streaming while still feeding the token tree via the
+    # x-smg-routing-tokens header. Images off: placeholder expansion is an
+    # ids-path feature, so this keeps ids and text legs byte-comparable.
+    "radix-replica": [
+        (
+            "token-affine",
+            {
+                "smg_flag_overrides": RADIX_TREE_FLAGS,
+                "loadgen.image_count": 0,
+            },
+            None,
+        ),
+        (
+            "token-random",
+            {
+                "smg_flag_overrides": RADIX_TREE_FLAGS,
+                "loadgen.image_count": 0,
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+            },
+            None,
+        ),
+        (
+            "token-single",
+            {
+                "smg_flag_overrides": RADIX_TREE_FLAGS,
+                "loadgen.image_count": 0,
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+                "smg_count": 1,
+            },
+            None,
+        ),
+        (
+            "text-affine",
+            {
+                "smg_flag_overrides": RADIX_TREE_FLAGS,
+                "loadgen.image_count": 0,
+                "loadgen.payload": "text",
+            },
+            None,
+        ),
+        (
+            "text-random",
+            {
+                "smg_flag_overrides": RADIX_TREE_FLAGS,
+                "loadgen.image_count": 0,
+                "loadgen.payload": "text",
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+            },
+            None,
+        ),
+        (
+            "token-hint-streamed",
+            {
+                "smg_flag_overrides": RADIX_TREE_FLAGS,
+                "loadgen.image_count": 0,
+                "loadgen.tokens_hint": True,
+            },
+            None,
+        ),
     ],
     # Kill and relaunch every SMG mid-window: sticky pins and placements are
     # process state, so affinity must rebuild; errors during the blackout

@@ -118,6 +118,34 @@ class ScenarioConstruction(unittest.TestCase):
         )
         self.assertEqual(flags[1], "delegate", "input must not be mutated")
 
+    def test_patch_smg_flags_false_removes_bare_and_valued_flags(self):
+        flags = [
+            "--cache-index",
+            "hash",
+            "--routing-key-override",
+            "--assignment-mode",
+            "delegate",
+            "--disable-retries",
+        ]
+        patched = scenarios.patch_smg_flags(flags, scenarios.RADIX_TREE_FLAGS)
+        self.assertEqual(
+            patched, ["--cache-index", "tree", "--disable-retries"]
+        )
+        self.assertIn("--routing-key-override", flags, "input must not be mutated")
+
+    def test_radix_legs_share_flag_patch_and_disable_images(self):
+        for label, overrides, _ in scenarios.SCENARIOS["radix-replica"]:
+            self.assertEqual(
+                overrides["smg_flag_overrides"],
+                scenarios.RADIX_TREE_FLAGS,
+                "leg %s must route on the tree without the sticky override" % label,
+            )
+            self.assertEqual(
+                overrides["loadgen.image_count"],
+                0,
+                "leg %s: placeholder expansion is ids-only; images must be off" % label,
+            )
+
 
 class MetricAggregation(unittest.TestCase):
     def _analyze(self, records):
