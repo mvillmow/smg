@@ -90,18 +90,26 @@ profile sets `"sample_fds": false`.
 
 ## Full-profile host sizing
 
-`profiles/full.json` (18k workers, 6,000 rps, real 43 ms ITL / ~89 s
-lifetime, 620 KB images) is documented for a large Linux host, not a laptop:
+`profiles/full.template.json` carries generic round placeholders — copy it to
+`profiles/full.local.json` (gitignored) and fill in your fleet's real worker
+count, request rate, timing, and body sizes; never commit those values. A
+full-scale run belongs on a large Linux host, not a laptop. Scaling rules of
+thumb for K SMGs, W workers, R req/s, mean body B, mean lifetime L:
 
-- ~4.1 GiB/s aggregate body ingest (6,000 rps × ~696 KiB), all loopback.
-- ~700k concurrent client h2 streams (87,500 per SMG × 8) — the loadgen must
-  run with `http2: true`; h1 would need 700k sockets.
-- ~144k SMG→worker connections (8 × 18k, one h2c conn per pair).
-- Registration alone is 144k `POST /workers` calls (64-way per SMG, SMGs in
-  parallel); allow the profile's 900 s readiness timeout.
-- Memory: with cache_aware and no routing-tokens hint every body is buffered
-  in the gateway (`decide_body_path`), so per-SMG RSS carries the in-flight
-  body set — that regime is one of the things this rig measures.
+- Aggregate body ingest ≈ R × B, all loopback.
+- Concurrent client h2 streams ≈ R × L — run the loadgen with `http2: true`
+  and size `conns_per_origin`; h1 would need one socket per stream.
+- SMG→worker connections ≈ K × W (one h2c conn per pair with
+  `--upstream-http2`).
+- Registration is K × W `POST /workers` calls (64-way per SMG, SMGs in
+  parallel); allow a generous readiness timeout.
+- Body memory depends on the routing regime: with the sticky override and a
+  valid routing key, bodies STREAM (`REASON_PURE_FORWARD`) and are not
+  buffered; without it (or without a key) the typed path buffers each body —
+  the `body path streamed share` report row verifies which regime a run was
+  actually in.
+- Resource conclusions (CPU/RSS/fds) are only meaningful at full scale;
+  reduced-scale reports carry an explicit warning banner.
 
 ## Policy A/B
 

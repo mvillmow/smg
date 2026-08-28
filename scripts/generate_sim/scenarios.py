@@ -122,6 +122,48 @@ SCENARIOS = {
             None,
         ),
     ],
+    # Gateway-revision comparison: the deployed revision (prebuilt binary,
+    # slot a — build it from the actual deployed SHA with an ISOLATED
+    # CARGO_TARGET_DIR) vs the branch's ambient latest-main build, plus
+    # min_group on latest main. Routing-regime differences show directly in
+    # the "body path streamed share" row.
+    "revision-ab": [
+        ("deployed-rev", {}, "a"),
+        ("latest-main", {}, None),
+        (
+            "latest-main-min-group",
+            {"smg_flag_overrides": {"--assignment-mode": "min_group"}},
+            None,
+        ),
+    ],
+    # Routing-key stability: stable per-session keys (baseline), a fresh key
+    # every turn (sticky pin lost + ingress re-hash each turn), and everyone
+    # sharing 32 keys (concurrent same-key pressure on the sticky cap).
+    "key-stability": [
+        ("stable-key", {}, None),
+        (
+            "key-per-turn",
+            {
+                "loadgen.key_per_turn": True,
+                "loadgen.turn2_ingress": "hash",
+            },
+            None,
+        ),
+        ("shared-keys", {"loadgen.routing_key_reuse": 1.0}, None),
+    ],
+    # Kill and relaunch every SMG mid-window: sticky pins and placements are
+    # process state, so affinity must rebuild; errors during the blackout
+    # are part of the result.
+    "router-restart": [
+        (
+            "restart-mid-run",
+            dict(
+                MULTITURN,
+                **{"restart_smgs_at_secs": 60},
+            ),
+            None,
+        ),
+    ],
     # The hash placement index is LOCAL to each SMG: turn-2 affinity only
     # survives if turn 2 reaches the same SMG. This isolates that effect.
     # Does a smaller SMG fleet raise cache hit rates? With sticky turns the
@@ -264,6 +306,19 @@ def extract_rows(report):
         round(sticky.get("occupied_hit", 0) / sticky_total, 4) if sticky_total else None
     )
     rows["sticky cap_respill count"] = sticky.get("cap_respill", 0) if sticky else None
+    # Direct verification of the request-body regime: share of requests
+    # routed via streaming (header-only selection) vs buffered (typed path).
+    paths = {}
+    for s in samples:
+        for name, count in (s.get("body_paths") or {}).items():
+            paths[name] = paths.get(name, 0) + count
+    path_total = sum(paths.values())
+    streamed = sum(v for k, v in paths.items() if k.startswith("streamed"))
+    rows["body path streamed share"] = (
+        round(streamed / path_total, 4) if path_total else None
+    )
+    rows["offered session rps"] = summary.get("offered_session_rps")
+    rows["drain requests (excluded)"] = _get(summary, "drain", "requests")
     rows["rss peak MiB (max smg)"] = (
         round(max(rss_peaks) / 1024, 1) if rss_peaks else None
     )
@@ -352,9 +407,25 @@ def cmd_compare(args):
     sim.log("compare: %s" % (scenario_dir / "compare.md"))
 
 
+# Two-sided 97.5% Student-t quantiles by degrees of freedom; small seed
+# counts need these, not the normal 1.96 (n=3 would otherwise report
+# intervals ~2.2x too narrow).
+STUDENT_T_975 = {
+    1: 12.706,
+    2: 4.303,
+    3: 3.182,
+    4: 2.776,
+    5: 2.571,
+    6: 2.447,
+    7: 2.365,
+    8: 2.306,
+    9: 2.262,
+}
+
+
 def aggregate_seed_rows(seed_rows):
-    """Mean ± 95% CI half-width across seeds for numeric rows; single-seed
-    runs and non-numeric rows pass through the first value."""
+    """Mean ± 95% CI half-width (Student-t) across seeds for numeric rows;
+    single-seed runs and non-numeric rows pass through the first value."""
     if len(seed_rows) == 1:
         return seed_rows[0]
     keys = []
@@ -370,7 +441,8 @@ def aggregate_seed_rows(seed_rows):
             n = len(nums)
             m = sum(nums) / n
             var = sum((v - m) ** 2 for v in nums) / (n - 1)
-            half = 1.96 * (var**0.5) / (n**0.5)
+            t = STUDENT_T_975.get(n - 1, 1.96)
+            half = t * (var**0.5) / (n**0.5)
             out[key] = "%.4g ±%.2g" % (m, half)
         else:
             out[key] = vals[0]

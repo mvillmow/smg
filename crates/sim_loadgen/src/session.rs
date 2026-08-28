@@ -83,7 +83,7 @@ pub async fn run(ctx: Arc<Ctx>, sid: u64) {
     let mut rng = Rng::new(session_seed);
 
     let reuse_draw = rng.next_f64();
-    let key = if reuse_draw < args.routing_key_reuse {
+    let mut key = if reuse_draw < args.routing_key_reuse {
         format!("shared-{}", rng.next_index(SHARED_ROUTING_KEYS))
     } else {
         format!("sess-{sid}")
@@ -168,6 +168,11 @@ pub async fn run(ctx: Arc<Ctx>, sid: u64) {
             suffix,
         ));
         turn += 1;
+        // Clients without a stable session key present a fresh key each
+        // turn: the sticky override re-pins, and hash ingress re-hashes.
+        if args.key_per_turn {
+            key = format!("sess-{sid}-t{turn}");
+        }
         smg = match args.turn2_ingress {
             Turn2Ingress::Same => t1_smg,
             Turn2Ingress::Hash => hash_smg(&key, n),

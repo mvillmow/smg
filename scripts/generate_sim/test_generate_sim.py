@@ -16,7 +16,7 @@ import scenarios
 import sim
 
 PROFILES = Path(__file__).resolve().parent / "profiles"
-PRODUCTION_PROFILES = ["local-small.json", "local-medium.json", "full.json"]
+PRODUCTION_PROFILES = ["local-small.json", "local-medium.json", "full.template.json"]
 
 
 def load(name):
@@ -43,7 +43,9 @@ class ProfileInvariants(unittest.TestCase):
 
     def test_full_profile_supports_production_concurrency(self):
         # 6,000 rps x 89 s mean lifetime ~= 534k concurrent requests.
-        self.assertGreaterEqual(load("full.json")["loadgen"]["max_inflight"], 534_000)
+        self.assertGreaterEqual(
+            load("full.template.json")["loadgen"]["max_inflight"], 534_000
+        )
 
     def test_local_profiles_target_production_worker_pressure(self):
         # ~30-38 concurrent per worker: session_rps x mean_turns x lifetime
@@ -147,6 +149,21 @@ class MetricAggregation(unittest.TestCase):
         agg = scenarios.aggregate_seed_rows(rows)
         self.assertTrue(agg["x"].startswith("2 ±"), agg["x"])
         self.assertEqual(agg["label"], "a")
+
+
+class ArtifactHygiene(unittest.TestCase):
+    def test_committed_results_carry_no_absolute_local_paths(self):
+        # OSS hygiene: committed artifacts must not leak local usernames or
+        # machine paths (repo-relative provenance only).
+        results = Path(__file__).resolve().parent / "results"
+        if not results.exists():
+            self.skipTest("no committed results")
+        offenders = []
+        for f in results.rglob("*.json"):
+            text = f.read_text(errors="replace")
+            if "/Users/" in text or "/home/" in text:
+                offenders.append(str(f.relative_to(results)))
+        self.assertEqual(offenders, [], "absolute local paths in artifacts")
 
 
 class BranchParsing(unittest.TestCase):

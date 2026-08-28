@@ -1,6 +1,6 @@
 {
   "name": "local-medium",
-  "description": "Workstation profile at production worker pressure: 8 SMGs x 240 workers, ~917 req/s target (30-38 concurrent per worker at 8.9 s compressed lifetime).",
+  "description": "Workstation profile at production-like worker pressure: 8 SMGs x 240 workers, 10x compression. Cache semantics only \u2014 not for resource conclusions.",
   "smg_count": 8,
   "workers_total": 240,
   "mock_processes": 2,

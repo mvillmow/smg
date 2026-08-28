@@ -70,8 +70,11 @@ impl RequestRecord {
     }
 }
 
-/// Build the summary document. Requests finishing during `--warmup-secs` are
-/// excluded from every statistic but still counted in the totals.
+/// Build the summary document. Statistics cover the STEADY-STATE window
+/// only: requests completing after `--warmup-secs` and before the arrival
+/// window closes (`--duration-secs`). The drain tail — turns that finish
+/// after arrivals stop — is reported separately and never mixed into
+/// cache/latency/throughput comparisons.
 pub fn summarize(
     args: &Args,
     records: &[RequestRecord],
@@ -80,11 +83,19 @@ pub fn summarize(
     sessions: u64,
 ) -> Value {
     let warmup_end_ms = run_start_ms.saturating_add(args.warmup_secs.saturating_mul(1000));
+    let arrival_end_ms = run_start_ms.saturating_add(args.duration_secs.saturating_mul(1000));
     let measured: Vec<&RequestRecord> = records
         .iter()
-        .filter(|r| r.finish_ms() >= warmup_end_ms)
+        .filter(|r| {
+            let finish = r.finish_ms();
+            finish >= warmup_end_ms && finish < arrival_end_ms
+        })
         .collect();
-    let measured_secs = (elapsed_secs - args.warmup_secs as f64).max(1e-9);
+    let drain: Vec<&RequestRecord> = records
+        .iter()
+        .filter(|r| r.finish_ms() >= arrival_end_ms)
+        .collect();
+    let measured_secs = (args.duration_secs.saturating_sub(args.warmup_secs)).max(1) as f64;
 
     let mut errors: BTreeMap<String, u64> = BTreeMap::new();
     for record in records {
@@ -216,6 +227,18 @@ pub fn summarize(
             "errors": errors,
         },
         "elapsed_secs": elapsed_secs,
+        // Steady-state window: [warmup, arrival end). Offered rate and the
+        // drain tail are reported separately so scenarios stay comparable.
+        "window": {
+            "start_secs": args.warmup_secs,
+            "end_secs": args.duration_secs,
+            "measured_requests": measured.len(),
+        },
+        "offered_session_rps": args.session_rps,
+        "drain": {
+            "requests": drain.len(),
+            "ok": drain.iter().filter(|r| r.is_ok()).count(),
+        },
         "achieved_rps": measured.len() as f64 / measured_secs,
         "ttft_ms": stats(&ttfts),
         "e2e_ms": stats(&e2es),
@@ -251,6 +274,7 @@ fn config_json(args: &Args) -> Value {
         "conns_per_origin": args.conns_per_origin,
         "max_turns": args.max_turns,
         "request_timeout_secs": args.request_timeout_secs,
+        "key_per_turn": args.key_per_turn,
         "ingress": args.ingress.as_str(),
         "turn2_ingress": args.turn2_ingress.as_str(),
         "routing_key_reuse": args.routing_key_reuse,

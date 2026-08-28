@@ -18,10 +18,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -95,9 +92,11 @@ struct SimState {
     running: usize,
     waiting: usize,
     waiting_uncached_tokens: i64,
-    /// Tokens pinned by running requests (prompt + reserved output).
+    /// Tokens claimed by running requests: uncached prompt + output
+    /// reservation, held until COMPLETION (a decoding request depends on
+    /// its whole prompt, so none of it may stop counting mid-flight).
     running_tokens: u64,
-    cache: BlockLru,
+    kv: KvIndex,
     /// EWMA of per-request cached/prompt.
     hit_rate_ewma: f64,
 }
@@ -117,11 +116,12 @@ pub struct Admitted {
 }
 
 impl Admitted {
-    /// Mark simulated prefill complete: only now do the prompt's blocks
-    /// enter the shared prefix cache (a concurrent request must not hit KV
-    /// that hasn't been computed), and the request's private KV claim
-    /// shrinks to its output reservation — the prompt blocks are accounted
-    /// by the cache from here on, never in both places. Idempotent.
+    /// Mark simulated prefill complete: only now do the prompt's freshly
+    /// computed blocks become matchable by other requests (a concurrent
+    /// request must not hit KV that hasn't been computed). They enter the
+    /// index PINNED — this request still decodes against them, so they
+    /// stay non-evictable and its KV claim keeps counting until
+    /// completion. Idempotent.
     pub fn finish_prefill(&mut self) {
         self.guard.finish_prefill();
     }
@@ -137,7 +137,7 @@ impl SimWorker {
                 waiting: 0,
                 waiting_uncached_tokens: 0,
                 running_tokens: 0,
-                cache: BlockLru::new(),
+                kv: KvIndex::new(),
                 hit_rate_ewma: 0.0,
             }),
             params,
@@ -170,12 +170,19 @@ impl SimWorker {
         }
     }
 
-    /// Test-only view of the evictable prefix-cache size in tokens (not
-    /// part of reported usage; see [`Self::load`]).
+    /// Test-only view of the evictable cache size in tokens (not part of
+    /// reported usage; see [`Self::load`]).
     #[cfg(test)]
     fn cache_tokens_for_test(&self) -> u64 {
         let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        st.cache.tokens(self.params.block_size)
+        st.kv.evictable_tokens(self.params.block_size)
+    }
+
+    /// Test-only view of pinned (active, non-evictable) KV in tokens.
+    #[cfg(test)]
+    fn pinned_tokens_for_test(&self) -> u64 {
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.kv.pinned_tokens(self.params.block_size)
     }
 
     /// Effective cached sequence: `input_ids` with each placeholder run
@@ -244,11 +251,13 @@ impl SimWorker {
             .await
             .expect("admission semaphore never closes");
 
+        let block = self.params.block_size;
         let prompt_tokens = effective.len();
-        // Private KV claim while running: the uncached prompt (owned by this
-        // request until prefill completes and the blocks move to the shared
-        // cache) plus the output reservation. Cached prompt blocks are
-        // already accounted by the cache, never counted twice.
+        let chain = chain_hashes(&effective, block);
+        // The request's KV claim while running: uncached prompt + output
+        // reservation, held until COMPLETION. Matched blocks are pinned so
+        // eviction cannot remove KV a running request depends on; they stay
+        // accounted by whoever computed them, never twice.
         let cached_tokens;
         let private_tokens;
         {
@@ -256,24 +265,22 @@ impl SimWorker {
             st.waiting -= 1;
             st.waiting_uncached_tokens -= uncached_estimate;
             st.running += 1;
-            let cached = st
-                .cache
-                .match_prefix(&effective, self.params.block_size)
-                .min(prompt_tokens);
-            cached_tokens = cached;
-            private_tokens = (prompt_tokens - cached) as u64 + u64::from(max_new);
+            let matched_blocks = st.kv.match_blocks(&chain);
+            cached_tokens = (matched_blocks * block).min(prompt_tokens);
+            st.kv.pin(&chain[..matched_blocks]);
+            private_tokens = (prompt_tokens - cached_tokens) as u64 + u64::from(max_new);
             st.running_tokens += private_tokens;
             let ratio = if prompt_tokens == 0 {
                 0.0
             } else {
-                cached as f64 / prompt_tokens as f64
+                cached_tokens as f64 / prompt_tokens as f64
             };
             st.hit_rate_ewma = st.hit_rate_ewma * 0.95 + ratio * 0.05;
             let budget = self
                 .params
                 .kv_capacity_tokens
                 .saturating_sub(st.running_tokens);
-            st.cache.evict_to(budget, self.params.block_size);
+            st.kv.evict_to(budget, block);
         }
 
         let uncached = (prompt_tokens - cached_tokens) as f64;
@@ -282,11 +289,19 @@ impl SimWorker {
         );
         let decode = Duration::from_secs_f64(f64::from(max_new) * self.params.itl_ms / 1000.0);
 
-        let request_seed =
-            splitmix64(NEXT_SEED.fetch_add(1, Ordering::Relaxed) ^ fnv64_u32(&effective));
+        // Deterministic from request CONTENT alone (full-sequence chain hash
+        // + length + output budget) — never from admission order — so the
+        // same seed produces byte-identical A/B traffic, and a follow-up
+        // echoing these outputs is reproducible across runs.
+        let request_seed = splitmix64(
+            chain.last().copied().unwrap_or(FNV_SEED)
+                ^ (prompt_tokens as u64)
+                ^ (u64::from(max_new) << 32),
+        );
         let output_ids: Vec<u32> = (0..max_new as u64)
             .map(|k| (splitmix64(request_seed ^ k) % 30_000) as u32)
             .collect();
+        let matched_blocks = cached_tokens / block;
 
         Admitted {
             prompt_tokens,
@@ -299,8 +314,9 @@ impl SimWorker {
                 worker: Arc::clone(self),
                 effective,
                 output_ids: output_ids.clone(),
-                uncached_prompt_tokens: (prompt_tokens - cached_tokens) as u64,
-                output_reservation: u64::from(max_new),
+                chain,
+                pinned_blocks: matched_blocks,
+                private_tokens,
                 prefill_done: false,
                 permit: Some(permit),
             },
@@ -309,22 +325,25 @@ impl SimWorker {
     }
 }
 
-static NEXT_SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
-
-/// Releases a request's admission slot and KV pin. Cache publication is
-/// staged: nothing at admission; the prompt's blocks at prefill completion
-/// (`finish_prefill`); the full sequence (prompt ⊕ output — later-turn
-/// affinity depends on the output being cached) at completion. A request
-/// dropped before prefill completes publishes nothing. Runs on normal
-/// completion AND on client disconnect (response stream dropped).
+/// Releases a request's admission slot and KV accounting. The request's
+/// claim (uncached prompt + output reservation) is held until COMPLETION —
+/// decoding depends on the whole prompt, so none of it stops counting
+/// mid-flight. Matchability is staged: matched blocks are pinned from
+/// admission; the rest of the prompt becomes matchable (pinned) at prefill
+/// completion; at completion everything unpins into the evictable cache
+/// with the output appended (later-turn affinity depends on the output
+/// being cached). A request dropped before prefill publishes nothing new.
+/// Runs on normal completion AND on client disconnect.
 struct CompletionGuard {
     worker: Arc<SimWorker>,
     effective: Vec<u32>,
     output_ids: Vec<u32>,
-    /// Private KV still claimed for the prompt; moves to the shared cache's
-    /// account at prefill completion.
-    uncached_prompt_tokens: u64,
-    output_reservation: u64,
+    /// Chained block hashes of the prompt.
+    chain: Vec<u64>,
+    /// Leading chain blocks this request currently pins.
+    pinned_blocks: usize,
+    /// Uncached prompt + output reservation, released at drop.
+    private_tokens: u64,
     prefill_done: bool,
     permit: Option<OwnedSemaphorePermit>,
 }
@@ -335,16 +354,12 @@ impl CompletionGuard {
             return;
         }
         self.prefill_done = true;
-        let params = self.worker.params.clone();
         let mut st = self.worker.state.lock().unwrap_or_else(|p| p.into_inner());
-        st.cache.insert_chain(&self.effective, params.block_size);
-        // The prompt blocks now live in the cache's account; release the
-        // private claim so they are never counted twice.
-        st.running_tokens = st
-            .running_tokens
-            .saturating_sub(self.uncached_prompt_tokens);
-        let budget = params.kv_capacity_tokens.saturating_sub(st.running_tokens);
-        st.cache.evict_to(budget, params.block_size);
+        // The freshly computed prompt blocks become matchable, pinned (not
+        // evictable) because this request still decodes against them. The
+        // KV claim is unchanged — the tokens were counted from admission.
+        st.kv.pin(&self.chain[self.pinned_blocks..]);
+        self.pinned_blocks = self.chain.len();
     }
 }
 
@@ -353,23 +368,114 @@ impl Drop for CompletionGuard {
         let params = self.worker.params.clone();
         let mut st = self.worker.state.lock().unwrap_or_else(|p| p.into_inner());
         st.running = st.running.saturating_sub(1);
+        st.running_tokens = st.running_tokens.saturating_sub(self.private_tokens);
+        st.kv.unpin(&self.chain[..self.pinned_blocks]);
         if self.prefill_done {
-            st.running_tokens = st.running_tokens.saturating_sub(self.output_reservation);
+            // Publish the finished sequence (prompt ⊕ output) as evictable
+            // cache; an abort before prefill publishes nothing new.
             let mut full = std::mem::take(&mut self.effective);
             full.extend_from_slice(&self.output_ids);
-            st.cache.insert_chain(&full, params.block_size);
-        } else {
-            // Dropped before prefill finished: nothing was computed, nothing
-            // is published; release the whole private claim.
-            st.running_tokens = st
-                .running_tokens
-                .saturating_sub(self.uncached_prompt_tokens + self.output_reservation);
+            let full_chain = chain_hashes(&full, params.block_size);
+            st.kv.insert_evictable(&full_chain);
         }
         let budget = params.kv_capacity_tokens.saturating_sub(st.running_tokens);
-        st.cache.evict_to(budget, params.block_size);
+        st.kv.evict_to(budget, params.block_size);
         drop(st);
         self.permit.take();
     }
+}
+
+// ── KV index: pinned (active) + evictable (LRU) block hashes ────────────────
+
+/// Block-hash view of a worker's KV: `pinned` holds refcounted blocks that
+/// running requests depend on (never evicted); `lru` holds completed,
+/// evictable cache. Both are matchable.
+struct KvIndex {
+    pinned: HashMap<u64, u32>,
+    lru: BlockLru,
+}
+
+impl KvIndex {
+    fn new() -> Self {
+        Self {
+            pinned: HashMap::new(),
+            lru: BlockLru::new(),
+        }
+    }
+
+    /// Leading chain blocks present in pinned or evictable KV.
+    fn match_blocks(&mut self, chain: &[u64]) -> usize {
+        let mut matched = 0usize;
+        for &hash in chain {
+            if self.pinned.contains_key(&hash) {
+                matched += 1;
+            } else if self.lru.contains(hash) {
+                self.lru.touch(hash);
+                matched += 1;
+            } else {
+                break;
+            }
+        }
+        matched
+    }
+
+    /// Pin blocks (refcounted); a block pinned out of the LRU stops being
+    /// evictable until its last unpin.
+    fn pin(&mut self, hashes: &[u64]) {
+        for &hash in hashes {
+            *self.pinned.entry(hash).or_insert(0) += 1;
+            self.lru.remove(hash);
+        }
+    }
+
+    /// Drop one pin per block; the last unpin moves the block into the
+    /// evictable LRU.
+    fn unpin(&mut self, hashes: &[u64]) {
+        for &hash in hashes {
+            if let Some(count) = self.pinned.get_mut(&hash) {
+                *count -= 1;
+                if *count == 0 {
+                    self.pinned.remove(&hash);
+                    self.lru.touch(hash);
+                }
+            }
+        }
+    }
+
+    fn insert_evictable(&mut self, hashes: &[u64]) {
+        for &hash in hashes {
+            if !self.pinned.contains_key(&hash) {
+                self.lru.touch(hash);
+            }
+        }
+    }
+
+    /// Evict LRU blocks until evictable tokens fit `budget_tokens`; pinned
+    /// blocks are untouchable by construction.
+    fn evict_to(&mut self, budget_tokens: u64, block_size: usize) {
+        self.lru.evict_to(budget_tokens, block_size);
+    }
+
+    #[cfg(test)]
+    fn evictable_tokens(&self, block_size: usize) -> u64 {
+        self.lru.tokens(block_size)
+    }
+
+    #[cfg(test)]
+    fn pinned_tokens(&self, block_size: usize) -> u64 {
+        (self.pinned.len() * block_size) as u64
+    }
+}
+
+/// Chained block hashes for `seq` (one entry per full `block_size` block).
+fn chain_hashes(seq: &[u32], block_size: usize) -> Vec<u64> {
+    let mut chain = Vec::with_capacity(seq.len() / block_size.max(1));
+    let mut prev = FNV_SEED;
+    for block in seq.chunks_exact(block_size) {
+        prev = chain_hash(prev, block);
+        chain.push(prev);
+    }
+    chain
 }
 
 // ── Block-hash LRU prefix cache ─────────────────────────────────────────────
@@ -397,30 +503,14 @@ impl BlockLru {
         (self.live.len() * block_size) as u64
     }
 
-    /// Longest cached block-aligned prefix of `seq`, in tokens. Touches
-    /// matched blocks so hot prefixes stay resident.
-    fn match_prefix(&mut self, seq: &[u32], block_size: usize) -> usize {
-        let mut matched = 0usize;
-        let mut chain = FNV_SEED;
-        for block in seq.chunks_exact(block_size) {
-            chain = chain_hash(chain, block);
-            if self.live.contains_key(&chain) {
-                self.touch(chain);
-                matched += block_size;
-            } else {
-                break;
-            }
-        }
-        matched
+    fn contains(&self, hash: u64) -> bool {
+        self.live.contains_key(&hash)
     }
 
-    /// Insert every full block of `seq` (chained hashes).
-    fn insert_chain(&mut self, seq: &[u32], block_size: usize) {
-        let mut chain = FNV_SEED;
-        for block in seq.chunks_exact(block_size) {
-            chain = chain_hash(chain, block);
-            self.touch(chain);
-        }
+    /// Drop a block outright (used when a block gets pinned); stale queue
+    /// entries are skipped lazily at eviction.
+    fn remove(&mut self, hash: u64) {
+        self.live.remove(&hash);
     }
 
     fn touch(&mut self, hash: u64) {
@@ -600,31 +690,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_kv_never_counted_in_both_running_and_cache() {
-        // 64-token cold prompt + 8 reserved output, block 4. Running usage
-        // is 72 at admission (all private); prefill completion MOVES the
-        // prompt claim to the evictable cache (running 8, cache 64) rather
-        // than duplicating it; completion leaves everything cached and
-        // nothing running. Reported usage covers running work only.
+    async fn active_prompt_kv_stays_counted_and_pinned_until_completion() {
+        // 64-token cold prompt + 8 reserved output, block 4. A decoding
+        // request depends on its whole prompt, so its 72-token claim holds
+        // from admission to COMPLETION; prefill completion makes the prompt
+        // matchable (pinned, non-evictable) without changing usage or
+        // double-counting; completion releases the claim and publishes the
+        // full sequence as evictable cache.
         let w = SimWorker::new(params(4), 9100);
         let mut a = w.admit((0..64).collect(), 8).await;
         assert_eq!(w.load().num_used_tokens, 72);
         assert_eq!(w.cache_tokens_for_test(), 0);
+        assert_eq!(w.pinned_tokens_for_test(), 0);
         a.finish_prefill();
         assert_eq!(
             w.load().num_used_tokens,
-            8,
-            "only the output reservation stays running"
+            72,
+            "the prompt keeps counting while decode depends on it"
         );
-        assert_eq!(w.cache_tokens_for_test(), 64, "prompt moved to the cache");
+        assert_eq!(w.pinned_tokens_for_test(), 64, "prompt pinned, matchable");
+        assert_eq!(w.cache_tokens_for_test(), 0, "nothing evictable yet");
         drop(a);
         assert_eq!(w.load().num_used_tokens, 0);
+        assert_eq!(w.pinned_tokens_for_test(), 0);
         assert_eq!(
             w.cache_tokens_for_test(),
             72,
-            "prompt \u{2295} output cached"
+            "prompt \u{2295} output evictable after completion"
         );
         assert_eq!(w.load().num_running_reqs, 0);
+    }
+
+    #[tokio::test]
+    async fn pinned_blocks_survive_eviction_pressure() {
+        // Capacity 128 tokens; an active request's 64-token prompt is
+        // pinned after prefill. Churn from completing requests must evict
+        // only the evictable cache — the active prompt stays matchable.
+        let w = SimWorker::new(
+            SimParams {
+                kv_capacity_tokens: 128,
+                ..params(4)
+            },
+            9100,
+        );
+        let ids: Vec<u32> = (0..64).collect();
+        let mut active = w.admit(ids.clone(), 8).await;
+        active.finish_prefill();
+        for start in (1000..3000u32).step_by(100) {
+            let mut churn = w.admit((start..start + 32).collect(), 4).await;
+            churn.finish_prefill();
+            drop(churn);
+        }
+        assert_eq!(w.pinned_tokens_for_test(), 64, "active prompt not evicted");
+        let hit = w.admit(ids, 4).await;
+        assert_eq!(hit.cached_tokens, 64, "pinned prompt stays matchable");
+    }
+
+    #[tokio::test]
+    async fn output_ids_are_deterministic_from_content() {
+        // Identical (sequence, max_new) must yield identical outputs on
+        // different workers and regardless of admission order; different
+        // content must diverge — A/B traffic reproducibility depends on it.
+        let w1 = SimWorker::new(params(4), 9100);
+        let w2 = SimWorker::new(params(4), 9200);
+        let ids: Vec<u32> = (0..64).collect();
+        let other = w1.admit((500..564).collect(), 8).await; // admission-order noise
+        let a = w1.admit(ids.clone(), 8).await;
+        let b = w2.admit(ids.clone(), 8).await;
+        assert_eq!(a.output_ids, b.output_ids, "content-determined outputs");
+        drop(other);
+        let c = w1.admit((2000..2064).collect(), 8).await;
+        assert_ne!(a.output_ids, c.output_ids, "different content diverges");
     }
 
     #[tokio::test]

@@ -59,6 +59,10 @@ pub struct Args {
     /// Per-request client timeout; a wedged stream records status 0 instead
     /// of hanging the end-of-run drain.
     pub request_timeout_secs: u64,
+    /// Give every turn a fresh routing key (models clients that do not
+    /// carry a stable session key): each turn re-pins under the sticky
+    /// override and, under hash ingress, may land on a different SMG.
+    pub key_per_turn: bool,
     /// Mean of the exponential think time between turn 1 and turn 2.
     pub think_secs: f64,
     /// Request SSE streaming responses (TTFT is only measurable when true).
@@ -124,6 +128,7 @@ impl Args {
             conns_per_origin: 4,
             max_turns: 2,
             request_timeout_secs: 300,
+            key_per_turn: false,
             ingress: Ingress::Hash,
             turn2_ingress: Turn2Ingress::Same,
             routing_key_reuse: 0.0,
@@ -172,6 +177,7 @@ impl Args {
                 "--request-timeout-secs" => {
                     cfg.request_timeout_secs = parse(value(&mut args, &flag)?, &flag)?;
                 }
+                "--key-per-turn" => cfg.key_per_turn = parse(value(&mut args, &flag)?, &flag)?,
                 "--ingress" => {
                     cfg.ingress = match value(&mut args, &flag)?.as_str() {
                         "hash" => Ingress::Hash,
@@ -328,6 +334,7 @@ fn usage() -> String {
        --max-turns <n>              turn cap per session; each turn continues with\n\
                                     probability --t2-ratio (default 2)\n\
        --request-timeout-secs <n>   per-request client timeout (default 300)\n\
+       --key-per-turn <bool>        fresh routing key every turn (default false)\n\
        --ingress <hash|random>      turn-1 SMG choice (default hash)\n\
        --turn2-ingress <same|hash|random>  turn-2 SMG choice (default same)\n\
        --routing-key-reuse <f>      fraction of sessions sharing one of 32 keys (default 0.0)\n\

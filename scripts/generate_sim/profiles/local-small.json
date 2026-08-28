@@ -1,6 +1,6 @@
 {
   "name": "local-small",
-  "description": "Laptop profile at production worker pressure: 8 SMGs x 120 workers, ~30-38 concurrent requests per worker (target ~460 req/s at 8.9 s mean lifetime under 10x time compression), 10x body compression (62 KB images). Live production topology is 10 SMGs; 8 is the requested experiment default (smg_count is a knob).",
+  "description": "Laptop profile at production-like worker pressure: 8 SMGs x 120 workers, ~30-38 concurrent requests per worker under 10x time compression and reduced body size. smg_count and every workload property are knobs; cache semantics only \u2014 not for resource conclusions.",
   "smg_count": 8,
   "workers_total": 120,
   "mock_processes": 1,

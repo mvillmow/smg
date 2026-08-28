@@ -56,6 +56,9 @@ METRIC_PREFIXES = (
     # cache-aware debug lines then cover only delegated (turn-1) decisions.
     "smg_manual_policy_branch_total",
     "smg_routing_key_source_total",
+    # Buffered vs streamed body routing, per path/reason — the direct
+    # verification of which request-body regime a leg actually ran in.
+    "smg_router_request_body_path_total",
 )
 
 BRANCH_RE = re.compile(r'branch="?([A-Za-z0-9_.-]+)"?')
@@ -517,13 +520,17 @@ def analyze_requests(path, workers_total):
     }
 
 
-def summarize_samples(path, smg_count):
+def summarize_samples(path, smg_count, window=None):
+    """Aggregate sampler records; with `window` = (start_s, end_s), only
+    samples inside the steady-state window count, so resource figures
+    exclude warmup and the drain tail exactly like the loadgen stats."""
     series = [
         {"rss_kib": [], "cpu_pct": [], "fds": [], "queue_depth": [], "conns": []}
         for _ in range(smg_count)
     ]
     last_counters = [{"rejected": 0.0, "selections": 0.0} for _ in range(smg_count)]
     sticky_branches = [{} for _ in range(smg_count)]
+    body_paths = [{} for _ in range(smg_count)]
     if not path.exists():
         return []
     with open(path, errors="replace") as f:
@@ -532,6 +539,10 @@ def summarize_samples(path, smg_count):
                 rec = json.loads(line)
             except ValueError:
                 continue
+            if window is not None:
+                elapsed = rec.get("elapsed_s")
+                if elapsed is None or not (window[0] <= elapsed <= window[1]):
+                    continue
             for entry in rec.get("smg", []):
                 idx = entry.get("idx")
                 if idx is None or idx >= smg_count:
@@ -558,6 +569,10 @@ def summarize_samples(path, smg_count):
                         m = BRANCH_RE.search(key)
                         if m:
                             sticky_branches[idx][m.group(1)] = val
+                    elif key.startswith("smg_router_request_body_path_total"):
+                        m = re.search(r'path="?(\w+)"?.*?reason="?(\w+)"?', key)
+                        if m:
+                            body_paths[idx]["%s:%s" % m.groups()] = val
                 if metrics:
                     s["queue_depth"].append(depth)
                     s["conns"].append(conns)
@@ -588,6 +603,9 @@ def summarize_samples(path, smg_count):
                 # Final counter values: sticky-session outcomes under
                 # --routing-key-override (occupied_hit = pinned follow-up).
                 "sticky_branches": sticky_branches[idx],
+                # Final "path:reason" counters — verifies buffered vs
+                # streamed routing directly.
+                "body_paths": body_paths[idx],
             }
         )
     return out
@@ -614,7 +632,11 @@ def build_report(run_dir):
         "run_dir": str(run_dir),
         "loadgen_summary": loadgen_summary,
         "requests": analyze_requests(run_dir / "requests.jsonl", workers_total),
-        "samples": summarize_samples(run_dir / "samples.jsonl", smg_count),
+        "samples": summarize_samples(
+        run_dir / "samples.jsonl",
+        smg_count,
+        window=(int(profile.get("warmup_secs", 0)), int(profile["duration_secs"])),
+    ),
         "cache_aware_branches": per_smg_branches,
     }
     with open(run_dir / "report.json", "w") as f:
@@ -634,6 +656,16 @@ def _fmt(val):
 def write_markdown(report, path):
     profile = report["profile"]
     lines = []
+    if int(profile.get("workers_total", 0)) < 4000:
+        lines.append(
+            "> **Reduced-scale run.** Cache/affinity semantics are "
+            "meaningful; CPU/RSS/fd/connection figures are NOT "
+            "production-representative (fleet size, body size, concurrency, "
+            "sticky-map cardinality, and stream chunking are all scaled "
+            "down). Use profiles/full.local.json on a large host for "
+            "resource conclusions."
+        )
+        lines.append("")
     lines.append("# generate-sim report — %s" % profile.get("name", "run"))
     lines.append("")
     loadgen = profile.get("loadgen", {})
@@ -756,6 +788,16 @@ def write_markdown(report, path):
 # ---- orchestration ----------------------------------------------------------
 
 
+def _repo_relative(path):
+    """Repo-relative rendering for provenance: committed artifacts must not
+    carry absolute local paths."""
+    path = Path(path)
+    try:
+        return str(path.resolve().relative_to(REPO_ROOT.resolve()))
+    except ValueError:
+        return path.name
+
+
 def _git(args):
     try:
         return (
@@ -818,7 +860,7 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
 
     children = []
     meta = {
-        "smg_bin": str(smg_bin),
+        "smg_bin": _repo_relative(smg_bin),
         "started_at": datetime.now().isoformat(),
         # Provenance: enough to reproduce or audit any table built from this
         # run — repo state, exact binaries, profile content, and seed.
@@ -878,6 +920,27 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
         log("loadgen: %ds run" % duration)
         loadgen = spawn("loadgen", cmd, logs_dir / "loadgen.log")
         children.append(loadgen)
+
+        # Optional mid-window gateway restart: sticky pins and hash
+        # placements are process state, so affinity must rebuild from
+        # scratch; requests during the blackout fail and count as errors.
+        restart_at = profile.get("restart_smgs_at_secs")
+        if restart_at:
+
+            def _restart_smgs():
+                time.sleep(float(restart_at))
+                log("restarting all SMGs (sticky pins and placements lost)")
+                for child in [c for c in children if c["name"].startswith("smg-")]:
+                    if child["proc"].poll() is None:
+                        child["proc"].kill()
+                new_smgs = launch_smgs(profile, logs_dir, smg_bin)
+                children.extend(new_smgs)
+                register_workers(profile)
+                # The sampler reads this list each tick; swap in the new pids.
+                smg_pids[:] = [c["proc"].pid for c in new_smgs]
+                meta["restarted_at_secs"] = restart_at
+
+            threading.Thread(target=_restart_smgs, daemon=True).start()
         try:
             meta["loadgen_exit"] = loadgen["proc"].wait(timeout=duration * 3 + 300)
         except subprocess.TimeoutExpired:
