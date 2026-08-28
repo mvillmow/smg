@@ -25,6 +25,7 @@ import os
 import platform
 import re
 import statistics
+import socket
 import subprocess
 import sys
 import threading
@@ -196,6 +197,47 @@ def wait_health(url, timeout, what):
     raise RuntimeError("%s never became healthy at %s" % (what, url))
 
 
+def wait_tcp(port, timeout, what):
+    """Liveness for listeners with no HTTP surface (gRPC workers)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=5):
+                return
+        except OSError:
+            time.sleep(1)
+    raise RuntimeError("%s never accepted TCP on port %d" % (what, port))
+
+
+def ensure_local_tokenizer():
+    """Generate (once) a WordLevel tokenizer.json covering every token id
+    the sim can produce (loadgen ids < 150k, sim outputs < 30k), so the
+    gateway's gRPC pipeline can resolve and decode without any network
+    fetch. Returned path goes into each gRPC worker's tokenizer_path label.
+    """
+    path = REPO_ROOT / "target" / "generate-sim" / "wordlevel-tokenizer.json"
+    if path.exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    vocab = {"t%d" % i: i for i in range(150_000)}
+    vocab["<unk>"] = 150_000
+    tok = {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [],
+        "normalizer": None,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": None,
+        "decoder": None,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"},
+    }
+    with open(path, "w") as f:
+        json.dump(tok, f)
+    log("generated local tokenizer: %s" % path.name)
+    return path
+
+
 # ---- run steps --------------------------------------------------------------
 
 
@@ -214,6 +256,9 @@ def build_binaries(target_dir, build_gateway):
 def launch_mocks(profile, logs_dir, mock_bin):
     total = int(profile["workers_total"])
     procs = int(profile["mock_processes"])
+    grpc = profile.get("worker_mode", "http") == "grpc"
+    port_flags = ("--grpc-base-port", "--grpc-count") if grpc else (
+        "--http-base-port", "--http-count")
     per_proc = (total + procs - 1) // procs
     children = []
     started = 0
@@ -224,22 +269,26 @@ def launch_mocks(profile, logs_dir, mock_bin):
             str(mock_bin),
             "--host",
             "127.0.0.1",
-            "--http-base-port",
+            port_flags[0],
             str(base),
-            "--http-count",
+            port_flags[1],
             str(count),
             "--model",
             profile.get("model_id", "mock-model"),
         ] + flags_from(profile.get("mock", {}))
         children.append(spawn("mock-%d" % j, cmd, logs_dir / ("mock-%d.log" % j)))
         started += count
-    log("mock fleet: %d workers over %d processes (ports %d-%d)"
-        % (total, procs, MOCK_BASE_PORT, MOCK_BASE_PORT + total - 1))
+    log("mock fleet: %d %s workers over %d processes (ports %d-%d)"
+        % (total, "grpc" if grpc else "http", procs,
+           MOCK_BASE_PORT, MOCK_BASE_PORT + total - 1))
     time.sleep(2)
     for child in children:
         if child["proc"].poll() is not None:
             raise RuntimeError("%s exited early; see its log" % child["name"])
-    wait_health("http://127.0.0.1:%d/health" % MOCK_BASE_PORT, 30, "mock fleet")
+    if grpc:
+        wait_tcp(MOCK_BASE_PORT, 30, "mock fleet")
+    else:
+        wait_health("http://127.0.0.1:%d/health" % MOCK_BASE_PORT, 30, "mock fleet")
     return children
 
 
@@ -277,16 +326,37 @@ def register_workers(profile):
     """
     total = int(profile["workers_total"])
     model_id = profile.get("model_id", "mock-model")
+    grpc = profile.get("worker_mode", "http") == "grpc"
     smg_ports = [SMG_BASE_PORT + i for i in range(int(profile["smg_count"]))]
+    tokenizer_path = str(ensure_local_tokenizer()) if grpc else None
 
     def register_one(smg_port, worker_port):
-        body = {
-            "url": "http://127.0.0.1:%d" % worker_port,
-            "connection_mode": "http",
-            "runtime": "sglang",
-            "models": [{"id": model_id}],
-            "health": {"disable_health_check": True},
-        }
+        if grpc:
+            # The URL scheme selects the connection mode; runtime picks the
+            # proto dialect the mock implements. weight_version is relayed
+            # verbatim in every response's meta_info — it is how the
+            # loadgen learns which worker served a request (the gRPC
+            # router exposes no other worker identity).
+            body = {
+                "url": "grpc://127.0.0.1:%d" % worker_port,
+                "connection_mode": "grpc",
+                "runtime": "tokenspeed",
+                "models": [{"id": model_id}],
+                "kv_block_size": int(profile.get("mock", {}).get("block_size", 128)),
+                "labels": {
+                    "tokenizer_path": tokenizer_path,
+                    "weight_version": str(worker_port),
+                },
+                "health": {"disable_health_check": True},
+            }
+        else:
+            body = {
+                "url": "http://127.0.0.1:%d" % worker_port,
+                "connection_mode": "http",
+                "runtime": "sglang",
+                "models": [{"id": model_id}],
+                "health": {"disable_health_check": True},
+            }
         try:
             http_post_json("http://127.0.0.1:%d/workers" % smg_port, body, timeout=20)
             return True

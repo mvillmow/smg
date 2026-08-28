@@ -133,6 +133,33 @@ class ScenarioConstruction(unittest.TestCase):
         )
         self.assertIn("--routing-key-override", flags, "input must not be mutated")
 
+    def test_kv_event_legs_run_grpc_nonstreaming_with_igw(self):
+        for label, overrides, _ in scenarios.SCENARIOS["kv-events"]:
+            self.assertEqual(overrides["worker_mode"], "grpc", label)
+            self.assertIs(
+                overrides["loadgen.stream"],
+                False,
+                "%s: gRPC streaming's final frame carries only the tail "
+                "token; multi-turn context needs the full output" % label,
+            )
+            self.assertIn(
+                "--enable-igw",
+                overrides["smg_flag_overrides"],
+                "%s: dynamically registered gRPC workers are unreachable "
+                "without IGW routing" % label,
+            )
+        # The event legs must drop the sticky short-circuit; the control
+        # must keep it (that is what makes it a control).
+        by_label = {l: o for l, o, _ in scenarios.SCENARIOS["kv-events"]}
+        self.assertIs(
+            by_label["event-affine"]["smg_flag_overrides"]["--routing-key-override"],
+            False,
+        )
+        self.assertNotIn(
+            "--routing-key-override",
+            by_label["sticky-control"]["smg_flag_overrides"],
+        )
+
     def test_radix_legs_share_flag_patch_and_disable_images(self):
         for label, overrides, _ in scenarios.SCENARIOS["radix-replica"]:
             self.assertEqual(

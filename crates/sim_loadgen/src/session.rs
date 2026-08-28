@@ -219,6 +219,7 @@ async fn send_turn(ctx: &Ctx, req: &TurnRequest<'_>) -> Option<Vec<u32>> {
         req.max_new,
         args.stream,
         args.payload,
+        &args.model,
     );
     drop(images);
 
@@ -265,7 +266,19 @@ async fn send_turn(ctx: &Ctx, req: &TurnRequest<'_>) -> Option<Vec<u32>> {
                 }
             } else {
                 match resp.bytes().await {
-                    Ok(bytes) => response = serde_json::from_slice(&bytes).ok(),
+                    // The gRPC router returns an array of responses for
+                    // non-streaming /generate; the HTTP mock returns one
+                    // object. Normalize to the first (only) element.
+                    Ok(bytes) => {
+                        response = serde_json::from_slice::<Value>(&bytes)
+                            .ok()
+                            .map(|v| match v {
+                                Value::Array(mut items) if !items.is_empty() => {
+                                    items.swap_remove(0)
+                                }
+                                other => other,
+                            })
+                    }
                     Err(_) => status = 0,
                 }
             }
@@ -283,7 +296,14 @@ async fn send_turn(ctx: &Ctx, req: &TurnRequest<'_>) -> Option<Vec<u32>> {
     let mut output_ids: Option<Vec<u32>> = None;
     if let Some(value) = &response {
         let meta = &value["meta_info"];
-        worker_port = meta["worker_port"].as_u64();
+        // The HTTP mock injects its port directly; the gRPC router carries
+        // no worker identity, so gRPC legs register each worker with a
+        // `weight_version` label of its port, relayed here verbatim.
+        worker_port = meta["worker_port"].as_u64().or_else(|| {
+            meta["weight_version"]
+                .as_str()
+                .and_then(|v| v.parse::<u64>().ok())
+        });
         cached_tokens = meta["cached_tokens"].as_u64();
         completion_tokens = meta["completion_tokens"].as_u64();
         output_ids = value["output_ids"].as_array().map(|ids| {
@@ -341,12 +361,17 @@ fn build_body(
     max_new: u32,
     stream: bool,
     payload: Payload,
+    model: &str,
 ) -> String {
     let image_len: usize = images.iter().map(|image| image.len() + 3).sum();
-    let mut body = String::with_capacity(image_len + input_ids.len() * 7 + 96);
+    let mut body = String::with_capacity(image_len + input_ids.len() * 7 + 128);
+    body.push('{');
+    if !model.is_empty() {
+        let _ = write!(body, "\"model\":\"{model}\",");
+    }
     match payload {
         Payload::Ids => {
-            body.push_str("{\"input_ids\":[");
+            body.push_str("\"input_ids\":[");
             for (i, id) in input_ids.iter().enumerate() {
                 if i > 0 {
                     body.push(',');
@@ -356,7 +381,7 @@ fn build_body(
             body.push(']');
         }
         Payload::Text => {
-            body.push_str("{\"text\":\"");
+            body.push_str("\"text\":\"");
             for (i, id) in input_ids.iter().enumerate() {
                 if i > 0 {
                     body.push(' ');
@@ -470,9 +495,23 @@ mod tests {
     }
 
     #[test]
+    fn model_field_prepends_only_when_set() {
+        let with: serde_json::Value =
+            serde_json::from_str(&build_body(&[1], &[], 2, false, Payload::Ids, "mock-model"))
+                .unwrap();
+        assert_eq!(with["model"], "mock-model");
+        let without: serde_json::Value =
+            serde_json::from_str(&build_body(&[1], &[], 2, false, Payload::Ids, "")).unwrap();
+        assert!(
+            without.get("model").is_none(),
+            "empty model must be omitted"
+        );
+    }
+
+    #[test]
     fn text_payload_is_valid_json_and_prefix_preserving() {
-        let turn1 = build_body(&[12, 3], &[], 8, false, Payload::Text);
-        let turn2 = build_body(&[12, 3, 45], &[], 8, false, Payload::Text);
+        let turn1 = build_body(&[12, 3], &[], 8, false, Payload::Text, "");
+        let turn2 = build_body(&[12, 3, 45], &[], 8, false, Payload::Text, "");
         let v1: serde_json::Value = serde_json::from_str(&turn1).unwrap();
         let v2: serde_json::Value = serde_json::from_str(&turn2).unwrap();
         assert_eq!(v1["text"], "12 3");
@@ -486,7 +525,7 @@ mod tests {
             .starts_with(v1["text"].as_str().unwrap()));
         // The ids path is untouched by the payload switch.
         let ids: serde_json::Value =
-            serde_json::from_str(&build_body(&[12, 3], &[], 8, false, Payload::Ids)).unwrap();
+            serde_json::from_str(&build_body(&[12, 3], &[], 8, false, Payload::Ids, "")).unwrap();
         assert_eq!(ids["input_ids"], serde_json::json!([12, 3]));
     }
 }

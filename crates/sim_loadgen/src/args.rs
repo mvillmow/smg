@@ -126,6 +126,9 @@ pub struct Args {
     pub tokens_hint: bool,
     /// Prompt wire format: `ids` (default) or `text`.
     pub payload: Payload,
+    /// `model` field for the request body; empty omits it. IGW-mode
+    /// gateways (gRPC worker legs) reject /generate without a model.
+    pub model: String,
     /// Global cap on in-flight requests (a permit per request, not session).
     pub max_inflight: usize,
     /// Requests finishing this early are excluded from summary stats.
@@ -167,6 +170,7 @@ impl Args {
             output_max: 8192,
             tokens_hint: false,
             payload: Payload::Ids,
+            model: String::new(),
             max_inflight: 200_000,
             warmup_secs: 0,
             seed: 42,
@@ -250,6 +254,7 @@ impl Args {
                         other => return Err(format!("--payload must be ids|text, got {other}")),
                     }
                 }
+                "--model" => cfg.model = value(&mut args, &flag)?,
                 "--max-inflight" => cfg.max_inflight = parse(value(&mut args, &flag)?, &flag)?,
                 "--warmup-secs" => cfg.warmup_secs = parse(value(&mut args, &flag)?, &flag)?,
                 "--seed" => cfg.seed = parse(value(&mut args, &flag)?, &flag)?,

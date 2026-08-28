@@ -44,6 +44,21 @@ RADIX_TREE_FLAGS = {
     "--assignment-mode": False,
 }
 
+# kv-events legs: gRPC-mode workers streaming KV cache events, tree index,
+# no sticky short-circuit. --enable-igw is required because workers are
+# registered dynamically: without it the gateway's single router is chosen
+# from --worker-urls schemes at startup (HTTP by default) and would never
+# route to gRPC workers. Loadgen runs non-streaming: the gRPC router's
+# final SSE frame carries only the tail output token, which would starve
+# the multi-turn context build.
+KV_EVENT_OVERRIDES = {
+    "worker_mode": "grpc",
+    "loadgen.image_count": 0,
+    "loadgen.stream": False,
+    "loadgen.model": "mock-model",
+    "smg_flag_overrides": {**RADIX_TREE_FLAGS, "--enable-igw": None},
+}
+
 
 def patch_smg_flags(flags, patches):
     """Return a copy of `flags` with each `--flag: value` replaced in place
@@ -235,6 +250,41 @@ SCENARIOS = {
                 "smg_flag_overrides": RADIX_TREE_FLAGS,
                 "loadgen.image_count": 0,
                 "loadgen.tokens_hint": True,
+            },
+            None,
+        ),
+    ],
+    # Event-driven cache-aware routing: gRPC workers broadcast their actual
+    # cache contents (SubscribeKvEvents -> PositionalIndexer), so every
+    # gateway replica independently converges on ground truth with no
+    # gateway-to-gateway sync. The paired approximate-tree legs in
+    # radix-replica collapse under sprayed ingress; if worker broadcast
+    # works, the sprayed leg here should NOT collapse — that is the whole
+    # comparison. buffered-control repeats the approximate token tree under
+    # the same gRPC fleet, isolating "events vs approximation" from any
+    # HTTP-vs-gRPC pipeline difference... except events cannot be disabled
+    # per leg without a mock flag, so the control instead sprays with the
+    # sticky override ON (events subscribed but placement sticky), pinning
+    # the event machinery's cost while removing its routing influence.
+    "kv-events": [
+        ("event-affine", dict(KV_EVENT_OVERRIDES), None),
+        (
+            "event-sprayed",
+            {
+                **KV_EVENT_OVERRIDES,
+                "loadgen.ingress": "random",
+                "loadgen.turn2_ingress": "random",
+            },
+            None,
+        ),
+        (
+            "sticky-control",
+            {
+                "worker_mode": "grpc",
+                "loadgen.image_count": 0,
+                "loadgen.stream": False,
+                "loadgen.model": "mock-model",
+                "smg_flag_overrides": {"--cache-index": "tree", "--enable-igw": None},
             },
             None,
         ),

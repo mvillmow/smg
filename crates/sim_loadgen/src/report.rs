@@ -290,6 +290,7 @@ fn config_json(args: &Args) -> Value {
         "output_max": args.output_max,
         "tokens_hint": args.tokens_hint,
         "payload": args.payload.as_str(),
+        "model": args.model,
         "max_inflight": args.max_inflight,
         "warmup_secs": args.warmup_secs,
         "seed": args.seed,

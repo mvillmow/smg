@@ -17,13 +17,13 @@
 //! that look identical to routing can still miss each other's KV.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use serde_json::{json, Value};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
 
 /// Tunables for the sim engine, resolved from CLI flags.
 #[derive(Debug, Clone)]
@@ -75,6 +75,80 @@ pub struct SimWorker {
     port: u16,
 }
 
+// ── KV cache events (gateway event-driven routing) ──────────────────────────
+
+/// One block's wire view: the sim's chained hash (stable, unique per
+/// prefix) plus the block's own token ids — the gateway recomputes its
+/// content hash from the ids, so they are load-bearing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimKvBlock {
+    pub hash: u64,
+    pub token_ids: Vec<u32>,
+}
+
+/// A cache transition, proto-agnostic (grpc.rs maps to the wire types).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SimKvEvent {
+    /// Blocks became matchable, in sequence order, positioned after
+    /// `parent` (`None` = sequence start).
+    Stored {
+        parent: Option<u64>,
+        blocks: Vec<SimKvBlock>,
+    },
+    /// Blocks were evicted.
+    Removed { hashes: Vec<u64> },
+}
+
+/// One numbered batch; the gateway requires consecutive sequence numbers.
+#[derive(Debug, Clone)]
+pub struct SimKvBatch {
+    pub seq: u64,
+    pub events: Vec<SimKvEvent>,
+}
+
+/// Replay batches kept for late/reconnecting subscribers. A subscriber
+/// whose cursor predates the ring sees a sequence gap and reconnects,
+/// which the gateway treats as a normal recovery path.
+const KV_EVENT_RING: usize = 65_536;
+
+/// A subscription: the ring batches to replay first, then the live feed.
+pub type KvEventSubscription = (Vec<Arc<SimKvBatch>>, broadcast::Receiver<Arc<SimKvBatch>>);
+
+/// Broadcast + replay ring. Lives inside the state mutex so batch order
+/// matches the accounting transitions that produced it.
+struct KvEventHub {
+    seq: u64,
+    ring: VecDeque<Arc<SimKvBatch>>,
+    tx: broadcast::Sender<Arc<SimKvBatch>>,
+}
+
+impl KvEventHub {
+    fn new() -> Self {
+        Self {
+            seq: 0,
+            ring: VecDeque::new(),
+            tx: broadcast::channel(8192).0,
+        }
+    }
+
+    fn emit(&mut self, events: Vec<SimKvEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        self.seq += 1;
+        let batch = Arc::new(SimKvBatch {
+            seq: self.seq,
+            events,
+        });
+        if self.ring.len() == KV_EVENT_RING {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(Arc::clone(&batch));
+        // No receivers is fine — the ring still records for later replay.
+        let _ = self.tx.send(batch);
+    }
+}
+
 /// Point-in-time load view for `/v1/loads`.
 pub struct SimLoad {
     pub num_running_reqs: i64,
@@ -99,6 +173,40 @@ struct SimState {
     kv: KvIndex,
     /// EWMA of per-request cached/prompt.
     hit_rate_ewma: f64,
+    /// KV-event broadcast for gRPC subscribers; `None` when the worker is
+    /// served over HTTP (no subscription protocol, no emission cost).
+    events: Option<KvEventHub>,
+}
+
+impl SimState {
+    /// Emit `Stored` for the chain range `[from, to)` of `seq`'s blocks,
+    /// chained after the preceding block (the gateway derives positions
+    /// from that parent link).
+    fn emit_stored(&mut self, chain: &[u64], seq: &[u32], from: usize, to: usize, block: usize) {
+        let Some(hub) = self.events.as_mut() else {
+            return;
+        };
+        if from >= to {
+            return;
+        }
+        let blocks = (from..to)
+            .map(|i| SimKvBlock {
+                hash: chain[i],
+                token_ids: seq[i * block..(i + 1) * block].to_vec(),
+            })
+            .collect();
+        let parent = (from > 0).then(|| chain[from - 1]);
+        hub.emit(vec![SimKvEvent::Stored { parent, blocks }]);
+    }
+
+    fn emit_removed(&mut self, hashes: Vec<u64>) {
+        if hashes.is_empty() {
+            return;
+        }
+        if let Some(hub) = self.events.as_mut() {
+            hub.emit(vec![SimKvEvent::Removed { hashes }]);
+        }
+    }
 }
 
 /// Everything a response needs, computed at admission under one lock hold.
@@ -129,6 +237,16 @@ impl Admitted {
 
 impl SimWorker {
     pub fn new(params: SimParams, port: u16) -> Arc<Self> {
+        Self::build(params, port, false)
+    }
+
+    /// Worker with KV-event emission on (gRPC-served workers, where the
+    /// gateway can subscribe via `SubscribeKvEvents`).
+    pub fn new_with_events(params: SimParams, port: u16) -> Arc<Self> {
+        Self::build(params, port, true)
+    }
+
+    fn build(params: SimParams, port: u16, events: bool) -> Arc<Self> {
         let admission = Arc::new(Semaphore::new(params.max_running.max(1)));
         Arc::new(Self {
             admission,
@@ -139,10 +257,33 @@ impl SimWorker {
                 running_tokens: 0,
                 kv: KvIndex::new(),
                 hit_rate_ewma: 0.0,
+                events: events.then(KvEventHub::new),
             }),
             params,
             port,
         })
+    }
+
+    /// Subscribe to KV-event batches: every ring batch with `seq >
+    /// start_seq` in order, then the live stream. Snapshot and receiver are
+    /// taken under the state lock, so the boundary has no gap — emission
+    /// also happens under that lock. Returns `None` when events are off.
+    pub fn subscribe_kv_events(&self, start_seq: u64) -> Option<KvEventSubscription> {
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let hub = st.events.as_ref()?;
+        let replay = hub
+            .ring
+            .iter()
+            .filter(|b| b.seq > start_seq)
+            .cloned()
+            .collect();
+        Some((replay, hub.tx.subscribe()))
+    }
+
+    /// The engine-side cache page size (each event block carries this many
+    /// token ids).
+    pub fn block_size(&self) -> usize {
+        self.params.block_size
     }
 
     pub fn load(&self) -> SimLoad {
@@ -280,7 +421,8 @@ impl SimWorker {
                 .params
                 .kv_capacity_tokens
                 .saturating_sub(st.running_tokens);
-            st.kv.evict_to(budget, block);
+            let evicted = st.kv.evict_to(budget, block);
+            st.emit_removed(evicted);
         }
 
         let uncached = (prompt_tokens - cached_tokens) as f64;
@@ -354,11 +496,19 @@ impl CompletionGuard {
             return;
         }
         self.prefill_done = true;
+        let block = self.worker.params.block_size;
         let mut st = self.worker.state.lock().unwrap_or_else(|p| p.into_inner());
         // The freshly computed prompt blocks become matchable, pinned (not
         // evictable) because this request still decodes against them. The
         // KV claim is unchanged — the tokens were counted from admission.
         st.kv.pin(&self.chain[self.pinned_blocks..]);
+        st.emit_stored(
+            &self.chain,
+            &self.effective,
+            self.pinned_blocks,
+            self.chain.len(),
+            block,
+        );
         self.pinned_blocks = self.chain.len();
     }
 }
@@ -372,14 +522,24 @@ impl Drop for CompletionGuard {
         st.kv.unpin(&self.chain[..self.pinned_blocks]);
         if self.prefill_done {
             // Publish the finished sequence (prompt ⊕ output) as evictable
-            // cache; an abort before prefill publishes nothing new.
+            // cache; an abort before prefill publishes nothing new. The
+            // output-extension blocks are new — announce them chained after
+            // the prompt's last block.
             let mut full = std::mem::take(&mut self.effective);
             full.extend_from_slice(&self.output_ids);
             let full_chain = chain_hashes(&full, params.block_size);
             st.kv.insert_evictable(&full_chain);
+            st.emit_stored(
+                &full_chain,
+                &full,
+                self.chain.len(),
+                full_chain.len(),
+                params.block_size,
+            );
         }
         let budget = params.kv_capacity_tokens.saturating_sub(st.running_tokens);
-        st.kv.evict_to(budget, params.block_size);
+        let evicted = st.kv.evict_to(budget, params.block_size);
+        st.emit_removed(evicted);
         drop(st);
         self.permit.take();
     }
@@ -451,9 +611,9 @@ impl KvIndex {
     }
 
     /// Evict LRU blocks until evictable tokens fit `budget_tokens`; pinned
-    /// blocks are untouchable by construction.
-    fn evict_to(&mut self, budget_tokens: u64, block_size: usize) {
-        self.lru.evict_to(budget_tokens, block_size);
+    /// blocks are untouchable by construction. Returns the evicted hashes.
+    fn evict_to(&mut self, budget_tokens: u64, block_size: usize) -> Vec<u64> {
+        self.lru.evict_to(budget_tokens, block_size)
     }
 
     #[cfg(test)]
@@ -520,18 +680,21 @@ impl BlockLru {
     }
 
     /// Evict least-recently-touched blocks until cached tokens fit
-    /// `budget_tokens`.
-    fn evict_to(&mut self, budget_tokens: u64, block_size: usize) {
+    /// `budget_tokens`. Returns the evicted hashes.
+    fn evict_to(&mut self, budget_tokens: u64, block_size: usize) -> Vec<u64> {
+        let mut evicted = Vec::new();
         while self.tokens(block_size) > budget_tokens {
             match self.order.pop_front() {
                 Some((hash, tick)) => {
                     if self.live.get(&hash) == Some(&tick) {
                         self.live.remove(&hash);
+                        evicted.push(hash);
                     }
                 }
                 None => break,
             }
         }
+        evicted
     }
 }
 
@@ -864,5 +1027,106 @@ mod tests {
 
         let top_level = json!({"max_new_tokens": 3});
         assert_eq!(extract_max_new_tokens(&top_level), Some(3));
+    }
+
+    /// Drain every ring batch after `start_seq` (test helper).
+    fn replay(w: &SimWorker, start_seq: u64) -> Vec<Arc<SimKvBatch>> {
+        w.subscribe_kv_events(start_seq).expect("events enabled").0
+    }
+
+    #[tokio::test]
+    async fn kv_events_chain_prompt_then_output_blocks() {
+        // 8 tokens, block 4 -> 2 prompt blocks; 4 outputs -> 1 more block.
+        let w = SimWorker::new_with_events(params(4), 9100);
+        let ids: Vec<u32> = (0..8).collect();
+        let mut a = w.admit(ids.clone(), 4).await;
+        assert!(replay(&w, 0).is_empty(), "nothing stored before prefill");
+
+        a.finish_prefill();
+        let batches = replay(&w, 0);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].seq, 1, "sequence numbers start at 1");
+        let SimKvEvent::Stored { parent, blocks } = &batches[0].events[0] else {
+            panic!("prefill completion must emit Stored");
+        };
+        assert_eq!(*parent, None, "prompt starts the sequence");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].token_ids, vec![0, 1, 2, 3]);
+        assert_eq!(blocks[1].token_ids, vec![4, 5, 6, 7]);
+        let prompt_chain = chain_hashes(&ids, 4);
+        assert_eq!(blocks[1].hash, prompt_chain[1]);
+
+        let outputs = a.output_ids.clone();
+        drop(a);
+        let batches = replay(&w, 1);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].seq, 2, "consecutive batch numbering");
+        let SimKvEvent::Stored { parent, blocks } = &batches[0].events[0] else {
+            panic!("completion must emit the output-extension Stored");
+        };
+        assert_eq!(
+            *parent,
+            Some(prompt_chain[1]),
+            "output blocks chain after the prompt's last block"
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].token_ids, outputs,
+            "output block carries the output ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn kv_events_report_evictions() {
+        // Capacity 16 tokens, block 4: the second finished sequence must
+        // evict the first's blocks, and the eviction must be announced with
+        // the same hashes the Stored events used.
+        let mut p = params(4);
+        p.kv_capacity_tokens = 16;
+        let w = SimWorker::new_with_events(p, 9100);
+
+        let first: Vec<u32> = (0..12).collect();
+        let mut a = w.admit(first.clone(), 4).await;
+        a.finish_prefill();
+        drop(a);
+
+        let second: Vec<u32> = (100..116).collect();
+        let mut b = w.admit(second, 4).await;
+        b.finish_prefill();
+        drop(b);
+
+        let mut stored: Vec<u64> = Vec::new();
+        let mut removed: Vec<u64> = Vec::new();
+        for batch in replay(&w, 0) {
+            for event in &batch.events {
+                match event {
+                    SimKvEvent::Stored { blocks, .. } => {
+                        stored.extend(blocks.iter().map(|b| b.hash));
+                    }
+                    SimKvEvent::Removed { hashes } => removed.extend(hashes),
+                }
+            }
+        }
+        assert!(!removed.is_empty(), "capacity pressure must evict");
+        assert!(
+            removed.iter().all(|h| stored.contains(h)),
+            "evictions must reference previously stored hashes"
+        );
+    }
+
+    #[tokio::test]
+    async fn kv_events_replay_cursor_and_http_default() {
+        let w = SimWorker::new_with_events(params(4), 9100);
+        let mut a = w.admit((0..8).collect(), 4).await;
+        a.finish_prefill();
+        drop(a); // seq 1 (prefill Stored) + seq 2 (output Stored)
+        assert_eq!(replay(&w, 0).len(), 2);
+        let after = replay(&w, 1);
+        assert_eq!(after.len(), 1, "cursor filters already-seen batches");
+        assert_eq!(after[0].seq, 2);
+
+        // HTTP-served workers keep events off entirely.
+        let http = SimWorker::new(params(4), 9101);
+        assert!(http.subscribe_kv_events(0).is_none());
     }
 }
