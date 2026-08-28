@@ -86,6 +86,8 @@ fn start_mock_zmq_engines(handshake: &str, count: u16) {
         output_tokens: OUTPUT_TOKENS,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
+        sim: false,
+        sim_params: mock_worker::sim::SimParams::default(),
     });
     for rank in 0..u32::from(count) {
         tokio::spawn(mock_worker::zmq::serve(
