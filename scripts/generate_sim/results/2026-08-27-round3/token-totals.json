@@ -1,0 +1,98 @@
+{
+ "hit-rate-calibration/baseline-1p5turn": {
+  "cached_token_ratio": 0.473189816364959,
+  "cached_tokens_sum": 321805568,
+  "ok": 62561,
+  "prompt_tokens_sum": 680077121
+ },
+ "hit-rate-calibration/multiturn": {
+  "cached_token_ratio": 0.8002390360596839,
+  "cached_tokens_sum": 551531264,
+  "ok": 51862,
+  "prompt_tokens_sum": 689208148
+ },
+ "hit-rate-calibration/multiturn-prefix4k": {
+  "cached_token_ratio": 0.8428852077010351,
+  "cached_tokens_sum": 593953024,
+  "ok": 51840,
+  "prompt_tokens_sum": 704666565
+ },
+ "key-stability/key-per-turn": {
+  "cached_token_ratio": 0.1902758289838817,
+  "cached_tokens_sum": 129349120,
+  "ok": 62544,
+  "prompt_tokens_sum": 679797958
+ },
+ "key-stability/shared-keys": {
+  "cached_token_ratio": 0.19009118598681118,
+  "cached_tokens_sum": 128992000,
+  "ok": 62403,
+  "prompt_tokens_sum": 678579595
+ },
+ "key-stability/stable-key": {
+  "cached_token_ratio": 0.47322879021405617,
+  "cached_tokens_sum": 321839360,
+  "ok": 62562,
+  "prompt_tokens_sum": 680092519
+ },
+ "radix-replica/text-affine": {
+  "cached_token_ratio": 0.40989183719922223,
+  "cached_tokens_sum": 278134272,
+  "ok": 62556,
+  "prompt_tokens_sum": 678555284
+ },
+ "radix-replica/text-random": {
+  "cached_token_ratio": 0.2184199430634465,
+  "cached_tokens_sum": 148016128,
+  "ok": 62515,
+  "prompt_tokens_sum": 677667643
+ },
+ "radix-replica/token-affine": {
+  "cached_token_ratio": 0.44378854202650875,
+  "cached_tokens_sum": 301162240,
+  "ok": 62559,
+  "prompt_tokens_sum": 678616529
+ },
+ "radix-replica/token-hint-streamed": {
+  "cached_token_ratio": 0.19085958004442616,
+  "cached_tokens_sum": 129469440,
+  "ok": 62543,
+  "prompt_tokens_sum": 678349182
+ },
+ "radix-replica/token-random": {
+  "cached_token_ratio": 0.2226490634788633,
+  "cached_tokens_sum": 150872064,
+  "ok": 62512,
+  "prompt_tokens_sum": 677622720
+ },
+ "radix-replica/token-single": {
+  "cached_token_ratio": 0.3134988196701386,
+  "cached_tokens_sum": 163370240,
+  "ok": 48590,
+  "prompt_tokens_sum": 521119155
+ },
+ "revision-ab/deployed-rev": {
+  "cached_token_ratio": 0.4732278355824883,
+  "cached_tokens_sum": 321831424,
+  "ok": 62561,
+  "prompt_tokens_sum": 680077121
+ },
+ "revision-ab/latest-main": {
+  "cached_token_ratio": 0.47320313829318233,
+  "cached_tokens_sum": 321806336,
+  "ok": 62560,
+  "prompt_tokens_sum": 680059598
+ },
+ "revision-ab/latest-main-min-group": {
+  "cached_token_ratio": 0.4732439949902231,
+  "cached_tokens_sum": 321841408,
+  "ok": 62561,
+  "prompt_tokens_sum": 680074996
+ },
+ "router-restart/restart-mid-run": {
+  "cached_token_ratio": 0.7341824379024854,
+  "cached_tokens_sum": 360352256,
+  "ok": 39187,
+  "prompt_tokens_sum": 490821133
+ }
+}
