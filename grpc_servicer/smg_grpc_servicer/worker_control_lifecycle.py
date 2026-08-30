@@ -1,0 +1,101 @@
+"""Shared lifecycle hook for the Rust WorkerControl server.
+
+The extension import is deliberately lazy: engine servicers that do not set
+``SMG_WORKER_CONTROL_BIND_ADDRESS`` keep their existing dependency surface.
+Explicitly enabling the control plane is fail-closed.
+"""
+
+from __future__ import annotations
+
+import importlib.metadata
+import os
+import socket
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+
+def _optional_env(environ: Mapping[str, str], name: str) -> str | None:
+    value = environ.get(name)
+    return value.strip() if value and value.strip() else None
+
+
+@dataclass
+class WorkerControlLifecycle:
+    """Small engine-independent wrapper around the PyO3 server."""
+
+    server: Any
+
+    @classmethod
+    def start_from_env(
+        cls,
+        *,
+        engine_type: str,
+        model_ids: Sequence[str],
+        features: Sequence[str],
+        max_concurrent_requests: int = 0,
+        engine_distribution: str | None = None,
+        environ: Mapping[str, str] | None = None,
+    ) -> WorkerControlLifecycle | None:
+        environ = os.environ if environ is None else environ
+        bind_address = _optional_env(environ, "SMG_WORKER_CONTROL_BIND_ADDRESS")
+        if bind_address is None:
+            return None
+
+        engine_endpoint = _optional_env(environ, "SMG_WORKER_ENGINE_ENDPOINT")
+        if engine_endpoint is None:
+            raise ValueError(
+                "SMG_WORKER_ENGINE_ENDPOINT is required when the Worker control plane is enabled"
+            )
+        worker_id = _optional_env(environ, "SMG_WORKER_ID") or socket.gethostname()
+        instance_id = _optional_env(environ, "SMG_WORKER_INSTANCE_ID")
+        zone = _optional_env(environ, "SMG_WORKER_ZONE") or ""
+
+        try:
+            from smg.worker import WorkerControlServer
+        except ImportError as error:
+            raise RuntimeError(
+                "the SMG Python extension is required when the Worker control plane is enabled"
+            ) from error
+
+        engine_version = ""
+        if engine_distribution:
+            try:
+                engine_version = importlib.metadata.version(engine_distribution)
+            except importlib.metadata.PackageNotFoundError:
+                pass
+
+        server = WorkerControlServer(
+            bind_address=bind_address,
+            worker_id=worker_id,
+            instance_id=instance_id,
+            hostname=socket.gethostname(),
+            zone=zone,
+            engine_type=engine_type,
+            engine_version=engine_version,
+            engine_endpoint=engine_endpoint,
+            model_ids=list(model_ids),
+            features=list(features),
+            max_concurrent_requests=max(0, max_concurrent_requests),
+        )
+        return cls(server=server)
+
+    @property
+    def running(self) -> bool:
+        return bool(self.server.running)
+
+    @property
+    def last_error(self) -> str | None:
+        return self.server.last_error
+
+    def mark_serving(self) -> None:
+        self.server.set_health("serving", "ready")
+
+    def mark_draining(self) -> None:
+        self.server.set_health("draining", "draining")
+
+    def mark_not_serving(self, message: str = "stopped") -> None:
+        self.server.set_health("not_serving", message)
+
+    def stop(self, timeout_secs: float = 5.0) -> None:
+        self.server.stop(timeout_secs)
