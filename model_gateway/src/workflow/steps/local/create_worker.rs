@@ -234,6 +234,8 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 let mut builder = BasicWorkerBuilder::new(url.clone())
                     .model(model_card.clone())
                     .worker_type(config.worker_type)
+                    .worker_mode(config.worker_mode)
+                    .control_url(config.control_url.clone())
                     .connection_mode(*connection_mode)
                     .runtime_type(runtime_type)
                     .circuit_breaker_config(circuit_breaker.clone())

@@ -7,6 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/vllm_engine.proto");
     println!("cargo:rerun-if-changed=proto/trtllm_service.proto");
     println!("cargo:rerun-if-changed=proto/mlx_engine.proto");
+    println!("cargo:rerun-if-changed=proto/worker_control.proto");
 
     // Pass 1: compile shared message types (no gRPC service generation)
     tonic_prost_build::configure()
@@ -59,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/trtllm_service.proto",
                 "proto/mlx_engine.proto",
                 "proto/tokenspeed_scheduler.proto",
+                "proto/worker_control.proto",
             ],
             &["proto"],
         )?;

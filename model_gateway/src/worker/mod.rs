@@ -41,7 +41,7 @@ pub use openai_protocol::UNKNOWN_MODEL_ID;
 pub use openai_protocol::{
     model_card::ModelCard,
     model_type::{Endpoint, ModelType},
-    worker::{ProviderType, WorkerGroupKey},
+    worker::{ProviderType, WorkerGroupKey, WorkerMode},
 };
 pub use overload::OverloadThresholds;
 pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool};

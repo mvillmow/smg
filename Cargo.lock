@@ -4285,10 +4285,12 @@ dependencies = [
  "axum",
  "engine-zmq-client",
  "futures",
+ "prost-types",
  "serde_json",
  "smg-grpc-client",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -7662,15 +7664,19 @@ name = "smg-python"
 version = "1.10.1"
 dependencies = [
  "once_cell",
+ "prost-types",
  "pyo3",
  "rand 0.10.2",
  "reasoning-parser",
  "serde_yaml",
  "smg",
  "smg-auth",
+ "smg-grpc-client",
  "smg-mesh",
  "tikv-jemallocator",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "tool-parser",
 ]
 

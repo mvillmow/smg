@@ -18,6 +18,7 @@ use ts::{
 
 use crate::{
     config::Config,
+    control::MockWorkerControl,
     engine::{self, Engine, NewRequest},
 };
 
@@ -33,9 +34,11 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
     let addr = SocketAddr::new(ip, port);
     // One simulated engine per listener (i.e. per virtual worker).
     let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
+    let control = MockWorkerControl::new(&cfg, &host, port);
     let service = MockScheduler { cfg, engine };
     if let Err(e) = Server::builder()
         .add_service(TokenSpeedSchedulerServer::new(service))
+        .add_service(control.into_server())
         .serve(addr)
         .await
     {

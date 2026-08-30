@@ -11,7 +11,10 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
-    worker::{sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL},
+    worker::{
+        sampling_defaults::SamplingDefaults, ConnectionMode, WorkerMode,
+        DEFAULT_SAMPLING_PARAMS_LABEL,
+    },
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::util::{grpc_base_url, http_base_url},
@@ -341,43 +344,52 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             config.url, connection_mode
         );
 
-        let (discovered_labels, detected_runtime) = match connection_mode {
-            ConnectionMode::Http => {
-                let runtime = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "No detected_runtime_type for {}, defaulting to sglang",
-                            config.url
-                        );
-                        "sglang"
-                    });
-                let labels = match runtime {
-                    "vllm" => {
-                        fetch_vllm_http_metadata(&config.url, config.api_key.as_deref()).await
-                    }
-                    _ => fetch_sglang_http_metadata(&config.url, config.api_key.as_deref()).await,
-                };
-                Ok((labels, None))
+        let (discovered_labels, detected_runtime) = if config.worker_mode == WorkerMode::Smg {
+            // The internal SMG endpoint is not an engine scheduler service.
+            // Preserve explicit registration metadata and avoid engine RPCs;
+            // the internal handshake can advertise richer metadata later.
+            Ok((HashMap::new(), None))
+        } else {
+            match connection_mode {
+                ConnectionMode::Http => {
+                    let runtime = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or_else(|| {
+                            warn!(
+                                "No detected_runtime_type for {}, defaulting to sglang",
+                                config.url
+                            );
+                            "sglang"
+                        });
+                    let labels = match runtime {
+                        "vllm" => {
+                            fetch_vllm_http_metadata(&config.url, config.api_key.as_deref()).await
+                        }
+                        _ => {
+                            fetch_sglang_http_metadata(&config.url, config.api_key.as_deref()).await
+                        }
+                    };
+                    Ok((labels, None))
+                }
+                ConnectionMode::Grpc => {
+                    let config_runtime = config.runtime_type.to_string();
+                    let runtime_type = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or(&config_runtime);
+                    fetch_grpc_metadata(&config.url, runtime_type)
+                        .await
+                        .map(|(labels, rt)| (labels, Some(rt)))
+                }
+                // An EngineCore worker does not report model/tokenizer metadata over
+                // ZMQ; it is configured at worker registration. Return `None` for the
+                // runtime so the explicitly configured / detected runtime is preserved
+                // (the handshake is shared across engines, so it cannot be probed here).
+                ConnectionMode::Zmq => Ok((HashMap::new(), None)),
             }
-            ConnectionMode::Grpc => {
-                let config_runtime = config.runtime_type.to_string();
-                let runtime_type = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or(&config_runtime);
-                fetch_grpc_metadata(&config.url, runtime_type)
-                    .await
-                    .map(|(labels, rt)| (labels, Some(rt)))
-            }
-            // An EngineCore worker does not report model/tokenizer metadata over
-            // ZMQ; it is configured at worker registration. Return `None` for the
-            // runtime so the explicitly configured / detected runtime is preserved
-            // (the handshake is shared across engines, so it cannot be probed here).
-            ConnectionMode::Zmq => Ok((HashMap::new(), None)),
         }
         .unwrap_or_else(|e| {
             warn!("Failed to fetch metadata for {}: {}", config.url, e);

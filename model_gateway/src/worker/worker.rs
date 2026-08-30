@@ -16,14 +16,23 @@ pub use openai_protocol::worker::{ConnectionMode, ProfileOptions, RuntimeType, W
 use openai_protocol::{
     model_card::ModelCard,
     model_type::{Endpoint, ModelType},
-    worker::{HealthCheckConfig, ProviderType, WorkerInfo, WorkerModels, WorkerSpec, WorkerStatus},
+    worker::{
+        HealthCheckConfig, ProviderType, WorkerInfo, WorkerMode, WorkerModels, WorkerSpec,
+        WorkerStatus,
+    },
 };
-use smg_grpc_client::common_proto;
+use smg_grpc_client::{
+    common_proto, connect_channel_with_timeout,
+    worker_proto::{
+        worker_control_client::WorkerControlClient, GetHealthRequest, WorkerHealthState,
+    },
+};
 use tokio::{
     sync::{mpsc, OnceCell},
     task::AbortHandle,
     time,
 };
+use tonic::transport::Channel;
 
 use super::{
     event::WorkerConnected, overload::OverloadThresholds, CircuitBreaker, ResolvedResilience,
@@ -325,6 +334,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get the worker's connection mode (HTTP or gRPC)
     /// Returns a reference to avoid cloning on every access
     fn connection_mode(&self) -> &ConnectionMode;
+
+    /// Identify whether this endpoint is an engine or an SMG worker service.
+    fn worker_mode(&self) -> WorkerMode;
 
     /// Get the worker's lifecycle status.
     fn status(&self) -> WorkerStatus;
@@ -680,6 +692,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// until it lands, so an orphaned driver would keep them for up to the
     /// connect timeout and collide with a same-URL re-registration.
     fn abort_background_tasks(&self) {}
+    async fn smg_worker_health_check(&self) -> WorkerResult<bool>;
     async fn grpc_health_check(&self) -> WorkerResult<bool>;
     /// Liveness check for a ZMQ worker. Unlike gRPC there is no health RPC on
     /// the raw wire: liveness is local (handshake completed and the engine has
@@ -1190,6 +1203,10 @@ pub struct BasicWorker {
     /// probe evict a dead client by swapping in a fresh cell (gRPC never
     /// swaps — a failed gRPC worker is removed and re-added instead).
     pub backend_client: Arc<ArcSwap<OnceCell<Arc<BackendClient>>>>,
+    /// Cached channel for the two-tier Worker's control-only listener. It is
+    /// deliberately separate from `backend_client`, which always targets the
+    /// inference endpoint.
+    pub worker_control_client: Arc<OnceCell<WorkerControlClient<Channel>>>,
     /// Guards the one-shot background ZMQ handshake driver so the health probe
     /// never cancels a long (model-load) handshake. Self-clears on failure to
     /// allow a retry. Unused for HTTP/gRPC.
@@ -1221,6 +1238,7 @@ impl Clone for BasicWorker {
             runtime: ArcSwap::from(self.runtime.load_full()),
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             backend_client: Arc::clone(&self.backend_client),
+            worker_control_client: Arc::clone(&self.worker_control_client),
             zmq_connect_started: Arc::clone(&self.zmq_connect_started),
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
@@ -1349,6 +1367,7 @@ impl BasicWorker {
         // A transport or runtime change means a different wire protocol, and a
         // replacement that arrived with its own client keeps it.
         if self.metadata.spec.connection_mode != other.metadata.spec.connection_mode
+            || self.metadata.spec.worker_mode != other.metadata.spec.worker_mode
             || self.metadata.spec.runtime_type != other.metadata.spec.runtime_type
             || self.backend_client.load().get().is_some()
         {
@@ -1380,6 +1399,10 @@ impl Worker for BasicWorker {
         &self.metadata.spec.connection_mode
     }
 
+    fn worker_mode(&self) -> WorkerMode {
+        self.metadata.spec.worker_mode
+    }
+
     fn status(&self) -> WorkerStatus {
         self.runtime.load().status()
     }
@@ -1406,10 +1429,14 @@ impl Worker for BasicWorker {
             return Ok(());
         }
 
-        let probe_ok = match &self.metadata.spec.connection_mode {
-            ConnectionMode::Http => self.http_health_check().await?,
-            ConnectionMode::Grpc => self.grpc_health_check().await?,
-            ConnectionMode::Zmq => self.zmq_health_check().await?,
+        let probe_ok = if self.metadata.spec.worker_mode == WorkerMode::Smg {
+            self.smg_worker_health_check().await?
+        } else {
+            match &self.metadata.spec.connection_mode {
+                ConnectionMode::Http => self.http_health_check().await?,
+                ConnectionMode::Grpc => self.grpc_health_check().await?,
+                ConnectionMode::Zmq => self.zmq_health_check().await?,
+            }
         };
 
         if probe_ok {
@@ -1696,6 +1723,58 @@ impl Worker for BasicWorker {
         }
     }
 
+    async fn smg_worker_health_check(&self) -> WorkerResult<bool> {
+        let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+        let control_url = self
+            .metadata
+            .spec
+            .control_url
+            .as_deref()
+            .unwrap_or(&self.metadata.spec.url);
+        let client = self
+            .worker_control_client
+            .get_or_try_init(|| async {
+                let channel = connect_channel_with_timeout(control_url, timeout)
+                    .await
+                    .map_err(|error| WorkerError::ConnectionFailed {
+                        url: control_url.to_string(),
+                        reason: format!("Failed to connect to SMG Worker control plane: {error}"),
+                    })?;
+                Ok::<_, WorkerError>(WorkerControlClient::new(channel))
+            })
+            .await?;
+        let mut client = client.clone();
+        match time::timeout(
+            timeout,
+            client.get_health(GetHealthRequest {
+                include_components: false,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                let health = response.into_inner();
+                let state = WorkerHealthState::try_from(health.state)
+                    .unwrap_or(WorkerHealthState::Unspecified);
+                tracing::debug!(
+                    worker_url = %self.metadata.spec.url,
+                    control_url,
+                    state = state.as_str_name(),
+                    "SMG Worker control health response"
+                );
+                Ok(state == WorkerHealthState::Serving)
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(control_url, %error, "SMG Worker control health RPC failed");
+                Ok(false)
+            }
+            Err(_) => {
+                tracing::warn!(control_url, "SMG Worker control health RPC timed out");
+                Ok(false)
+            }
+        }
+    }
+
     async fn zmq_health_check(&self) -> WorkerResult<bool> {
         // Never drive (or cancel) the handshake from the probe: model load can
         // take far longer than the health timeout, and cancelling it mid-flight
@@ -1893,6 +1972,12 @@ mod tests {
     use std::{thread, time::Duration};
 
     use openai_protocol::worker::HealthCheckConfig;
+    use smg_grpc_client::worker_proto::{
+        self as worker_proto,
+        worker_control_server::{WorkerControl as WorkerControlService, WorkerControlServer},
+    };
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{transport::Server, Request, Response, Status};
 
     use super::*;
     use crate::worker::{
@@ -1970,6 +2055,75 @@ mod tests {
         assert!(worker.is_healthy());
         assert_eq!(worker.load(), 0);
         assert_eq!(worker.processed_requests(), 0);
+    }
+
+    #[derive(Default)]
+    struct ServingWorkerControl;
+
+    #[tonic::async_trait]
+    impl WorkerControlService for ServingWorkerControl {
+        async fn get_identity(
+            &self,
+            _request: Request<worker_proto::GetIdentityRequest>,
+        ) -> Result<Response<worker_proto::GetIdentityResponse>, Status> {
+            Err(Status::unimplemented("not needed by periodic health test"))
+        }
+
+        async fn get_capabilities(
+            &self,
+            _request: Request<worker_proto::GetCapabilitiesRequest>,
+        ) -> Result<Response<worker_proto::GetCapabilitiesResponse>, Status> {
+            Err(Status::unimplemented("not needed by periodic health test"))
+        }
+
+        async fn get_health(
+            &self,
+            _request: Request<GetHealthRequest>,
+        ) -> Result<Response<worker_proto::GetHealthResponse>, Status> {
+            Ok(Response::new(worker_proto::GetHealthResponse {
+                state: WorkerHealthState::Serving.into(),
+                message: "ready".to_string(),
+                ..Default::default()
+            }))
+        }
+
+        async fn get_topology(
+            &self,
+            _request: Request<worker_proto::GetTopologyRequest>,
+        ) -> Result<Response<worker_proto::GetTopologyResponse>, Status> {
+            Err(Status::unimplemented("not needed by periodic health test"))
+        }
+    }
+
+    #[tokio::test]
+    async fn smg_health_uses_control_url_not_inference_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only tonic server is explicitly aborted before the test returns"
+        )]
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(WorkerControlServer::new(ServingWorkerControl))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+        });
+
+        let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:1")
+            .worker_mode(WorkerMode::Smg)
+            .control_url(Some(format!("grpc://{address}")))
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(HealthCheckConfig {
+                timeout_secs: 2,
+                ..HealthCheckConfig::default()
+            })
+            .build();
+        assert!(worker.check_health_async().await.is_ok());
+        assert!(worker.backend_client.load().get().is_none());
+        assert!(worker.worker_control_client.get().is_some());
+
+        server.abort();
     }
 
     #[test]
