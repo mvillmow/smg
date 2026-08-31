@@ -26,6 +26,7 @@ use smg_grpc_client::{
     worker_proto::{
         worker_control_client::WorkerControlClient, GetHealthRequest, WorkerHealthState,
     },
+    WorkerInferenceClient,
 };
 use tokio::{
     sync::{mpsc, OnceCell},
@@ -42,7 +43,11 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         common::header_utils::extract_routing_key,
-        grpc::{backend_client::BackendClient, client::GrpcClient, zmq_client},
+        grpc::{
+            backend_client::{BackendClient, SmgBackendClient},
+            client::GrpcClient,
+            zmq_client,
+        },
     },
 };
 
@@ -1625,21 +1630,36 @@ impl Worker for BasicWorker {
                 let cell = self.backend_client.load_full();
                 let client = cell
                     .get_or_try_init(|| async {
-                        let runtime_str = self.metadata.spec.runtime_type.to_string();
+                        let runtime = self.metadata.spec.runtime_type;
+                        let runtime_str = runtime.to_string();
+                        let worker_mode = self.metadata.spec.worker_mode;
                         tracing::info!(
                             "Lazily initializing gRPC client ({}) for worker: {}",
                             runtime_str,
                             self.metadata.spec.url
                         );
                         // DP-expanded workers carry a `{base}@{rank}` URL; connect to the base
-                        match GrpcClient::connect(self.metadata.base_url(), &runtime_str).await {
+                        let connected = if worker_mode == WorkerMode::Smg {
+                            WorkerInferenceClient::connect(self.metadata.base_url())
+                                .await
+                                .map(|client| {
+                                    BackendClient::Smg(Arc::new(SmgBackendClient::new(
+                                        client, runtime,
+                                    )))
+                                })
+                        } else {
+                            GrpcClient::connect(self.metadata.base_url(), &runtime_str)
+                                .await
+                                .map(BackendClient::Grpc)
+                        };
+                        match connected {
                             Ok(client) => {
                                 tracing::info!(
                                     "Successfully connected gRPC client ({}) for worker: {}",
                                     runtime_str,
                                     self.metadata.spec.url
                                 );
-                                Ok(Arc::new(BackendClient::Grpc(client)))
+                                Ok(Arc::new(client))
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -1969,17 +1989,28 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
+    use std::{pin::Pin, thread, time::Duration};
 
+    use futures::{stream, Stream};
     use openai_protocol::worker::HealthCheckConfig;
-    use smg_grpc_client::worker_proto::{
-        self as worker_proto,
-        worker_control_server::{WorkerControl as WorkerControlService, WorkerControlServer},
+    use smg_grpc_client::{
+        tokenspeed_proto,
+        worker_inference_proto::{
+            self as inference_proto,
+            worker_inference_server::{
+                WorkerInference as WorkerInferenceService, WorkerInferenceServer,
+            },
+        },
+        worker_proto::{
+            self as worker_proto,
+            worker_control_server::{WorkerControl as WorkerControlService, WorkerControlServer},
+        },
     };
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{transport::Server, Request, Response, Status};
 
     use super::*;
+    use crate::routers::grpc::proto_wrapper::{ProtoGenerateRequest, ProtoResponseVariant};
     use crate::worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder,
@@ -2123,6 +2154,99 @@ mod tests {
         assert!(worker.backend_client.load().get().is_none());
         assert!(worker.worker_control_client.get().is_some());
 
+        server.abort();
+    }
+
+    #[derive(Default)]
+    struct OneShotInference;
+
+    #[tonic::async_trait]
+    impl WorkerInferenceService for OneShotInference {
+        type GenerateStream =
+            Pin<Box<dyn Stream<Item = Result<inference_proto::GenerateResponse, Status>> + Send>>;
+
+        async fn generate(
+            &self,
+            request: Request<inference_proto::GenerateRequest>,
+        ) -> Result<Response<Self::GenerateStream>, Status> {
+            let response = inference_proto::GenerateResponse {
+                request_id: request.into_inner().request_id,
+                response: Some(inference_proto::generate_response::Response::Complete(
+                    inference_proto::GenerateComplete {
+                        output_ids: vec![7, 8],
+                        finish_reason: "stop".to_string(),
+                        completion_tokens: 2,
+                        ..Default::default()
+                    },
+                )),
+            };
+            Ok(Response::new(Box::pin(stream::iter([Ok(response)]))))
+        }
+
+        async fn abort(
+            &self,
+            _request: Request<inference_proto::AbortRequest>,
+        ) -> Result<Response<inference_proto::AbortResponse>, Status> {
+            Ok(Response::new(inference_proto::AbortResponse {
+                success: true,
+                message: String::new(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn smg_data_plane_uses_inference_url_not_control_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only tonic server is explicitly aborted before the test returns"
+        )]
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(WorkerInferenceServer::new(OneShotInference))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+        });
+
+        let worker = BasicWorkerBuilder::new(format!("grpc://{address}"))
+            .worker_mode(WorkerMode::Smg)
+            .control_url(Some("grpc://127.0.0.1:1".to_string()))
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Sglang)
+            .health_config(no_health_check())
+            .build();
+        let client = worker
+            .get_backend_client()
+            .await
+            .expect("connect WorkerInference")
+            .expect("gRPC backend");
+        assert!(matches!(client.as_ref(), BackendClient::Smg(_)));
+        assert_eq!(client.runtime_type(), RuntimeType::Sglang);
+
+        let mut client = client.as_ref().clone();
+        let mut response = client
+            .generate(ProtoGenerateRequest::TokenSpeed(Box::new(
+                tokenspeed_proto::GenerateRequest {
+                    request_id: "smg-data".to_string(),
+                    stream: true,
+                    ..Default::default()
+                },
+            )))
+            .await
+            .expect("WorkerInference generate");
+        let item = response
+            .next()
+            .await
+            .expect("response item")
+            .expect("successful item");
+        let ProtoResponseVariant::Complete(complete) = item.into_response() else {
+            panic!("expected terminal response");
+        };
+        assert_eq!(complete.output_ids(), &[7, 8]);
+        response.mark_completed();
+
+        assert!(worker.worker_control_client.get().is_none());
         server.abort();
     }
 

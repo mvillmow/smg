@@ -34,6 +34,12 @@ sends inference traffic to a control-only listener.
 generation, token streaming, and abort. Unsupported workloads must fail closed
 until their contracts are explicit.
 
+Version 1 uses one engine-neutral argument shape for every Worker: tokenized
+input, sampling parameters, logprob options, streaming responses, and abort.
+The Worker translates that contract to its colocated engine. Embeddings,
+multimodal tensors, and disaggregated execution are deliberately excluded from
+the first slice rather than leaking engine-specific messages into the API.
+
 The Router uses `WorkerControl` for registration and periodic health. It uses
 only `WorkerInference` for requests. It must not bypass the Worker and connect
 to an engine endpoint advertised as node-local implementation detail.
@@ -45,9 +51,11 @@ the Rust tonic server in that coordinator after scheduler processes fork.
 Python only announces lifecycle transitions such as starting, serving, and
 draining; health reads are served from Rust memory and do not acquire the GIL.
 
-The binding is a compatibility and lifecycle hook, not the inference path. The
-same constructor and lifecycle calls should work across engines, while each
-engine supplies its own endpoint, model IDs, features, and readiness timing.
+The binding is a compatibility and lifecycle hook, not a per-request Python
+callback. It can start the Rust `WorkerInference` adapter on the same listener,
+while token streaming stays between tonic services. The same constructor and
+lifecycle calls should work across engines; each engine supplies its endpoint,
+model IDs, features, and readiness timing.
 
 ## Performance assessment
 
@@ -76,8 +84,10 @@ Configuration is opt-in and shared across engines:
 - `SMG_WORKER_CONTROL_BIND_ADDRESS`;
 - `SMG_WORKER_ID` and optional `SMG_WORKER_INSTANCE_ID`;
 - `SMG_WORKER_ZONE`;
-- `SMG_WORKER_ENGINE_ENDPOINT`, which must be Router-reachable and must not
+- `SMG_WORKER_ENGINE_ENDPOINT`, which must be Worker-reachable and must not
   advertise an unspecified address such as `0.0.0.0`.
+- `SMG_WORKER_INFERENCE_ENABLED`, which opts the same Rust listener into the
+  `WorkerInference` data plane.
 
 If the control server is explicitly enabled but cannot start, the coordinator
 must fail closed. An unexpected control-server exit also initiates shutdown.
@@ -89,14 +99,43 @@ must fail closed. An unexpected control-server exit also initiates shutdown.
 - `WorkerControl` protobuf and Rust client/server bindings implement identity,
   capabilities, health, and topology.
 - The Rust mock worker serves control and scheduler APIs for GPU-free tests.
+- `WorkerInference` protobuf and Rust client/server bindings now cover regular
+  text generation, streaming, and abort with an engine-neutral wire schema.
+- `BackendClient::Smg` connects only to the inference URL. Legacy engine mode
+  continues to construct its engine-specific gRPC client.
+- WorkerInference streams reuse the Router's canonical response processing,
+  including drop-triggered abort, without exposing that internal shape on the
+  wire.
+- The SGLang Worker adapter targets SGLang 0.5.18's native Rust
+  `sglang.runtime.v1.SglangService`; it performs typed conversion, streaming,
+  backpressure, and abort without a Python gRPC hop.
 - The PyO3 binding hosts the Rust control server and exposes lifecycle health
-  transitions without putting Python on the request path.
+  transitions without putting Python on the request path. Inference remains
+  opt-in so existing control-only deployments do not change behavior.
 - Router registration performs a versioned Worker handshake before admitting
   an explicit SMG Worker.
 - Worker specs can carry separate `control_url` and inference `url` values;
   registration and periodic health use only the control endpoint.
 - SGLang's coordinator can opt in to the embedded control server, transitions
   it after warmup and before drain, and treats unexpected exit as fatal.
+- Static Router workers can select the architecture with
+  `--worker-mode smg --backend sglang`; dynamic registration can additionally
+  provide separate inference and control URLs.
+
+## B200 validation
+
+Validated on a B200 dev host with `lmsysorg/sglang:latest` (0.5.18) and
+`vllm/vllm-openai:latest` (0.28.0). Both images passed direct HTTP generation.
+The full SGLang path also passed non-streaming generation, SSE streaming, and
+client-disconnect cancellation:
+
+`Router HTTP -> WorkerInference (Rust) -> SGLang native gRPC (Rust) -> B200`.
+
+SGLang 0.5.18 currently reads `GenerateReqInput.batch_size` before the async
+generator performs request normalization in its streaming bridge. Moving that
+read inside the first stream iteration made the native stream pass. This is an
+upstream compatibility fix, not an SMG change. The vLLM image has no equivalent
+generic Worker adapter in this slice, so only its engine baseline was tested.
 
 ## Remaining work
 
@@ -104,11 +143,14 @@ must fail closed. An unexpected control-server exit also initiates shutdown.
    replacement, mesh, and service-discovery path.
 2. Persist discovered Worker identity, capabilities, and topology as observed
    metadata instead of treating the handshake as a boolean probe.
-3. Add the minimal Rust `WorkerInference` service and client.
+3. Add the vLLM Worker-side adapter behind the same Rust service; do not call
+   Python for every health poll or stream chunk.
 4. Route Two-Tier pools only to SMG Workers and keep legacy engine pools
    isolated.
-5. Validate streaming, cancellation, and coordinator shutdown with an actual
-   model on a multi-GPU dev host.
+5. Extend the protocol only after separate contracts exist for embedding,
+   multimodal, and PD/EPD workloads.
+6. Add B200 overload and coordinator-shutdown tests, then run the same complete
+   path through the future vLLM Worker adapter.
 
 ## Upstream alignment
 

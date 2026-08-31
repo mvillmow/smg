@@ -22,6 +22,8 @@ _GENERATED_MODULES = {
     "mlx_engine_pb2_grpc",
     "worker_control_pb2",
     "worker_control_pb2_grpc",
+    "worker_inference_pb2",
+    "worker_inference_pb2_grpc",
 }
 
 __all__ = sorted(_GENERATED_MODULES)

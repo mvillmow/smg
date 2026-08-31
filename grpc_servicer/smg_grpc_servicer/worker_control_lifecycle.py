@@ -20,6 +20,18 @@ def _optional_env(environ: Mapping[str, str], name: str) -> str | None:
     return value.strip() if value and value.strip() else None
 
 
+def _bool_env(environ: Mapping[str, str], name: str) -> bool:
+    value = _optional_env(environ, name)
+    if value is None:
+        return False
+    normalized = value.lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value, got {value!r}")
+
+
 @dataclass
 class WorkerControlLifecycle:
     """Small engine-independent wrapper around the PyO3 server."""
@@ -50,6 +62,7 @@ class WorkerControlLifecycle:
         worker_id = _optional_env(environ, "SMG_WORKER_ID") or socket.gethostname()
         instance_id = _optional_env(environ, "SMG_WORKER_INSTANCE_ID")
         zone = _optional_env(environ, "SMG_WORKER_ZONE") or ""
+        inference_enabled = _bool_env(environ, "SMG_WORKER_INFERENCE_ENABLED")
 
         try:
             from smg.worker import WorkerControlServer
@@ -77,6 +90,7 @@ class WorkerControlLifecycle:
             model_ids=list(model_ids),
             features=list(features),
             max_concurrent_requests=max(0, max_concurrent_requests),
+            inference_enabled=inference_enabled,
         )
         return cls(server=server)
 

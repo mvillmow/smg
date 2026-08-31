@@ -7,14 +7,21 @@ use std::{
     sync::Arc,
 };
 
-use futures::{stream, Stream};
-use smg_grpc_client::{common_proto as common, tokenspeed_scheduler::tokenspeed_proto as ts};
+use futures::{stream, Stream, StreamExt};
+use smg_grpc_client::{
+    common_proto as common,
+    tokenspeed_scheduler::tokenspeed_proto as ts,
+    worker_inference::{
+        from_tokenspeed_response, into_tokenspeed_request, proto as worker_inference,
+    },
+};
 use tokio::sync::mpsc;
 use tonic::{transport::Server, Request, Response, Status};
 use ts::{
     generate_response::Response as GenResp,
     token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer},
 };
+use worker_inference::worker_inference_server::{WorkerInference, WorkerInferenceServer};
 
 use crate::{
     config::Config,
@@ -36,8 +43,12 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
     let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
     let control = MockWorkerControl::new(&cfg, &host, port);
     let service = MockScheduler { cfg, engine };
+    let worker_inference = MockWorkerInference {
+        scheduler: service.clone(),
+    };
     if let Err(e) = Server::builder()
         .add_service(TokenSpeedSchedulerServer::new(service))
+        .add_service(WorkerInferenceServer::new(worker_inference))
         .add_service(control.into_server())
         .serve(addr)
         .await
@@ -54,9 +65,53 @@ struct MockScheduler {
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
+type WorkerGenStream =
+    Pin<Box<dyn Stream<Item = Result<worker_inference::GenerateResponse, Status>> + Send>>;
 type KvEventStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
 type TokenizerStream =
     Pin<Box<dyn Stream<Item = Result<common::GetTokenizerChunk, Status>> + Send>>;
+
+#[derive(Clone)]
+struct MockWorkerInference {
+    scheduler: MockScheduler,
+}
+
+#[tonic::async_trait]
+impl WorkerInference for MockWorkerInference {
+    type GenerateStream = WorkerGenStream;
+
+    async fn generate(
+        &self,
+        request: Request<worker_inference::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        let request = Request::new(into_tokenspeed_request(request.into_inner()));
+        let response = TokenSpeedScheduler::generate(&self.scheduler, request).await?;
+        let stream = response
+            .into_inner()
+            .map(|item| item.map(from_tokenspeed_response));
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn abort(
+        &self,
+        request: Request<worker_inference::AbortRequest>,
+    ) -> Result<Response<worker_inference::AbortResponse>, Status> {
+        let request = request.into_inner();
+        let response = TokenSpeedScheduler::abort(
+            &self.scheduler,
+            Request::new(ts::AbortRequest {
+                request_id: request.request_id,
+                reason: request.reason,
+            }),
+        )
+        .await?
+        .into_inner();
+        Ok(Response::new(worker_inference::AbortResponse {
+            success: response.success,
+            message: response.message,
+        }))
+    }
+}
 
 #[tonic::async_trait]
 impl TokenSpeedScheduler for MockScheduler {

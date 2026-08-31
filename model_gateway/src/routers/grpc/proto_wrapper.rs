@@ -36,6 +36,7 @@ use smg_grpc_client::{
     trtllm_service::AbortOnDropStream as TrtllmStream,
     vllm_engine::AbortOnDropStream as VllmStream,
     vllm_proto::{self as vllm, generate_complete::MatchedStop as VllmMatchedStop},
+    worker_inference::{into_tokenspeed_response, AbortOnDropStream as WorkerInferenceStream},
 };
 use smg_mm_rdma::RdmaExporter;
 
@@ -2155,6 +2156,9 @@ pub enum ProtoStream {
     Trtllm(TrtllmStream),
     Mlx(MlxStream),
     TokenSpeed(TokenSpeedStream),
+    /// Stable Router-to-Worker stream. Its engine-neutral wire response is
+    /// converted to the router's existing canonical response representation.
+    Smg(WorkerInferenceStream),
     /// ZMQ backend: a custom stream yielding vLLM-proto responses built from
     /// EngineCore outputs. Auto-aborts on drop, so `mark_completed` is a no-op.
     Zmq(ZmqGenerateStream),
@@ -2184,6 +2188,11 @@ impl ProtoStream {
                 .next()
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::TokenSpeed(Box::new(r)))),
+            Self::Smg(stream) => stream.next().await.map(|result| {
+                result.map(|response| {
+                    ProtoGenerateResponse::TokenSpeed(Box::new(into_tokenspeed_response(response)))
+                })
+            }),
             // Every ZMQ engine (including TokenSpeed) emits vllm-shaped
             // responses: the adapter translates wire output into
             // `vllm::GenerateResponse`, so variant checks like
@@ -2207,6 +2216,7 @@ impl ProtoStream {
             Self::Trtllm(stream) => stream.mark_completed(),
             Self::Mlx(stream) => stream.mark_completed(),
             Self::TokenSpeed(stream) => stream.mark_completed(),
+            Self::Smg(stream) => stream.mark_completed(),
             Self::Zmq(stream) => stream.mark_completed(),
         }
     }
@@ -2227,6 +2237,7 @@ impl ProtoStream {
             Self::Trtllm(stream) => Self::Trtllm(stream.defer_abort_until_first_item()),
             Self::Mlx(stream) => Self::Mlx(stream.defer_abort_until_first_item()),
             Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
+            Self::Smg(stream) => Self::Smg(stream.defer_abort_until_first_item()),
             Self::Zmq(stream) => Self::Zmq(stream),
         }
     }

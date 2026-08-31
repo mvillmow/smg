@@ -24,6 +24,10 @@ use smg_grpc_client::worker_proto::{
     self as proto,
     worker_control_server::{WorkerControl, WorkerControlServer as TonicWorkerControlServer},
 };
+use smg_grpc_client::{
+    worker_inference::SglangWorkerInference,
+    worker_inference_proto::worker_inference_server::WorkerInferenceServer,
+};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
@@ -212,6 +216,7 @@ impl PyWorkerControlServer {
         engine_version = String::new(),
         features = None,
         max_concurrent_requests = 0,
+        inference_enabled = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -227,6 +232,7 @@ impl PyWorkerControlServer {
         engine_version: String,
         features: Option<Vec<String>>,
         max_concurrent_requests: u32,
+        inference_enabled: bool,
     ) -> PyResult<Self> {
         if worker_id.trim().is_empty() {
             return Err(PyValueError::new_err("worker_id must not be empty"));
@@ -244,6 +250,10 @@ impl PyWorkerControlServer {
             state: proto::WorkerHealthState::Starting,
             message: "starting".to_string(),
         }));
+        let inference = inference_enabled.then(|| InferenceConfig {
+            engine_type: engine_type.clone(),
+            engine_endpoint: engine_endpoint.clone(),
+        });
         let config = BridgeConfig {
             worker_id: worker_id.clone(),
             instance_id: instance_id
@@ -258,7 +268,14 @@ impl PyWorkerControlServer {
             max_concurrent_requests,
             health: Arc::clone(&health),
         };
-        py.detach(|| start_server(bind_address, PythonWorkerControl::new(config), health))
+        py.detach(|| {
+            start_server(
+                bind_address,
+                PythonWorkerControl::new(config),
+                health,
+                inference,
+            )
+        })
     }
 
     #[getter]
@@ -340,6 +357,7 @@ fn start_server(
     bind_address: SocketAddr,
     service: PythonWorkerControl,
     health: Arc<Mutex<HealthSnapshot>>,
+    inference: Option<InferenceConfig>,
 ) -> PyResult<PyWorkerControlServer> {
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (done_tx, done_rx) = mpsc::sync_channel(1);
@@ -363,6 +381,28 @@ fn start_server(
             };
             let runtime_running = Arc::clone(&thread_running);
             runtime.block_on(async move {
+                let inference = match inference {
+                    Some(config) if config.engine_type.eq_ignore_ascii_case("sglang") => {
+                        match SglangWorkerInference::connect(&config.engine_endpoint).await {
+                            Ok(service) => Some(WorkerInferenceServer::new(service)),
+                            Err(error) => {
+                                let _ = started_tx.send(Err(format!(
+                                    "failed to connect WorkerInference adapter to {}: {error}",
+                                    config.engine_endpoint
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                    Some(config) => {
+                        let _ = started_tx.send(Err(format!(
+                            "WorkerInference adapter is not implemented for engine {}",
+                            config.engine_type
+                        )));
+                        return;
+                    }
+                    None => None,
+                };
                 let listener = match tokio::net::TcpListener::bind(bind_address).await {
                     Ok(listener) => listener,
                     Err(error) => {
@@ -386,6 +426,7 @@ fn start_server(
                 let incoming = TcpListenerStream::new(listener);
                 if let Err(error) = Server::builder()
                     .add_service(TonicWorkerControlServer::new(service))
+                    .add_optional_service(inference)
                     .serve_with_incoming_shutdown(incoming, async {
                         let _ = shutdown_rx.await;
                     })
@@ -416,6 +457,11 @@ fn start_server(
         running,
         last_error,
     })
+}
+
+struct InferenceConfig {
+    engine_type: String,
+    engine_endpoint: String,
 }
 
 #[cfg(test)]

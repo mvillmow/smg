@@ -8,13 +8,16 @@
 //! pipeline (which works against [`ProtoStream`]/[`ProtoGenerateRequest`]) is
 //! shared unchanged.
 
+use std::sync::Arc;
+
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, worker::WorkerLoadResponse,
 };
 use smg_grpc_client::{
     common_proto, tokenizer_bundle::StreamBundle, tokenspeed_proto, vllm_proto,
-    SglangSchedulerClient, TokenSpeedSchedulerClient, VllmEngineClient,
+    worker_inference::from_tokenspeed_request, SglangSchedulerClient, TokenSpeedSchedulerClient,
+    VllmEngineClient, WorkerInferenceClient,
 };
 
 use crate::{
@@ -38,7 +41,22 @@ use crate::{
 #[derive(Clone)]
 pub enum BackendClient {
     Grpc(GrpcClient),
+    /// Stable Worker SMG data plane. `runtime` describes the colocated engine
+    /// for capability checks, but never changes the Router-to-Worker wire.
+    Smg(Arc<SmgBackendClient>),
     Zmq(ZmqEngineClient),
+}
+
+#[derive(Clone)]
+pub struct SmgBackendClient {
+    inference: WorkerInferenceClient,
+    runtime: RuntimeType,
+}
+
+impl SmgBackendClient {
+    pub fn new(inference: WorkerInferenceClient, runtime: RuntimeType) -> Self {
+        Self { inference, runtime }
+    }
 }
 
 /// The native request builders of both ZMQ dialects for one request kind — the
@@ -85,6 +103,7 @@ impl BackendClient {
     pub fn runtime_type(&self) -> RuntimeType {
         match self {
             Self::Grpc(client) => client.runtime_type(),
+            Self::Smg(client) => client.runtime,
             Self::Zmq(client) => client.runtime(),
         }
     }
@@ -107,7 +126,7 @@ impl BackendClient {
     pub fn finalize_generate_request(
         &self,
         request: &mut ProtoGenerateRequest,
-        tokenizer: Option<&std::sync::Arc<dyn llm_tokenizer::traits::Tokenizer>>,
+        tokenizer: Option<&Arc<dyn llm_tokenizer::traits::Tokenizer>>,
     ) -> Vec<String> {
         let token_only_wire = self.is_zmq();
         let router_stops = helpers::resolve_string_stops(request, tokenizer, token_only_wire);
@@ -134,6 +153,7 @@ impl BackendClient {
     pub fn is_alive(&self) -> bool {
         match self {
             Self::Grpc(_) => true,
+            Self::Smg(_) => true,
             Self::Zmq(client) => client.is_alive(),
         }
     }
@@ -147,6 +167,7 @@ impl BackendClient {
     pub fn as_sglang_mut(&mut self) -> &mut SglangSchedulerClient {
         match self {
             Self::Grpc(client) => client.as_sglang_mut(),
+            Self::Smg(_) => panic!("Worker SMG backend does not expose an engine-specific client"),
             Self::Zmq(_) => panic!("Expected SGLang client, got ZMQ backend"),
         }
     }
@@ -154,6 +175,9 @@ impl BackendClient {
     pub async fn health_check(&self) -> Result<HealthCheckResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.health_check().await,
+            Self::Smg(_) => Err(tonic::Status::unimplemented(
+                "Worker SMG health is served by WorkerControl",
+            )),
             Self::Zmq(client) => {
                 let resp = client.health_check();
                 Ok(HealthCheckResponse {
@@ -167,6 +191,9 @@ impl BackendClient {
     pub async fn get_model_info(&self) -> Result<ModelInfo, tonic::Status> {
         match self {
             Self::Grpc(client) => client.get_model_info().await,
+            Self::Smg(_) => Err(tonic::Status::unimplemented(
+                "Worker SMG model metadata is served by WorkerControl",
+            )),
             Self::Zmq(client) => Ok(client.get_model_info()),
         }
     }
@@ -174,6 +201,9 @@ impl BackendClient {
     pub async fn get_server_info(&self) -> Result<ServerInfo, tonic::Status> {
         match self {
             Self::Grpc(client) => client.get_server_info().await,
+            Self::Smg(_) => Err(tonic::Status::unimplemented(
+                "Worker SMG server metadata is served by WorkerControl",
+            )),
             Self::Zmq(client) => Ok(client.get_server_info()),
         }
     }
@@ -181,6 +211,9 @@ impl BackendClient {
     pub async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.get_loads().await,
+            Self::Smg(_) => Err(tonic::Status::unimplemented(
+                "WorkerInference v1 does not expose scheduler loads",
+            )),
             Self::Zmq(client) => Ok(client.get_loads()),
         }
     }
@@ -191,6 +224,9 @@ impl BackendClient {
     ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.flush_cache(timeout_s).await,
+            Self::Smg(_) => Err(tonic::Status::unimplemented(
+                "WorkerInference v1 does not expose cache administration",
+            )),
             Self::Zmq(_) => Err(tonic::Status::unimplemented(
                 "FlushCache not supported over ZMQ",
             )),
@@ -203,6 +239,9 @@ impl BackendClient {
     ) -> Result<common_proto::ProfileResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.start_profile(req).await,
+            Self::Smg(_) => Err(tonic::Status::unimplemented(
+                "WorkerInference v1 does not expose profiling",
+            )),
             Self::Zmq(_) => Err(tonic::Status::unimplemented(
                 "StartProfile not supported over ZMQ",
             )),
@@ -212,6 +251,9 @@ impl BackendClient {
     pub async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.stop_profile().await,
+            Self::Smg(_) => Err(tonic::Status::unimplemented(
+                "WorkerInference v1 does not expose profiling",
+            )),
             Self::Zmq(_) => Err(tonic::Status::unimplemented(
                 "StopProfile not supported over ZMQ",
             )),
@@ -224,6 +266,9 @@ impl BackendClient {
     ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
         match self {
             Self::Grpc(client) => client.subscribe_kv_events(start_seq).await,
+            Self::Smg(_) => Err(tonic::Status::unimplemented(
+                "WorkerInference v1 does not expose KV events",
+            )),
             Self::Zmq(_) => Err(tonic::Status::unimplemented(
                 "SubscribeKvEvents not supported over ZMQ",
             )),
@@ -235,6 +280,7 @@ impl BackendClient {
     ) -> Result<StreamBundle, Box<dyn std::error::Error + Send + Sync>> {
         match self {
             Self::Grpc(client) => client.get_tokenizer().await,
+            Self::Smg(_) => Err("WorkerInference v1 does not serve a tokenizer bundle".into()),
             // EngineCore does not serve tokenizer artifacts over ZMQ; the
             // tokenizer is configured at worker registration instead.
             Self::Zmq(_) => Err("ZMQ backend does not serve a tokenizer bundle".into()),
@@ -247,6 +293,15 @@ impl BackendClient {
     ) -> Result<ProtoStream, tonic::Status> {
         match self {
             Self::Grpc(client) => client.generate(req).await,
+            Self::Smg(client) => {
+                let ProtoGenerateRequest::TokenSpeed(request) = req else {
+                    return Err(tonic::Status::invalid_argument(
+                        "Worker SMG requires the engine-neutral request representation",
+                    ));
+                };
+                let request = from_tokenspeed_request(*request)?;
+                Ok(ProtoStream::Smg(client.inference.generate(request).await?))
+            }
             Self::Zmq(client) => Ok(ProtoStream::Zmq(client.generate(req).await?)),
         }
     }
@@ -257,6 +312,9 @@ impl BackendClient {
     ) -> Result<ProtoEmbedComplete, tonic::Status> {
         match self {
             Self::Grpc(client) => client.embed(req).await,
+            Self::Smg(_) => Err(tonic::Status::unimplemented(
+                "WorkerInference v1 does not support embedding",
+            )),
             Self::Zmq(_) => Err(tonic::Status::unimplemented(
                 "ZMQ backend does not support embedding yet",
             )),
@@ -274,6 +332,20 @@ impl BackendClient {
         match self {
             Self::Grpc(client) => {
                 client.build_chat_request(request_id, body, processed_text, token_ids, options)
+            }
+            Self::Smg(_) => {
+                if options.multimodal_inputs.is_some() {
+                    return Err("WorkerInference v1 does not support multimodal inputs".to_string());
+                }
+                let request = TokenSpeedSchedulerClient::build_generate_request_from_chat(
+                    request_id,
+                    body,
+                    processed_text,
+                    token_ids,
+                    None,
+                    options.tool_constraints,
+                )?;
+                Ok(ProtoGenerateRequest::TokenSpeed(Box::new(request)))
             }
             // A ZMQ backend speaks vLLM EngineCore or TokenSpeed directly; build
             // the native request for its dialect, mirroring the gRPC per-engine
@@ -305,6 +377,20 @@ impl BackendClient {
             Self::Grpc(client) => {
                 client.build_messages_request(request_id, body, processed_text, token_ids, options)
             }
+            Self::Smg(_) => {
+                if options.multimodal_inputs.is_some() {
+                    return Err("WorkerInference v1 does not support multimodal inputs".to_string());
+                }
+                let request = TokenSpeedSchedulerClient::build_generate_request_from_messages(
+                    request_id,
+                    body,
+                    processed_text,
+                    token_ids,
+                    None,
+                    options.tool_constraints,
+                )?;
+                Ok(ProtoGenerateRequest::TokenSpeed(Box::new(request)))
+            }
             // Mirrors the gRPC per-engine dispatch: build the request natively for
             // the ZMQ backend's dialect (vLLM EngineCore or TokenSpeed).
             Self::Zmq(client) => build_zmq_request(
@@ -333,6 +419,14 @@ impl BackendClient {
             Self::Grpc(client) => {
                 client.build_completion_request(request_id, body, original_text, token_ids)
             }
+            Self::Smg(_) => Ok(ProtoGenerateRequest::TokenSpeed(Box::new(
+                TokenSpeedSchedulerClient::build_generate_request_from_completion(
+                    request_id,
+                    body,
+                    original_text,
+                    token_ids,
+                )?,
+            ))),
             Self::Zmq(client) => build_zmq_plain_request(
                 client.dialect(),
                 request_id,
@@ -358,6 +452,14 @@ impl BackendClient {
             Self::Grpc(client) => {
                 client.build_generate_request(request_id, body, original_text, token_ids)
             }
+            Self::Smg(_) => Ok(ProtoGenerateRequest::TokenSpeed(Box::new(
+                TokenSpeedSchedulerClient::build_plain_generate_request(
+                    request_id,
+                    body,
+                    original_text,
+                    token_ids,
+                )?,
+            ))),
             Self::Zmq(client) => build_zmq_plain_request(
                 client.dialect(),
                 request_id,

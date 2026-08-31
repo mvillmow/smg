@@ -71,6 +71,7 @@ def test_builds_shared_server_contract_and_drives_health(fake_smg):
     assert lifecycle.server.kwargs["model_ids"] == ["model-a"]
     assert lifecycle.server.kwargs["features"] == ["generate", "abort"]
     assert lifecycle.server.kwargs["max_concurrent_requests"] == 32
+    assert lifecycle.server.kwargs["inference_enabled"] is False
 
     lifecycle.mark_serving()
     lifecycle.mark_draining()
@@ -82,3 +83,19 @@ def test_builds_shared_server_contract_and_drives_health(fake_smg):
         ("not_serving", "shutdown"),
     ]
     assert lifecycle.server.stopped_with == 2.5
+
+
+def test_enables_inference_adapter_explicitly(fake_smg):
+    lifecycle = WorkerControlLifecycle.start_from_env(
+        engine_type="sglang",
+        model_ids=["model-a"],
+        features=["generate", "abort"],
+        environ={
+            "SMG_WORKER_CONTROL_BIND_ADDRESS": "0.0.0.0:31000",
+            "SMG_WORKER_ENGINE_ENDPOINT": "grpc://worker-a:32000",
+            "SMG_WORKER_INFERENCE_ENABLED": "true",
+        },
+    )
+
+    assert lifecycle is not None
+    assert lifecycle.server.kwargs["inference_enabled"] is True
