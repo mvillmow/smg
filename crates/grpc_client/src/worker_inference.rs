@@ -5,15 +5,24 @@
 //! to the router's existing TokenSpeed-shaped internal request/response model;
 //! that shape does not escape onto the WorkerInference wire.
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use futures::{Stream, StreamExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{transport::Channel, Request, Response, Status};
 use tracing::{debug, warn};
 
 use crate::{
-    sglang_runtime as sglang, tokenspeed_proto as ts, AbortOnDropClient, BoxedTraceInjector,
-    NoopTraceInjector,
+    sglang_runtime as sglang, tokenspeed_proto as ts, vllm_proto as vllm, AbortOnDropClient,
+    BoxedTraceInjector, NoopTraceInjector, TokenSpeedSchedulerClient, VllmEngineClient,
 };
 
 #[expect(clippy::allow_attributes)]
@@ -116,12 +125,12 @@ impl SglangWorkerInference {
     }
 }
 
-type SglangAdapterStream =
+type EngineAdapterStream =
     Pin<Box<dyn Stream<Item = Result<proto::GenerateResponse, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl proto::worker_inference_server::WorkerInference for SglangWorkerInference {
-    type GenerateStream = SglangAdapterStream;
+    type GenerateStream = EngineAdapterStream;
 
     async fn generate(
         &self,
@@ -167,6 +176,387 @@ impl proto::worker_inference_server::WorkerInference for SglangWorkerInference {
                 "SGLang rejected the abort request".to_string()
             },
         }))
+    }
+}
+
+/// Worker-side adapter for the SMG vLLM scheduler gRPC service.
+#[derive(Clone)]
+pub struct VllmWorkerInference {
+    client: VllmEngineClient,
+}
+
+impl VllmWorkerInference {
+    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self {
+            client: VllmEngineClient::connect(endpoint).await?,
+        })
+    }
+}
+
+#[tonic::async_trait]
+impl proto::worker_inference_server::WorkerInference for VllmWorkerInference {
+    type GenerateStream = EngineAdapterStream;
+
+    async fn generate(
+        &self,
+        request: Request<proto::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        let request = request.into_inner();
+        let request_id = request.request_id.clone();
+        let stream = self.client.generate(into_vllm_request(request)?).await?;
+        let stream = futures::stream::unfold(stream, move |mut stream| {
+            let request_id = request_id.clone();
+            async move {
+                let item = stream.next().await?;
+                let mapped = item.map(|response| from_vllm_response(&request_id, response));
+                if matches!(
+                    &mapped,
+                    Ok(proto::GenerateResponse {
+                        response: Some(proto::generate_response::Response::Complete(_)),
+                        ..
+                    })
+                ) {
+                    stream.mark_completed();
+                }
+                Some((mapped, stream))
+            }
+        });
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn abort(
+        &self,
+        request: Request<proto::AbortRequest>,
+    ) -> Result<Response<proto::AbortResponse>, Status> {
+        let request = request.into_inner();
+        self.client
+            .abort_request(request.request_id, request.reason)
+            .await?;
+        Ok(Response::new(proto::AbortResponse {
+            success: true,
+            message: String::new(),
+        }))
+    }
+}
+
+/// Worker-side adapter for the TokenSpeed scheduler gRPC service.
+#[derive(Clone)]
+pub struct TokenSpeedWorkerInference {
+    client: TokenSpeedSchedulerClient,
+}
+
+impl TokenSpeedWorkerInference {
+    pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self {
+            client: TokenSpeedSchedulerClient::connect(endpoint).await?,
+        })
+    }
+}
+
+#[tonic::async_trait]
+impl proto::worker_inference_server::WorkerInference for TokenSpeedWorkerInference {
+    type GenerateStream = EngineAdapterStream;
+
+    async fn generate(
+        &self,
+        request: Request<proto::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        let stream = self
+            .client
+            .generate(into_tokenspeed_request(request.into_inner()))
+            .await?;
+        let stream = futures::stream::unfold(stream, |mut stream| async move {
+            let item = stream.next().await?;
+            let mapped = item.map(from_tokenspeed_response);
+            if matches!(
+                &mapped,
+                Ok(proto::GenerateResponse {
+                    response: Some(proto::generate_response::Response::Complete(_)),
+                    ..
+                })
+            ) {
+                stream.mark_completed();
+            }
+            Some((mapped, stream))
+        });
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn abort(
+        &self,
+        request: Request<proto::AbortRequest>,
+    ) -> Result<Response<proto::AbortResponse>, Status> {
+        let request = request.into_inner();
+        self.client
+            .abort_request(request.request_id, request.reason)
+            .await?;
+        Ok(Response::new(proto::AbortResponse {
+            success: true,
+            message: String::new(),
+        }))
+    }
+}
+
+/// Engine-specific transport hidden behind the stable Worker service.
+#[derive(Clone)]
+enum EngineAdapter {
+    Sglang(SglangWorkerInference),
+    Vllm(VllmWorkerInference),
+    TokenSpeed(TokenSpeedWorkerInference),
+}
+
+/// One admission-controlled tonic service type for the Python binding
+/// regardless of engine.
+#[derive(Clone)]
+pub struct EngineWorkerInference {
+    adapter: EngineAdapter,
+    permits: Option<Arc<Semaphore>>,
+    serving: Option<Arc<AtomicBool>>,
+}
+
+impl EngineWorkerInference {
+    pub async fn connect(
+        engine_type: &str,
+        endpoint: &str,
+        max_concurrent_requests: u32,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let adapter = match engine_type.to_ascii_lowercase().as_str() {
+            "sglang" => EngineAdapter::Sglang(SglangWorkerInference::connect(endpoint).await?),
+            "vllm" => EngineAdapter::Vllm(VllmWorkerInference::connect(endpoint).await?),
+            "tokenspeed" | "ts" => {
+                EngineAdapter::TokenSpeed(TokenSpeedWorkerInference::connect(endpoint).await?)
+            }
+            other => {
+                return Err(
+                    format!("WorkerInference adapter is not implemented for {other}").into(),
+                )
+            }
+        };
+        let permits = (max_concurrent_requests > 0)
+            .then(|| Arc::new(Semaphore::new(max_concurrent_requests as usize)));
+        Ok(Self {
+            adapter,
+            permits,
+            serving: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_serving_flag(mut self, serving: Arc<AtomicBool>) -> Self {
+        self.serving = Some(serving);
+        self
+    }
+}
+
+fn try_acquire_worker_permit(
+    permits: Option<&Arc<Semaphore>>,
+) -> Result<Option<OwnedSemaphorePermit>, Status> {
+    permits
+        .map(|permits| Arc::clone(permits).try_acquire_owned())
+        .transpose()
+        .map_err(|_| Status::resource_exhausted("Worker request limit reached"))
+}
+
+fn ensure_worker_serving(serving: Option<&Arc<AtomicBool>>) -> Result<(), Status> {
+    if serving.is_some_and(|serving| !serving.load(Ordering::Acquire)) {
+        return Err(Status::unavailable("Worker is not serving"));
+    }
+    Ok(())
+}
+
+#[tonic::async_trait]
+impl proto::worker_inference_server::WorkerInference for EngineWorkerInference {
+    type GenerateStream = EngineAdapterStream;
+
+    async fn generate(
+        &self,
+        request: Request<proto::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        ensure_worker_serving(self.serving.as_ref())?;
+        let permit = try_acquire_worker_permit(self.permits.as_ref())?;
+        let response = match &self.adapter {
+            EngineAdapter::Sglang(service) => service.generate(request).await,
+            EngineAdapter::Vllm(service) => service.generate(request).await,
+            EngineAdapter::TokenSpeed(service) => service.generate(request).await,
+        }?;
+        let stream = response.into_inner().map(move |item| {
+            let _permit = &permit;
+            item
+        });
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn abort(
+        &self,
+        request: Request<proto::AbortRequest>,
+    ) -> Result<Response<proto::AbortResponse>, Status> {
+        match &self.adapter {
+            EngineAdapter::Sglang(service) => service.abort(request).await,
+            EngineAdapter::Vllm(service) => service.abort(request).await,
+            EngineAdapter::TokenSpeed(service) => service.abort(request).await,
+        }
+    }
+}
+
+fn into_vllm_request(request: proto::GenerateRequest) -> Result<vllm::GenerateRequest, Status> {
+    let tokenized = request.tokenized.unwrap_or_default();
+    let sampling_params = request
+        .sampling_params
+        .map(|params| {
+            into_vllm_sampling(
+                params,
+                request.return_logprob,
+                request.logprob_start_len,
+                request.top_logprobs_num,
+                &request.token_ids_logprob,
+            )
+        })
+        .transpose()?;
+    Ok(vllm::GenerateRequest {
+        request_id: request.request_id,
+        input: Some(vllm::generate_request::Input::Tokenized(
+            vllm::TokenizedInput {
+                original_text: tokenized.original_text,
+                input_ids: tokenized.input_ids,
+            },
+        )),
+        sampling_params,
+        stream: request.stream,
+        kv_transfer_params: None,
+        mm_inputs: None,
+        kv_transfer_params_json: None,
+        data_parallel_rank: request.data_parallel_rank,
+    })
+}
+
+fn into_vllm_sampling(
+    params: proto::SamplingParams,
+    return_logprob: bool,
+    logprob_start_len: Option<i32>,
+    top_logprobs_num: i32,
+    token_ids_logprob: &[u32],
+) -> Result<vllm::SamplingParams, Status> {
+    if params.engine_parameters.is_some() {
+        return Err(Status::invalid_argument(
+            "vLLM adapter does not accept untyped engine parameters",
+        ));
+    }
+    if !token_ids_logprob.is_empty() {
+        return Err(Status::unimplemented(
+            "vLLM adapter does not support token_ids_logprob",
+        ));
+    }
+    let logprobs = return_logprob.then_some(top_logprobs_num.max(0));
+    let prompt_logprobs = logprob_start_len.map(|_| top_logprobs_num.max(0));
+    let logit_bias = params
+        .logit_bias
+        .into_iter()
+        .map(|(key, value)| {
+            key.parse::<i32>()
+                .map(|key| (key, value))
+                .map_err(|_| Status::invalid_argument("vLLM logit_bias keys must be token IDs"))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    let seed = params
+        .sampling_seed
+        .map(|value| i32::try_from(value).map_err(|_| numeric_range_error("sampling_seed")))
+        .transpose()?;
+    let constraint = params.constraint.map(|constraint| match constraint {
+        proto::sampling_params::Constraint::Regex(value) => {
+            vllm::sampling_params::Constraint::Regex(value)
+        }
+        proto::sampling_params::Constraint::JsonSchema(value) => {
+            vllm::sampling_params::Constraint::JsonSchema(value)
+        }
+        proto::sampling_params::Constraint::EbnfGrammar(value) => {
+            vllm::sampling_params::Constraint::Grammar(value)
+        }
+        proto::sampling_params::Constraint::StructuralTag(value) => {
+            vllm::sampling_params::Constraint::StructuralTag(value)
+        }
+    });
+
+    Ok(vllm::SamplingParams {
+        temperature: params.temperature,
+        top_p: params.top_p.unwrap_or(1.0),
+        top_k: params.top_k.unwrap_or_default().max(0) as u32,
+        min_p: params.min_p.unwrap_or_default(),
+        frequency_penalty: params.frequency_penalty.unwrap_or_default(),
+        presence_penalty: params.presence_penalty.unwrap_or_default(),
+        repetition_penalty: params.repetition_penalty.unwrap_or(1.0),
+        max_tokens: params.max_new_tokens,
+        min_tokens: params.min_new_tokens,
+        stop: params.stop,
+        stop_token_ids: params.stop_token_ids,
+        skip_special_tokens: params.skip_special_tokens,
+        spaces_between_special_tokens: params.spaces_between_special_tokens,
+        ignore_eos: params.ignore_eos,
+        n: params.n.max(1),
+        logprobs,
+        prompt_logprobs,
+        seed,
+        include_stop_str_in_output: params.no_stop_trim,
+        logit_bias,
+        truncate_prompt_tokens: None,
+        constraint,
+    })
+}
+
+fn from_vllm_response(
+    request_id: &str,
+    response: vllm::GenerateResponse,
+) -> proto::GenerateResponse {
+    use vllm::generate_response::Response;
+
+    let response = response.response.map(|response| match response {
+        Response::Chunk(chunk) => {
+            proto::generate_response::Response::Chunk(proto::GenerateStreamChunk {
+                token_ids: chunk.token_ids,
+                prompt_tokens: chunk.prompt_tokens,
+                completion_tokens: chunk.completion_tokens,
+                cached_tokens: chunk.cached_tokens,
+                output_logprobs: chunk.output_logprobs.map(from_vllm_logprobs),
+                index: chunk.index,
+            })
+        }
+        Response::Complete(complete) => {
+            proto::generate_response::Response::Complete(proto::GenerateComplete {
+                output_ids: complete.output_ids,
+                finish_reason: complete.finish_reason,
+                prompt_tokens: complete.prompt_tokens,
+                completion_tokens: complete.completion_tokens,
+                cached_tokens: complete.cached_tokens,
+                output_logprobs: complete.output_logprobs.map(from_vllm_logprobs),
+                matched_stop: complete.matched_stop.map(|matched| match matched {
+                    vllm::generate_complete::MatchedStop::MatchedTokenId(id) => {
+                        proto::generate_complete::MatchedStop::MatchedTokenId(id)
+                    }
+                    vllm::generate_complete::MatchedStop::MatchedStopStr(value) => {
+                        proto::generate_complete::MatchedStop::MatchedStopStr(value)
+                    }
+                }),
+                index: complete.index,
+            })
+        }
+    });
+    proto::GenerateResponse {
+        request_id: request_id.to_string(),
+        response,
+    }
+}
+
+fn from_vllm_logprobs(logprobs: vllm::OutputLogProbs) -> proto::OutputLogProbs {
+    proto::OutputLogProbs {
+        token_logprobs: logprobs.token_logprobs,
+        token_ids: logprobs.token_ids,
+        top_logprobs: logprobs
+            .top_logprobs
+            .into_iter()
+            .map(|item| proto::TopLogProbs {
+                values: item.values,
+                token_ids: item.token_ids,
+            })
+            .collect(),
     }
 }
 
@@ -720,6 +1110,97 @@ mod tests {
         assert_eq!(sampling.max_new_tokens, Some(16));
         assert_eq!(sampling.stop_token_ids, vec![99]);
         assert_eq!(sampling.seed, Some(7));
+    }
+
+    #[test]
+    fn vllm_request_preserves_portable_arguments() {
+        let request = proto::GenerateRequest {
+            request_id: "vllm-1".to_string(),
+            tokenized: Some(proto::TokenizedInput {
+                input_ids: vec![10, 20],
+                original_text: "hello".to_string(),
+            }),
+            sampling_params: Some(proto::SamplingParams {
+                temperature: Some(0.2),
+                max_new_tokens: Some(16),
+                stop_token_ids: vec![99],
+                sampling_seed: Some(7),
+                n: 2,
+                ..Default::default()
+            }),
+            return_logprob: true,
+            top_logprobs_num: 3,
+            stream: true,
+            data_parallel_rank: Some(2),
+            ..Default::default()
+        };
+
+        let native = into_vllm_request(request).expect("vLLM request");
+        assert_eq!(native.request_id, "vllm-1");
+        assert_eq!(native.data_parallel_rank, Some(2));
+        let Some(vllm::generate_request::Input::Tokenized(input)) = native.input else {
+            panic!("expected tokenized input")
+        };
+        assert_eq!(input.input_ids, vec![10, 20]);
+        let sampling = native.sampling_params.expect("sampling params");
+        assert_eq!(sampling.temperature, Some(0.2));
+        assert_eq!(sampling.max_tokens, Some(16));
+        assert_eq!(sampling.stop_token_ids, vec![99]);
+        assert_eq!(sampling.seed, Some(7));
+        assert_eq!(sampling.logprobs, Some(3));
+        assert_eq!(sampling.n, 2);
+    }
+
+    #[test]
+    fn vllm_response_maps_to_worker_contract() {
+        let response = from_vllm_response(
+            "vllm-2",
+            vllm::GenerateResponse {
+                response: Some(vllm::generate_response::Response::Complete(
+                    vllm::GenerateComplete {
+                        output_ids: vec![42, 43],
+                        finish_reason: "stop".to_string(),
+                        completion_tokens: 2,
+                        matched_stop: Some(vllm::generate_complete::MatchedStop::MatchedTokenId(
+                            43,
+                        )),
+                        ..Default::default()
+                    },
+                )),
+            },
+        );
+
+        let Some(proto::generate_response::Response::Complete(complete)) = response.response else {
+            panic!("expected completion")
+        };
+        assert_eq!(response.request_id, "vllm-2");
+        assert_eq!(complete.output_ids, vec![42, 43]);
+        assert_eq!(complete.completion_tokens, 2);
+        assert_eq!(
+            complete.matched_stop,
+            Some(proto::generate_complete::MatchedStop::MatchedTokenId(43))
+        );
+    }
+
+    #[test]
+    fn worker_admission_rejects_overload_and_recovers_after_drop() {
+        let permits = Arc::new(Semaphore::new(1));
+        let first = try_acquire_worker_permit(Some(&permits)).expect("first permit");
+        let overloaded = try_acquire_worker_permit(Some(&permits)).expect_err("limit reached");
+        assert_eq!(overloaded.code(), tonic::Code::ResourceExhausted);
+        drop(first);
+        assert!(try_acquire_worker_permit(Some(&permits)).is_ok());
+        assert!(try_acquire_worker_permit(None).is_ok());
+    }
+
+    #[test]
+    fn worker_lifecycle_rejects_new_requests_while_draining() {
+        let serving = Arc::new(AtomicBool::new(true));
+        assert!(ensure_worker_serving(Some(&serving)).is_ok());
+        serving.store(false, Ordering::Release);
+        let draining = ensure_worker_serving(Some(&serving)).expect_err("draining rejects");
+        assert_eq!(draining.code(), tonic::Code::Unavailable);
+        assert!(ensure_worker_serving(None).is_ok());
     }
 
     #[test]

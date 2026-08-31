@@ -25,7 +25,7 @@ use smg_grpc_client::worker_proto::{
     worker_control_server::{WorkerControl, WorkerControlServer as TonicWorkerControlServer},
 };
 use smg_grpc_client::{
-    worker_inference::SglangWorkerInference,
+    worker_inference::EngineWorkerInference,
     worker_inference_proto::worker_inference_server::WorkerInferenceServer,
 };
 use tokio::sync::oneshot;
@@ -58,6 +58,7 @@ impl PythonWorkerControl {
             model_ids: config.model_ids.clone(),
             features: config.features.clone(),
         };
+        let engine_attributes = config.engine_attributes.clone();
         Self {
             state: Arc::new(BridgeState {
                 identity: proto::WorkerIdentity {
@@ -75,7 +76,7 @@ impl PythonWorkerControl {
                     features: config.features,
                     engines: vec![engine],
                     max_concurrent_requests: config.max_concurrent_requests,
-                    attributes: HashMap::new(),
+                    attributes: engine_attributes.clone(),
                 },
                 topology: proto::WorkerTopology {
                     worker_id: config.worker_id,
@@ -89,7 +90,7 @@ impl PythonWorkerControl {
                         data_parallel_rank: None,
                         tensor_parallel_rank: None,
                         pipeline_parallel_rank: None,
-                        attributes: HashMap::new(),
+                        attributes: engine_attributes,
                     }],
                     observed_at: Some(now()),
                 },
@@ -186,6 +187,7 @@ struct BridgeConfig {
     model_ids: Vec<String>,
     features: Vec<String>,
     max_concurrent_requests: u32,
+    engine_attributes: HashMap<String, String>,
     health: Arc<Mutex<HealthSnapshot>>,
 }
 
@@ -194,6 +196,7 @@ struct BridgeConfig {
 pub struct PyWorkerControlServer {
     address: String,
     health: Arc<Mutex<HealthSnapshot>>,
+    serving: Arc<AtomicBool>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
     done: Mutex<Option<Receiver<()>>>,
@@ -217,6 +220,7 @@ impl PyWorkerControlServer {
         features = None,
         max_concurrent_requests = 0,
         inference_enabled = false,
+        engine_attributes = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -233,6 +237,7 @@ impl PyWorkerControlServer {
         features: Option<Vec<String>>,
         max_concurrent_requests: u32,
         inference_enabled: bool,
+        engine_attributes: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         if worker_id.trim().is_empty() {
             return Err(PyValueError::new_err("worker_id must not be empty"));
@@ -250,9 +255,12 @@ impl PyWorkerControlServer {
             state: proto::WorkerHealthState::Starting,
             message: "starting".to_string(),
         }));
+        let serving = Arc::new(AtomicBool::new(false));
         let inference = inference_enabled.then(|| InferenceConfig {
             engine_type: engine_type.clone(),
             engine_endpoint: engine_endpoint.clone(),
+            max_concurrent_requests,
+            serving: Arc::clone(&serving),
         });
         let config = BridgeConfig {
             worker_id: worker_id.clone(),
@@ -266,6 +274,7 @@ impl PyWorkerControlServer {
             model_ids,
             features: features.unwrap_or_else(|| vec!["generate".to_string()]),
             max_concurrent_requests,
+            engine_attributes: engine_attributes.unwrap_or_default(),
             health: Arc::clone(&health),
         };
         py.detach(|| {
@@ -273,6 +282,7 @@ impl PyWorkerControlServer {
                 bind_address,
                 PythonWorkerControl::new(config),
                 health,
+                serving,
                 inference,
             )
         })
@@ -296,6 +306,10 @@ impl PyWorkerControlServer {
     #[pyo3(signature = (state, message = String::new()))]
     fn set_health(&self, state: &str, message: String) -> PyResult<()> {
         let state = parse_health_state(state)?;
+        self.serving.store(
+            state == proto::WorkerHealthState::Serving,
+            Ordering::Release,
+        );
         *lock(&self.health)? = HealthSnapshot { state, message };
         Ok(())
     }
@@ -357,6 +371,7 @@ fn start_server(
     bind_address: SocketAddr,
     service: PythonWorkerControl,
     health: Arc<Mutex<HealthSnapshot>>,
+    serving: Arc<AtomicBool>,
     inference: Option<InferenceConfig>,
 ) -> PyResult<PyWorkerControlServer> {
     let (started_tx, started_rx) = mpsc::sync_channel(1);
@@ -382,25 +397,24 @@ fn start_server(
             let runtime_running = Arc::clone(&thread_running);
             runtime.block_on(async move {
                 let inference = match inference {
-                    Some(config) if config.engine_type.eq_ignore_ascii_case("sglang") => {
-                        match SglangWorkerInference::connect(&config.engine_endpoint).await {
-                            Ok(service) => Some(WorkerInferenceServer::new(service)),
-                            Err(error) => {
-                                let _ = started_tx.send(Err(format!(
-                                    "failed to connect WorkerInference adapter to {}: {error}",
-                                    config.engine_endpoint
-                                )));
-                                return;
-                            }
+                    Some(config) => match EngineWorkerInference::connect(
+                        &config.engine_type,
+                        &config.engine_endpoint,
+                        config.max_concurrent_requests,
+                    )
+                    .await
+                    {
+                        Ok(service) => Some(WorkerInferenceServer::new(
+                            service.with_serving_flag(config.serving),
+                        )),
+                        Err(error) => {
+                            let _ = started_tx.send(Err(format!(
+                                "failed to connect {} WorkerInference adapter to {}: {error}",
+                                config.engine_type, config.engine_endpoint
+                            )));
+                            return;
                         }
-                    }
-                    Some(config) => {
-                        let _ = started_tx.send(Err(format!(
-                            "WorkerInference adapter is not implemented for engine {}",
-                            config.engine_type
-                        )));
-                        return;
-                    }
+                    },
                     None => None,
                 };
                 let listener = match tokio::net::TcpListener::bind(bind_address).await {
@@ -451,6 +465,7 @@ fn start_server(
     Ok(PyWorkerControlServer {
         address: address.to_string(),
         health,
+        serving,
         shutdown: Mutex::new(Some(shutdown_tx)),
         thread: Mutex::new(Some(thread)),
         done: Mutex::new(Some(done_rx)),
@@ -462,6 +477,8 @@ fn start_server(
 struct InferenceConfig {
     engine_type: String,
     engine_endpoint: String,
+    max_concurrent_requests: u32,
+    serving: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -498,6 +515,7 @@ mod tests {
             model_ids: vec!["model-a".to_string()],
             features: vec!["generate".to_string()],
             max_concurrent_requests: 32,
+            engine_attributes: HashMap::new(),
             health: Arc::clone(&health),
         });
 

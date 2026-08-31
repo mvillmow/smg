@@ -78,7 +78,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
                     });
                 }
             }
-            try_smg_worker_reachable(control_url, timeout)
+            let discovery = try_smg_worker_reachable(control_url, timeout)
                 .await
                 .map_err(|error| WorkflowError::StepFailed {
                     step_id: StepId::new("detect_connection_mode"),
@@ -86,11 +86,33 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
                         "SMG Worker control-plane handshake failed for {control_url}: {error}"
                     ),
                 })?;
+            if config.runtime_type.is_specified()
+                && !discovery.engines.iter().any(|engine| {
+                    engine
+                        .engine_type
+                        .eq_ignore_ascii_case(&config.runtime_type.to_string())
+                })
+            {
+                return Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("detect_connection_mode"),
+                    message: format!(
+                        "SMG Worker {} does not advertise configured runtime {}; engines={:?}",
+                        discovery.worker_id,
+                        config.runtime_type,
+                        discovery
+                            .engines
+                            .iter()
+                            .map(|engine| engine.engine_type.as_str())
+                            .collect::<Vec<_>>()
+                    ),
+                });
+            }
             debug!(
-                "{} identified as a ready SMG worker over gRPC (inference endpoint {})",
-                control_url, config.url
+                "{} identified as ready SMG worker {} instance {} over gRPC (inference endpoint {})",
+                control_url, discovery.worker_id, discovery.instance_id, config.url
             );
             context.data.connection_mode = Some(ConnectionMode::Grpc);
+            context.data.smg_worker_discovery = Some(discovery);
             return Ok(StepResult::Success);
         }
 

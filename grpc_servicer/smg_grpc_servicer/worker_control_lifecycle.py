@@ -46,6 +46,7 @@ class WorkerControlLifecycle:
         model_ids: Sequence[str],
         features: Sequence[str],
         max_concurrent_requests: int = 0,
+        engine_attributes: Mapping[str, str] | None = None,
         engine_distribution: str | None = None,
         environ: Mapping[str, str] | None = None,
     ) -> WorkerControlLifecycle | None:
@@ -91,6 +92,7 @@ class WorkerControlLifecycle:
             features=list(features),
             max_concurrent_requests=max(0, max_concurrent_requests),
             inference_enabled=inference_enabled,
+            engine_attributes=dict(engine_attributes or {}),
         )
         return cls(server=server)
 

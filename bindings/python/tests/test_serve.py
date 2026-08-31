@@ -685,7 +685,7 @@ class TestSglangWorkerLauncher:
     """Test SglangWorkerLauncher.build_command()."""
 
     def test_build_command_grpc_mode_default(self):
-        """Default connection_mode is grpc, so --grpc-mode should be present."""
+        """gRPC mode uses SGLang's native Rust service on the worker port."""
         launcher = SglangWorkerLauncher()
         args = argparse.Namespace(model_path="/tmp/model", connection_mode="grpc")
         backend_args = ["--model-path", "/tmp/model", "--trust-remote-code"]
@@ -695,8 +695,10 @@ class TestSglangWorkerLauncher:
         assert "--host" in cmd
         assert "127.0.0.1" in cmd
         assert "--port" in cmd
-        assert "31000" in cmd
-        assert "--grpc-mode" in cmd
+        assert cmd[cmd.index("--port") + 1] == "51000"
+        assert cmd[cmd.index("--grpc-port") + 1] == "31000"
+        assert "--grpc-mode" not in cmd
+        assert "--smg-grpc-mode" not in cmd
         for arg in backend_args:
             assert arg in cmd
 
@@ -836,7 +838,18 @@ class TestVllmWorkerLauncher:
 
 
 class TestTokenspeedWorkerLauncher:
-    """Test TokenspeedWorkerLauncher (ZMQ direct-backend only)."""
+    """Test TokenSpeed gRPC and ZMQ launch commands."""
+
+    def test_build_grpc_command(self):
+        launcher = TokenspeedWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="grpc")
+        cmd = launcher.build_command(args, ["--mem-fraction-static", "0.8"], "0.0.0.0", 31000)
+
+        assert "smg_grpc_servicer.tokenspeed" in cmd
+        assert cmd[cmd.index("--model") + 1] == "/tmp/model"
+        assert cmd[cmd.index("--host") + 1] == "0.0.0.0"
+        assert cmd[cmd.index("--port") + 1] == "31000"
+        assert "--mem-fraction-static" in cmd
 
     def test_build_zmq_command(self):
         launcher = TokenspeedWorkerLauncher()
@@ -956,12 +969,11 @@ class TestTokenspeedWorkerLauncher:
         assert "--grammar-backend=none" in cmd
         assert "xgrammar" not in cmd
 
-    def test_build_command_rejects_non_zmq_modes(self):
+    def test_build_command_rejects_http_mode(self):
         launcher = TokenspeedWorkerLauncher()
-        for mode in ("grpc", "http"):
-            args = argparse.Namespace(model="/tmp/model", connection_mode=mode)
-            with pytest.raises(ValueError, match="only supports --connection-mode zmq"):
-                launcher.build_command(args, [], "127.0.0.1", 31000)
+        args = argparse.Namespace(model="/tmp/model", connection_mode="http")
+        with pytest.raises(ValueError, match="supports grpc and zmq"):
+            launcher.build_command(args, [], "127.0.0.1", 31000)
 
     def test_worker_url_is_ipc(self):
         launcher = TokenspeedWorkerLauncher()
@@ -1295,7 +1307,10 @@ def _make_args(**overrides):
         "worker_host": "127.0.0.1",
         "worker_base_port": 31000,
         "worker_startup_timeout": 10,
+        "worker_control_base_port": 41000,
+        "worker_drain_secs": 5.0,
         "model_path": "/tmp/model",
+        "router_worker_mode": "engine",
         # router args with router_ prefix
         "router_policy": "cache_aware",
         "router_pd_disaggregation": False,
@@ -1365,6 +1380,75 @@ class TestServeOrchestrator:
             "grpc://127.0.0.1:32000",
             "grpc://127.0.0.1:32003",
         ]
+
+    def test_build_router_args_two_tier_uses_sidecar_urls(self):
+        args = _make_args(
+            backend="vllm",
+            model="/tmp/m",
+            data_parallel_size=2,
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator("vllm", args, [])
+        orch.workers = [(MagicMock(), 32000), (MagicMock(), 32003)]
+        orch.sidecars = [
+            (MagicMock(), 41000, 32000),
+            (MagicMock(), 41003, 32003),
+        ]
+
+        from types import SimpleNamespace
+
+        router_args = SimpleNamespace(
+            worker_mode="engine",
+            backend="sglang",
+            disable_retries=False,
+            disable_circuit_breaker=False,
+            policy="cache_aware",
+        )
+        with patch("smg.serve.RouterArgs.from_cli_args", return_value=router_args):
+            result = orch._build_router_args()
+
+        assert result.worker_urls == [
+            "grpc://127.0.0.1:41000",
+            "grpc://127.0.0.1:41003",
+        ]
+        assert result.worker_mode == "smg"
+        assert result.backend == "vllm"
+
+    def test_launch_two_tier_sidecars_for_tokenspeed(self):
+        args = _make_args(
+            backend="tokenspeed",
+            model="/tmp/m",
+            data_parallel_size=1,
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator("tokenspeed", args, ["--max-num-seqs", "64"])
+        orch.workers = [(MagicMock(), 31000)]
+        proc = MagicMock(pid=1234)
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=proc) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert "smg.worker_sidecar" in command
+        assert command[command.index("--engine-type") + 1] == "tokenspeed"
+        assert command[command.index("--engine-endpoint") + 1] == ("grpc://127.0.0.1:31000")
+        assert command[command.index("--max-concurrent-requests") + 1] == "64"
+        assert orch.sidecars == [(proc, 41000, 31000)]
+
+    def test_two_tier_rejects_non_grpc_engine_transport(self):
+        args = _make_args(
+            backend="tokenspeed",
+            model="/tmp/m",
+            data_parallel_size=1,
+            connection_mode="zmq",
+            router_worker_mode="smg",
+        )
+        orch = ServeOrchestrator("tokenspeed", args, [])
+        orch.workers = [(MagicMock(), 31000)]
+
+        with pytest.raises(ValueError, match="requires --connection-mode grpc"):
+            orch._launch_sidecars()
 
     def test_build_router_args_zmq_forwards_backend(self):
         """ZMQ workers cannot be runtime-probed: serve's --backend must reach

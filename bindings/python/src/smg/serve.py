@@ -239,6 +239,11 @@ class SglangWorkerLauncher(WorkerLauncher):
     def build_command(
         self, args: argparse.Namespace, backend_args: list[str], host: str, port: int
     ) -> list[str]:
+        mode = getattr(args, "connection_mode", "grpc")
+        # Native SGLang gRPC runs alongside HTTP and requires a distinct port.
+        # Keep the externally advertised worker port for gRPC; the auxiliary
+        # HTTP frontend is not routed to and lives in a disjoint port band.
+        http_port = port + 20000 if port <= 45535 else port - 20000
         cmd = [
             sys.executable,
             "-m",
@@ -248,17 +253,27 @@ class SglangWorkerLauncher(WorkerLauncher):
             "--host",
             host,
             "--port",
-            str(port),
+            str(http_port if mode == "grpc" else port),
         ]
-        if getattr(args, "connection_mode", "grpc") == "grpc":
-            cmd.append("--grpc-mode")
+        if mode == "grpc":
+            cmd.extend(["--grpc-port", str(port)])
 
-        if getattr(args, "connection_mode", "grpc") == "http" and getattr(
-            args, "enable_token_usage_details", False
-        ):
+        if mode == "http" and getattr(args, "enable_token_usage_details", False):
             cmd.append("--enable-cache-report")
 
-        cmd.extend(self._filter_backend_args(backend_args, ["--model-path", "--host", "--port"]))
+        cmd.extend(
+            self._filter_backend_args(
+                backend_args,
+                [
+                    "--model-path",
+                    "--host",
+                    "--port",
+                    "--grpc-port",
+                    "--grpc-mode",
+                    "--smg-grpc-mode",
+                ],
+            )
+        )
         return cmd
 
 
@@ -349,7 +364,7 @@ class VllmWorkerLauncher(WorkerLauncher):
 
 
 class TokenspeedWorkerLauncher(WorkerLauncher):
-    """Launcher for TokenSpeed inference workers (ZMQ direct-backend only)."""
+    """Launcher for TokenSpeed inference workers over gRPC or direct ZMQ."""
 
     def _get_tp_size(self, args: argparse.Namespace) -> int:
         return getattr(args, "tensor_parallel_size", 1) or 1
@@ -357,12 +372,24 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
     def build_command(
         self, args: argparse.Namespace, backend_args: list[str], host: str, port: int
     ) -> list[str]:
-        if getattr(args, "connection_mode", "grpc") != "zmq":
-            raise ValueError(
-                "TokenSpeed backend only supports --connection-mode zmq "
-                "(the headless engine speaks the ZMQ direct-backend wire)"
-            )
-        return self._build_zmq_command(args, backend_args, port)
+        mode = getattr(args, "connection_mode", "grpc")
+        if mode == "zmq":
+            return self._build_zmq_command(args, backend_args, port)
+        if mode != "grpc":
+            raise ValueError("TokenSpeed backend supports grpc and zmq connection modes")
+        cmd = [
+            sys.executable,
+            "-m",
+            "smg_grpc_servicer.tokenspeed",
+            "--model",
+            getattr(args, "model", ""),
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
+        cmd.extend(self._filter_backend_args(backend_args, ["--model", "--host", "--port"]))
+        return cmd
 
     def _build_zmq_command(
         self, args: argparse.Namespace, backend_args: list[str], port: int
@@ -751,8 +778,8 @@ def add_serve_args(parser: argparse.ArgumentParser) -> None:
         choices=["grpc", "http", "zmq"],
         help=(
             "Connection mode for workers (default: grpc). Note: trtllm only "
-            "supports grpc, tokenspeed only supports zmq, and zmq is otherwise "
-            "only supported for the vllm backend"
+            "supports grpc; TokenSpeed supports grpc and zmq; and zmq is "
+            "otherwise only supported for the vllm backend"
         ),
     )
     # Router host/port - may be overridden by backend (e.g. sglang)
@@ -792,6 +819,18 @@ def add_serve_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=300,
         help="Seconds to wait for workers to become healthy (default: 300)",
+    )
+    group.add_argument(
+        "--worker-control-base-port",
+        type=int,
+        default=41000,
+        help="Base port for two-tier SMG Worker sidecars (default: 41000)",
+    )
+    group.add_argument(
+        "--worker-drain-secs",
+        type=float,
+        default=5.0,
+        help="Seconds an SMG Worker drains active streams before exit (default: 5)",
     )
     group.add_argument(
         "--enable-token-usage-details",
@@ -877,6 +916,7 @@ class ServeOrchestrator:
         self.backend_args = backend_args
         self.launcher: WorkerLauncher = BACKEND_LAUNCHERS[backend]()
         self.workers: list[tuple[subprocess.Popen, int]] = []
+        self.sidecars: list[tuple[subprocess.Popen, int, int]] = []
         self._shutting_down = False
 
     # -- public API ---------------------------------------------------------
@@ -889,6 +929,9 @@ class ServeOrchestrator:
         try:
             self._launch_workers()
             self._wait_healthy()
+            if self._uses_two_tier_workers():
+                self._launch_sidecars()
+                self._wait_sidecars_healthy()
             router_args = self._build_router_args()
             launch_router(router_args)
         finally:
@@ -930,13 +973,96 @@ class ServeOrchestrator:
                     f"Worker on port {port} not healthy within {self.args.worker_startup_timeout}s"
                 )
 
+    def _uses_two_tier_workers(self) -> bool:
+        return getattr(self.args, "router_worker_mode", "engine") == "smg"
+
+    def _launch_sidecars(self) -> None:
+        if getattr(self.args, "connection_mode", "grpc") != "grpc":
+            raise ValueError("--router-worker-mode smg requires --connection-mode grpc")
+        if self.backend not in ("sglang", "vllm", "tokenspeed"):
+            raise ValueError(f"two-tier SMG Workers do not support backend {self.backend}")
+
+        control_ports = _find_available_ports(self.args.worker_control_base_port, len(self.workers))
+        model_id = getattr(self.args, "model", None) or getattr(self.args, "model_path", None)
+        if not model_id:
+            raise ValueError("two-tier SMG Workers require a model identifier")
+        max_concurrent_requests = _backend_arg_int(self.backend_args, "--max-num-seqs", 0)
+        for dp_rank, ((_, engine_port), control_port) in enumerate(
+            zip(self.workers, control_ports, strict=True)
+        ):
+            cmd = [
+                sys.executable,
+                "-m",
+                "smg.worker_sidecar",
+                "--bind-address",
+                f"0.0.0.0:{control_port}",
+                "--worker-id",
+                f"smg-{self.backend}-{dp_rank}",
+                "--engine-type",
+                self.backend,
+                "--engine-endpoint",
+                f"grpc://{self.args.worker_host}:{engine_port}",
+                "--model-id",
+                model_id,
+                "--max-concurrent-requests",
+                str(max_concurrent_requests),
+                "--drain-secs",
+                str(self.args.worker_drain_secs),
+            ]
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            logger.info("Launching SMG Worker sidecar with command: %s", " ".join(cmd))
+            proc = subprocess.Popen(
+                cmd,
+                start_new_session=True,
+                env=env,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+            )
+            self.sidecars.append((proc, control_port, engine_port))
+
+    def _wait_sidecars_healthy(self) -> None:
+        host = self.args.worker_host
+        for proc, control_port, _ in self.sidecars:
+            deadline = time.monotonic() + self.args.worker_startup_timeout
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    raise RuntimeError(
+                        f"SMG Worker sidecar on port {control_port} exited "
+                        f"with code {proc.returncode}"
+                    )
+                try:
+                    with socket.create_connection((host, control_port), timeout=1.0):
+                        logger.info(
+                            "SMG Worker sidecar on %s:%d is accepting connections",
+                            host,
+                            control_port,
+                        )
+                        break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                raise TimeoutError(
+                    f"SMG Worker sidecar on port {control_port} not healthy within "
+                    f"{self.args.worker_startup_timeout}s"
+                )
+
     def _build_router_args(self) -> RouterArgs:
-        worker_urls = [
-            self.launcher.worker_url(self.args, self.args.worker_host, port)
-            for _, port in self.workers
-        ]
+        if self._uses_two_tier_workers():
+            worker_urls = [
+                f"grpc://{self.args.worker_host}:{control_port}"
+                for _, control_port, _ in self.sidecars
+            ]
+        else:
+            worker_urls = [
+                self.launcher.worker_url(self.args, self.args.worker_host, port)
+                for _, port in self.workers
+            ]
         router_args = RouterArgs.from_cli_args(self.args, use_router_prefix=True)
         router_args.worker_urls = worker_urls
+        if self._uses_two_tier_workers():
+            router_args.worker_mode = "smg"
+            router_args.backend = self.backend
         # The ZMQ handshake is shared across engine runtimes, so the router
         # cannot probe the wire protocol; forward the serve backend so the Rust
         # side stamps the startup workers' runtime. (RouterArgs.backend
@@ -988,11 +1114,21 @@ class ServeOrchestrator:
 
     def _cleanup_workers(self) -> None:
         """SIGTERM all worker process groups, wait, then SIGKILL stragglers."""
-        if not self.workers:
+        if not self.workers and not self.sidecars:
+            return
+
+        # Sidecars transition to DRAINING on SIGTERM, reject new requests, and
+        # keep the engine alive until active streams have had time to finish.
+        self._terminate_processes([(proc, port) for proc, port, _ in self.sidecars])
+        self._terminate_processes(self.workers)
+
+    @staticmethod
+    def _terminate_processes(processes: list[tuple[subprocess.Popen, int]]) -> None:
+        if not processes:
             return
 
         # Send SIGTERM to each process group
-        for proc, port in self.workers:
+        for proc, _ in processes:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
@@ -1000,7 +1136,7 @@ class ServeOrchestrator:
 
         # Wait up to _WORKER_SHUTDOWN_TIMEOUT seconds for graceful exit
         deadline = time.monotonic() + _WORKER_SHUTDOWN_TIMEOUT
-        for proc, port in self.workers:
+        for proc, _ in processes:
             remaining = max(0, deadline - time.monotonic())
             try:
                 proc.wait(timeout=remaining)

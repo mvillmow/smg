@@ -2,6 +2,9 @@
 
 Status: draft implementation on `feat/two-tier-router-worker`
 
+Scope for this change is text generation only. LoRA management is explicitly
+excluded and will be implemented in a separate PR.
+
 ## Decision
 
 Split SMG into a fleet-level Router and a node-local Worker. The Router owns
@@ -109,48 +112,63 @@ must fail closed. An unexpected control-server exit also initiates shutdown.
 - The SGLang Worker adapter targets SGLang 0.5.18's native Rust
   `sglang.runtime.v1.SglangService`; it performs typed conversion, streaming,
   backpressure, and abort without a Python gRPC hop.
+- vLLM and TokenSpeed adapters implement the same stable Worker contract over
+  their scheduler gRPC services. Engine-specific messages stay behind the
+  Worker boundary.
 - The PyO3 binding hosts the Rust control server and exposes lifecycle health
-  transitions without putting Python on the request path. Inference remains
-  opt-in so existing control-only deployments do not change behavior.
+  transitions without putting Python on the request path. It uses one
+  constructor for SGLang, vLLM, and TokenSpeed, enforces a bounded request
+  semaphore, and rejects new generation while draining.
+- `smg serve --router-worker-mode smg` starts one Rust Worker sidecar per gRPC
+  engine and routes only to those sidecars. Shutdown drains sidecars before
+  stopping engines. TokenSpeed now supports both gRPC and direct ZMQ launch.
+- SGLang gRPC launch uses the native `--grpc-port` service; `--grpc-mode` is a
+  deprecated legacy Python-servicer path in SGLang 0.5.18.
 - Router registration performs a versioned Worker handshake before admitting
-  an explicit SMG Worker.
+  an explicit SMG Worker. Identity, capabilities, topology, engine attributes,
+  and all model IDs are persisted through registration.
 - Worker specs can carry separate `control_url` and inference `url` values;
   registration and periodic health use only the control endpoint.
-- SGLang's coordinator can opt in to the embedded control server, transitions
-  it after warmup and before drain, and treats unexpected exit as fatal.
-- Static Router workers can select the architecture with
-  `--worker-mode smg --backend sglang`; dynamic registration can additionally
-  provide separate inference and control URLs.
+- Periodic health verifies the process `instance_id`; a restarted Worker is
+  failed closed and must re-register instead of inheriting stale topology.
+- SGLang and TokenSpeed coordinators can opt in to the embedded control server,
+  transition it after warmup and before drain, and advertise model/tokenizer
+  metadata needed by the Router.
 
 ## B200 validation
 
 Validated on a B200 dev host with `lmsysorg/sglang:latest` (0.5.18) and
-`vllm/vllm-openai:latest` (0.28.0). Both images passed direct HTTP generation.
-The full SGLang path also passed non-streaming generation, SSE streaming, and
-client-disconnect cancellation:
+`vllm/vllm-openai:latest` (0.28.0), using `Qwen/Qwen3-1.7B`.
 
-`Router HTTP -> WorkerInference (Rust) -> SGLang native gRPC (Rust) -> B200`.
+Both engines passed the complete non-streaming path, including WorkerControl
+registration, tokenizer discovery, and real GPU generation:
 
-SGLang 0.5.18 currently reads `GenerateReqInput.batch_size` before the async
-generator performs request normalization in its streaming bridge. Moving that
-read inside the first stream iteration made the native stream pass. This is an
-upstream compatibility fix, not an SMG change. The vLLM image has no equivalent
-generic Worker adapter in this slice, so only its engine baseline was tested.
+`Router HTTP -> WorkerInference (Rust) -> native engine gRPC -> B200`.
+
+vLLM also passed SSE streaming and the draining test: after the Worker entered
+`DRAINING`, a new request returned 503 `Worker is not serving`. The OSS vLLM
+image contains `vllm.entrypoints.grpc_server`, but its default installation
+omits the gRPC extra; installing this repository's `smg-grpc-servicer` enables
+the endpoint.
+
+SGLang non-streaming passed through its native Rust gRPC server. Its 0.5.18
+streaming bridge still reads `GenerateReqInput.batch_size` before the async
+generator normalizes the request, so stock-image streaming returns an internal
+error. This is an upstream bridge defect; the Worker adapter's stream mapping
+and abort behavior are covered locally, but stock-image streaming remains
+blocked on that upstream fix.
+
+No TokenSpeed runtime image was available on the dev host. Its Rust adapter,
+request/response conversion, gRPC launch command, lifecycle integration, and
+overload/draining behavior are covered by local tests; GPU E2E remains pending.
 
 ## Remaining work
 
-1. Preserve Worker mode and discovered metadata through every registration,
-   replacement, mesh, and service-discovery path.
-2. Persist discovered Worker identity, capabilities, and topology as observed
-   metadata instead of treating the handshake as a boolean probe.
-3. Add the vLLM Worker-side adapter behind the same Rust service; do not call
-   Python for every health poll or stream chunk.
-4. Route Two-Tier pools only to SMG Workers and keep legacy engine pools
-   isolated.
-5. Extend the protocol only after separate contracts exist for embedding,
-   multimodal, and PD/EPD workloads.
-6. Add B200 overload and coordinator-shutdown tests, then run the same complete
-   path through the future vLLM Worker adapter.
+1. Land or consume the SGLang native streaming bridge fix.
+2. Run TokenSpeed GPU E2E when a compatible image is available.
+3. Add separate contracts before enabling embedding, multimodal, or PD/EPD
+   workloads; do not leak engine-specific fields into Worker v1.
+4. Add benchmark results before claiming a Rust performance improvement.
 
 ## Upstream alignment
 

@@ -24,7 +24,8 @@ use openai_protocol::{
 use smg_grpc_client::{
     common_proto, connect_channel_with_timeout,
     worker_proto::{
-        worker_control_client::WorkerControlClient, GetHealthRequest, WorkerHealthState,
+        worker_control_client::WorkerControlClient, GetHealthRequest, GetIdentityRequest,
+        WorkerHealthState,
     },
     WorkerInferenceClient,
 };
@@ -1782,7 +1783,48 @@ impl Worker for BasicWorker {
                     state = state.as_str_name(),
                     "SMG Worker control health response"
                 );
-                Ok(state == WorkerHealthState::Serving)
+                if state != WorkerHealthState::Serving {
+                    return Ok(false);
+                }
+
+                let Some(expected_instance_id) = self.metadata.spec.labels.get("smg.instance_id")
+                else {
+                    return Ok(true);
+                };
+                match time::timeout(timeout, client.get_identity(GetIdentityRequest {})).await {
+                    Ok(Ok(response)) => {
+                        let observed = response
+                            .into_inner()
+                            .identity
+                            .map(|identity| identity.instance_id)
+                            .unwrap_or_default();
+                        if observed != *expected_instance_id {
+                            tracing::warn!(
+                                control_url,
+                                expected_instance_id,
+                                observed_instance_id = observed,
+                                "SMG Worker instance changed; forcing re-registration"
+                            );
+                            return Ok(false);
+                        }
+                        Ok(true)
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            control_url,
+                            %error,
+                            "SMG Worker identity RPC failed during restart check"
+                        );
+                        Ok(false)
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            control_url,
+                            "SMG Worker identity RPC timed out during restart check"
+                        );
+                        Ok(false)
+                    }
+                }
             }
             Ok(Err(error)) => {
                 tracing::warn!(control_url, %error, "SMG Worker control health RPC failed");
@@ -2095,9 +2137,15 @@ mod tests {
     impl WorkerControlService for ServingWorkerControl {
         async fn get_identity(
             &self,
-            _request: Request<worker_proto::GetIdentityRequest>,
+            _request: Request<GetIdentityRequest>,
         ) -> Result<Response<worker_proto::GetIdentityResponse>, Status> {
-            Err(Status::unimplemented("not needed by periodic health test"))
+            Ok(Response::new(worker_proto::GetIdentityResponse {
+                identity: Some(worker_proto::WorkerIdentity {
+                    worker_id: "worker-a".to_string(),
+                    instance_id: "instance-a".to_string(),
+                    ..Default::default()
+                }),
+            }))
         }
 
         async fn get_capabilities(
@@ -2153,6 +2201,35 @@ mod tests {
         assert!(worker.check_health_async().await.is_ok());
         assert!(worker.backend_client.load().get().is_none());
         assert!(worker.worker_control_client.get().is_some());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn smg_health_rejects_restarted_instance() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only tonic server is explicitly aborted before the test returns"
+        )]
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(WorkerControlServer::new(ServingWorkerControl))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+        });
+
+        let worker = BasicWorkerBuilder::new(format!("grpc://{address}"))
+            .worker_mode(WorkerMode::Smg)
+            .connection_mode(ConnectionMode::Grpc)
+            .label("smg.instance_id", "stale-instance")
+            .health_config(HealthCheckConfig {
+                timeout_secs: 2,
+                ..HealthCheckConfig::default()
+            })
+            .build();
+        assert!(worker.check_health_async().await.is_err());
 
         server.abort();
     }

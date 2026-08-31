@@ -324,6 +324,11 @@ async def serve_grpc(
             model_ids=model_ids,
             features=["generate" if is_generation else "embed", "abort"],
             max_concurrent_requests=getattr(server_args, "max_running_requests", 0) or 0,
+            engine_attributes={
+                "model_path": server_args.model_path,
+                "tokenizer_path": getattr(server_args, "tokenizer_path", None)
+                or server_args.model_path,
+            },
         )
     except Exception:
         logger.exception("Failed to start the Worker control plane")

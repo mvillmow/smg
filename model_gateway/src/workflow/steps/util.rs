@@ -8,11 +8,14 @@ use smg_grpc_client::{
     connect_channel_with_timeout,
     worker_proto::{
         worker_control_client::WorkerControlClient, GetCapabilitiesRequest, GetHealthRequest,
-        GetIdentityRequest, WorkerHealthState,
+        GetIdentityRequest, GetTopologyRequest, WorkerHealthState,
     },
 };
 
-use crate::routers::grpc::client::GrpcClient;
+use crate::{
+    routers::grpc::client::GrpcClient,
+    workflow::data::{SmgEngineDiscovery, SmgWorkerDiscovery},
+};
 
 fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
     url.get(..scheme.len())
@@ -147,7 +150,10 @@ async fn grpc_transport_reachable(grpc_url: &str, timeout_secs: u64) -> Result<(
 /// identity prevents an arbitrary tonic service from being registered as an
 /// SMG Worker, capabilities enforce the API compatibility boundary, and
 /// health prevents routing to a Worker before its node-local engine is ready.
-pub(crate) async fn try_smg_worker_reachable(url: &str, timeout_secs: u64) -> Result<(), String> {
+pub(crate) async fn try_smg_worker_reachable(
+    url: &str,
+    timeout_secs: u64,
+) -> Result<SmgWorkerDiscovery, String> {
     const SUPPORTED_API_MAJOR: u32 = 1;
 
     let grpc_url = grpc_reachable_url(url)?;
@@ -202,7 +208,68 @@ pub(crate) async fn try_smg_worker_reachable(url: &str, timeout_secs: u64) -> Re
             ));
         }
 
-        Ok(())
+        let topology = client
+            .get_topology(GetTopologyRequest {})
+            .await
+            .map_err(|error| format!("SMG Worker GetTopology failed: {error}"))?
+            .into_inner()
+            .topology
+            .ok_or_else(|| "SMG Worker GetTopology returned no topology".to_string())?;
+        if topology.worker_id != identity.worker_id {
+            return Err(format!(
+                "SMG Worker topology worker_id {:?} does not match identity {:?}",
+                topology.worker_id, identity.worker_id
+            ));
+        }
+        if topology.engines.is_empty() {
+            return Err("SMG Worker topology advertises no engines".to_string());
+        }
+
+        let engines = topology
+            .engines
+            .into_iter()
+            .map(|engine| {
+                let capability = capabilities
+                    .engines
+                    .iter()
+                    .find(|candidate| candidate.engine_type == engine.engine_type);
+                SmgEngineDiscovery {
+                    engine_id: engine.engine_id,
+                    engine_type: engine.engine_type,
+                    engine_version: capability
+                        .map(|value| value.engine_version.clone())
+                        .unwrap_or_default(),
+                    endpoint: engine.endpoint,
+                    model_ids: if engine.model_ids.is_empty() {
+                        capability
+                            .map(|value| value.model_ids.clone())
+                            .unwrap_or_default()
+                    } else {
+                        engine.model_ids
+                    },
+                    features: capability
+                        .map(|value| value.features.clone())
+                        .unwrap_or_default(),
+                    attributes: engine.attributes,
+                }
+            })
+            .collect();
+
+        Ok(SmgWorkerDiscovery {
+            worker_id: identity.worker_id,
+            instance_id: identity.instance_id,
+            hostname: identity.hostname,
+            zone: identity.zone,
+            version: identity.version,
+            identity_labels: identity.labels,
+            api_major: capabilities.api_major,
+            api_minor: capabilities.api_minor,
+            features: capabilities.features,
+            max_concurrent_requests: capabilities.max_concurrent_requests,
+            capability_attributes: capabilities.attributes,
+            topology_version: topology.topology_version,
+            engines,
+        })
     };
 
     tokio::time::timeout(timeout, handshake)
@@ -444,7 +511,12 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             match try_smg_worker_reachable(&endpoint, 1).await {
-                Ok(()) => break,
+                Ok(discovery) => {
+                    assert_eq!(discovery.worker_id, "mock-127.0.0.1");
+                    assert_eq!(discovery.engines.len(), 1);
+                    assert_eq!(discovery.engines[0].model_ids, ["mock-model"]);
+                    break;
+                }
                 Err(error) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     tracing::debug!(%error, "waiting for mock Worker control plane");

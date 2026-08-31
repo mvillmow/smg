@@ -20,6 +20,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.scheduler_launcher import launch_engine
 from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
+from smg_grpc_servicer.worker_control_lifecycle import WorkerControlLifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -168,10 +169,50 @@ async def serve_grpc(server_args: ServerArgs) -> None:
 
     await server.start()
 
+    advertised_model = (
+        getattr(server_args, "served_model_name", None)
+        or getattr(server_args, "model", None)
+        or getattr(server_args, "model_path", "")
+    )
+    model_ids = (
+        list(advertised_model)
+        if isinstance(advertised_model, (list, tuple))
+        else [advertised_model]
+    )
+    try:
+        worker_control = WorkerControlLifecycle.start_from_env(
+            engine_type="tokenspeed",
+            engine_distribution="tokenspeed",
+            model_ids=model_ids,
+            features=[
+                "encode" if server_args.disaggregation_mode == "encode" else "generate",
+                "abort",
+            ],
+            max_concurrent_requests=(
+                getattr(server_args, "max_running_requests", 0)
+                or getattr(server_args, "max_num_seqs", 0)
+                or 0
+            ),
+            engine_attributes={
+                "model_path": model_ids[0],
+                "tokenizer_path": (
+                    getattr(server_args, "tokenizer", None)
+                    or getattr(server_args, "tokenizer_path", None)
+                    or model_ids[0]
+                ),
+            },
+        )
+    except Exception:
+        logger.exception("Failed to start the Worker control plane")
+        health_servicer.set_not_serving()
+        await server.stop(0)
+        await servicer.shutdown()
+        raise
+
     # Warmup on a background thread so the async server can handle the probe.
     warmup_thread = threading.Thread(
         target=_wait_and_warmup,
-        args=(server_args, health_servicer),
+        args=(server_args, health_servicer, worker_control),
         daemon=True,
     )
     warmup_thread.start()
@@ -194,6 +235,12 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         await stop_event.wait()
     finally:
         logger.info("Shutting down TokenSpeed gRPC server")
+        if worker_control is not None:
+            try:
+                worker_control.mark_draining()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to mark the Worker control plane as draining")
+        health_servicer.set_not_serving()
         try:
             await servicer.shutdown()
         except Exception:  # noqa: BLE001
@@ -204,6 +251,12 @@ async def serve_grpc(server_args: ServerArgs) -> None:
             except Exception:  # noqa: BLE001
                 logger.exception("discovery_servicer.shutdown() raised")
         await server.stop(5.0)
+        if worker_control is not None:
+            try:
+                worker_control.mark_not_serving()
+                await asyncio.to_thread(worker_control.stop, 5.0)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to stop the Worker control plane cleanly")
         if warmup_thread.is_alive():
             warmup_thread.join(timeout=5.0)
 
@@ -211,6 +264,7 @@ async def serve_grpc(server_args: ServerArgs) -> None:
 def _wait_and_warmup(
     server_args: ServerArgs,
     health_servicer: TokenSpeedHealthServicer,
+    worker_control: WorkerControlLifecycle | None = None,
 ) -> None:
     """Probe the gRPC server until it can generate one token, then set SERVING.
 
@@ -220,6 +274,8 @@ def _wait_and_warmup(
     if os.getenv("TOKENSPEED_SKIP_GRPC_WARMUP", "0").lower() in ("1", "true", "yes"):
         logger.info("TOKENSPEED_SKIP_GRPC_WARMUP=1 — skipping warmup")
         health_servicer.set_serving()
+        if worker_control is not None:
+            worker_control.mark_serving()
         return
 
     if server_args.disaggregation_mode == "encode":
@@ -228,6 +284,8 @@ def _wait_and_warmup(
         # the LM, SIGUSR1-killing the encode TP group. Skip it for this role.
         logger.info("encode role — skipping Generate warmup (no LM)")
         health_servicer.set_serving()
+        if worker_control is not None:
+            worker_control.mark_serving()
         return
 
     # Wildcard bind hosts aren't routable as destinations; dial loopback instead.
@@ -297,6 +355,8 @@ def _wait_and_warmup(
 
     if warmup_ok:
         health_servicer.set_serving()
+        if worker_control is not None:
+            worker_control.mark_serving()
         logger.info("TokenSpeed gRPC server is ready to serve")
     else:
         # Stays NOT_SERVING so K8s readiness keeps this worker out of rotation.

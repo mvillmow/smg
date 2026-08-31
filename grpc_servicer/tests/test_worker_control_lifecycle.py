@@ -57,6 +57,7 @@ def test_builds_shared_server_contract_and_drives_health(fake_smg):
         model_ids=["model-a"],
         features=["generate", "abort"],
         max_concurrent_requests=32,
+        engine_attributes={"model_path": "model-a"},
         environ={
             "SMG_WORKER_CONTROL_BIND_ADDRESS": "0.0.0.0:31000",
             "SMG_WORKER_ENGINE_ENDPOINT": "grpc://worker-a:32000",
@@ -72,6 +73,7 @@ def test_builds_shared_server_contract_and_drives_health(fake_smg):
     assert lifecycle.server.kwargs["features"] == ["generate", "abort"]
     assert lifecycle.server.kwargs["max_concurrent_requests"] == 32
     assert lifecycle.server.kwargs["inference_enabled"] is False
+    assert lifecycle.server.kwargs["engine_attributes"] == {"model_path": "model-a"}
 
     lifecycle.mark_serving()
     lifecycle.mark_draining()

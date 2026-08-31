@@ -530,6 +530,8 @@ struct Router {
     max_buffered_request_bytes: u64,
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
+    /// Appended last for positional constructor compatibility.
+    worker_mode: worker::WorkerMode,
 }
 
 impl Router {
@@ -816,8 +818,11 @@ impl Router {
         // probed. HTTP/gRPC keep auto-detection (None). Mirrors
         // `to_router_config` in model_gateway/src/main.rs.
         let startup_worker_runtime_type =
-            if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
+            if matches!(self.connection_mode, worker::ConnectionMode::Zmq)
+                || self.worker_mode == worker::WorkerMode::Smg
+            {
                 match self.backend {
+                    BackendType::Sglang => Some(worker::RuntimeType::Sglang),
                     BackendType::Vllm => Some(worker::RuntimeType::Vllm),
                     BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
                     _ => None,
@@ -835,6 +840,7 @@ impl Router {
             .health_check_port(self.health_check_port)
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
+            .startup_worker_mode(self.worker_mode)
             .zmq_engine_count(self.zmq_engine_count)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
@@ -1096,12 +1102,9 @@ impl Router {
         max_buffered_request_bytes = 1_048_576,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
+        worker_mode = String::from("engine"),
     ))]
     #[expect(clippy::too_many_arguments)]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "PyO3 #[new] method signature requires PyResult"
-    )]
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
@@ -1248,6 +1251,7 @@ impl Router {
         max_buffered_request_bytes: u64,
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
+        worker_mode: String,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1268,6 +1272,9 @@ impl Router {
         }
 
         let connection_mode = Self::determine_connection_mode(&all_urls);
+        let worker_mode = worker_mode
+            .parse::<worker::WorkerMode>()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
         Ok(Router {
             host,
@@ -1414,6 +1421,7 @@ impl Router {
             max_buffered_request_bytes,
             kv_connector_annotation,
             kv_engine_id_annotation,
+            worker_mode,
         })
     }
 

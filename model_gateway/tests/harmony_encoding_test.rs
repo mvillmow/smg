@@ -43,6 +43,7 @@ fn context(
             worker_kind: Some(kind),
             connection_mode: Some(connection),
             detected_runtime_type: None,
+            smg_worker_discovery: None,
             discovered_labels: Default::default(),
             dp_info: None,
             model_cards: Vec::new(),

@@ -287,6 +287,7 @@ pub fn create_worker_workflow_data(
         worker_kind: None,
         connection_mode: None,
         detected_runtime_type: None,
+        smg_worker_discovery: None,
         discovered_labels: std::collections::HashMap::new(),
         dp_info: None,
         model_cards: Vec::new(),
