@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use common::Rng;
 use kv_index::{compute_request_content_hashes, RadixTree as _, StringTree, TokenTree};
-use radix_tree::{Config, HolderId, RadixTree};
+use radix_tree::{Config, HolderId, OverlapScratch, RadixTree};
 
 const TENANTS: usize = 64;
 const FAMILIES: usize = 400;
@@ -142,6 +142,7 @@ enum Side {
         ids: Vec<HolderId>,
         block: u32,
         out: Vec<radix_tree::Overlap>,
+        qscratch: OverlapScratch,
     },
 }
 
@@ -176,6 +177,7 @@ fn tree_compare() {
                 ids,
                 block,
                 out: Vec::new(),
+                qscratch: OverlapScratch::default(),
             }
         }
     };
@@ -262,11 +264,12 @@ fn tree_compare() {
                     ids,
                     block,
                     out,
+                    qscratch,
                 },
                 Prepared::Blocks(tenant, blocks),
             ) => {
                 let chain: Vec<u64> = blocks.iter().map(|&(_, c)| c).collect();
-                tree.overlap(&chain, out);
+                tree.overlap(&chain, qscratch, out);
                 let (idx, _) = ids[*tenant].parts();
                 out.iter()
                     .find(|o| o.holder.parts().0 == idx)

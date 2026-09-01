@@ -28,7 +28,7 @@ use common::{
     workload::{self, Config as WlConfig},
     Op, Rng,
 };
-use radix_tree::{Config, HolderId, RadixTree, StoreError};
+use radix_tree::{Config, HolderId, OverlapScratch, RadixTree, StoreError};
 
 fn random_config(rng: &mut Rng) -> WlConfig {
     let holders = 2 + rng.below(255);
@@ -56,6 +56,7 @@ struct Subject {
     tree: RadixTree,
     ids: Vec<HolderId>,
     scratch: Vec<radix_tree::Overlap>,
+    qscratch: OverlapScratch,
 }
 
 impl Subject {
@@ -68,6 +69,7 @@ impl Subject {
             tree,
             ids,
             scratch: Vec::new(),
+            qscratch: OverlapScratch::default(),
         }
     }
     fn apply(&mut self, op: &Op) -> bool {
@@ -93,7 +95,7 @@ impl Subject {
     }
     fn overlap(&mut self, query: &[u64]) -> BTreeMap<usize, u32> {
         let scratch = &mut self.scratch;
-        self.tree.overlap(query, scratch);
+        self.tree.overlap(query, &mut self.qscratch, scratch);
         let mut out = BTreeMap::new();
         for o in scratch.iter() {
             out.insert(o.holder.parts().0 as usize, o.depth);
@@ -241,6 +243,7 @@ fn run_one_chaos(seed: u64) {
         let mut stale: Vec<HolderId> = Vec::new();
         let mut answers = Vec::new();
         let mut scratch = Vec::new();
+        let mut qscratch = OverlapScratch::default();
         for (i, op) in script.iter().enumerate() {
             match op {
                 COp::Store {
@@ -298,7 +301,7 @@ fn run_one_chaos(seed: u64) {
                     }
                 }
                 COp::Query { probe } => {
-                    tree.overlap(probe, &mut scratch);
+                    tree.overlap(probe, &mut qscratch, &mut scratch);
                     let mut m = BTreeMap::new();
                     for o in scratch.iter() {
                         m.insert(o.holder.parts().0 as usize, o.depth);

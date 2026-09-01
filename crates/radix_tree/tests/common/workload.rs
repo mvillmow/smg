@@ -115,13 +115,20 @@ pub fn generate(seed: u64, cfg: &Config) -> Workload {
     }
 
     // Assignment + per-holder scripts (sequences that MUST keep their
-    // relative order for that holder).
+    // relative order for that holder). A repeat assignment of the
+    // same family to the same holder re-stores the shared chain
+    // (pure duplicates) but must NOT grow a second divergent tail:
+    // two different keys at one chain position is outside the §7
+    // chain-consistent scope this generator promises (caught by the
+    // enumerate parity check).
     let mut per_holder: Vec<Vec<Op>> = vec![Vec::new(); cfg.holders];
+    let mut tailed: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
     for (fi, family) in families.iter().enumerate() {
         let count = cfg.holders_per_family.0
             + rng.below(cfg.holders_per_family.1 - cfg.holders_per_family.0 + 1);
         for _ in 0..count {
             let holder = rng.below(cfg.holders);
+            let first_assignment = tailed.insert((holder, fi));
             // Base chain in parent-linked batches.
             let mut parent = None;
             let mut batches = Vec::new();
@@ -133,27 +140,30 @@ pub fn generate(seed: u64, cfg: &Config) -> Workload {
                 });
                 parent = Some(batch.last().expect("non-empty").0);
             }
-            // Divergent tail: unique contents, keys mixed with holder
-            // and family so tails never collide.
-            let tail_len = cfg.tail_len.0 + rng.below(cfg.tail_len.1 - cfg.tail_len.0 + 1);
-            let mut tail = Vec::with_capacity(tail_len);
-            let mut prev_key = parent.expect("family non-empty");
-            for _ in 0..tail_len {
-                let content = fresh_content(&mut rng, &mut content_pool, 0);
-                let key = (prev_key ^ content.rotate_left(29))
-                    .wrapping_mul(0x9E3779B97F4A7C15)
-                    .wrapping_add(holder as u64 ^ (fi as u64) << 32)
-                    | 1;
-                tail.push((key, content));
-                prev_key = key;
-            }
-            for batch in tail.chunks(cfg.store_batch) {
-                batches.push(Op::Store {
-                    holder,
-                    parent,
-                    blocks: batch.to_vec(),
-                });
-                parent = Some(batch.last().expect("non-empty").0);
+            // Divergent tail (first assignment only): unique
+            // contents, keys mixed with holder and family so tails
+            // never collide.
+            if first_assignment {
+                let tail_len = cfg.tail_len.0 + rng.below(cfg.tail_len.1 - cfg.tail_len.0 + 1);
+                let mut tail = Vec::with_capacity(tail_len);
+                let mut prev_key = parent.expect("family non-empty");
+                for _ in 0..tail_len {
+                    let content = fresh_content(&mut rng, &mut content_pool, 0);
+                    let key = (prev_key ^ content.rotate_left(29))
+                        .wrapping_mul(0x9E3779B97F4A7C15)
+                        .wrapping_add(holder as u64 ^ (fi as u64) << 32)
+                        | 1;
+                    tail.push((key, content));
+                    prev_key = key;
+                }
+                for batch in tail.chunks(cfg.store_batch) {
+                    batches.push(Op::Store {
+                        holder,
+                        parent,
+                        blocks: batch.to_vec(),
+                    });
+                    parent = Some(batch.last().expect("non-empty").0);
+                }
             }
             // Duplicates: re-send some batches verbatim (later in the
             // holder's script — legal §7 duplication).

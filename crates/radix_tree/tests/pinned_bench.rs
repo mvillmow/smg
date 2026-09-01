@@ -18,7 +18,7 @@ mod common;
 use std::time::Instant;
 
 use common::{oracle::Oracle, Op, Rng};
-use radix_tree::{Config, HolderId, RadixTree};
+use radix_tree::{Config, HolderId, OverlapScratch, RadixTree};
 
 // ---- §11 normative constants (default scale) ----
 // RADIX_BENCH_SCALE=large runs 8x blocks / 8x holders (~20 GB peak,
@@ -216,7 +216,12 @@ fn side() -> String {
 #[allow(clippy::large_enum_variant)] // bench-local, two instances ever
 enum Sider {
     Oracle(Oracle, Vec<Vec<u64>>),
-    R1(RadixTree, Vec<HolderId>, Vec<radix_tree::Overlap>),
+    R1(
+        RadixTree,
+        Vec<HolderId>,
+        Vec<radix_tree::Overlap>,
+        OverlapScratch,
+    ),
 }
 
 impl Sider {
@@ -239,7 +244,7 @@ impl Sider {
                     chain.extend(blocks.iter().map(|&(k, _)| k));
                 }
             }
-            Sider::R1(tree, ids, _) => match op {
+            Sider::R1(tree, ids, _, _) => match op {
                 Op::Store {
                     holder,
                     parent,
@@ -258,8 +263,8 @@ impl Sider {
     fn query(&mut self, q: &[u64]) -> usize {
         match self {
             Sider::Oracle(oracle, _) => oracle.overlap(q).len(),
-            Sider::R1(tree, _, out) => {
-                tree.overlap(q, out);
+            Sider::R1(tree, _, out, qscratch) => {
+                tree.overlap(q, qscratch, out);
                 out.len()
             }
         }
@@ -297,7 +302,7 @@ fn pinned_workload() {
             let ids = (0..holders())
                 .map(|h| tree.create_holder(&format!("holder-{h}")))
                 .collect();
-            Sider::R1(tree, ids, Vec::new())
+            Sider::R1(tree, ids, Vec::new(), OverlapScratch::default())
         }
         _ => Sider::Oracle(Oracle::new(holders()), vec![Vec::new(); holders()]),
     };

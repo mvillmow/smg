@@ -22,13 +22,14 @@ use common::{
     oracle::Oracle,
     workload, Op,
 };
-use radix_tree::{Config, HolderId, RadixTree, StoreError};
+use radix_tree::{Config, HolderId, OverlapScratch, RadixTree, StoreError};
 
 /// The implementation under test, driven by the harness Op protocol.
 struct Subject {
     tree: RadixTree,
     ids: Vec<HolderId>,
     scratch: Vec<radix_tree::Overlap>,
+    qscratch: OverlapScratch,
 }
 
 impl Subject {
@@ -41,6 +42,7 @@ impl Subject {
             tree,
             ids,
             scratch: Vec::new(),
+            qscratch: OverlapScratch::default(),
         }
     }
 
@@ -69,7 +71,7 @@ impl Subject {
 
     fn overlap(&mut self, query: &[u64]) -> BTreeMap<usize, u32> {
         let scratch = &mut self.scratch;
-        self.tree.overlap(query, scratch);
+        self.tree.overlap(query, &mut self.qscratch, scratch);
         let mut out = BTreeMap::new();
         for o in scratch.iter() {
             out.insert(o.holder.parts().0 as usize, o.depth);
@@ -138,14 +140,27 @@ fn run_differential(seed: u64, cfg: &workload::Config) -> Census {
             );
         }
     }
-    // Terminal per-holder accounting parity.
+    // Terminal per-holder accounting, enumeration, and distinct-entry
+    // parity (review finding: these observables were never
+    // model-checked).
     for h in 0..wl.holders {
         assert_eq!(
             subject.tree.holder_blocks(subject.ids[h]),
             model.holder_blocks(h),
             "holder_blocks diverged for holder {h} (seed {seed})"
         );
+        let got: Vec<(u32, u64, u64)> = subject.tree.enumerate(subject.ids[h]).collect();
+        assert_eq!(
+            got,
+            model.enumerate(h),
+            "enumerate diverged for holder {h} (seed {seed})"
+        );
     }
+    assert_eq!(
+        subject.tree.stats().distinct_entries,
+        model.distinct_entries(),
+        "distinct_entries diverged (seed {seed})"
+    );
     census
 }
 

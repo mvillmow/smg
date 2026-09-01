@@ -2,7 +2,7 @@
 //! differential harness can't reach because the model deliberately
 //! has no ids, config bounds, or lifecycle.
 
-use radix_tree::{Config, RadixTree, StoreError};
+use radix_tree::{Config, OverlapScratch, RadixTree, StoreError};
 
 fn tree() -> RadixTree {
     RadixTree::new(Config::default())
@@ -75,10 +75,11 @@ fn truncate_tail_is_forest_wide_prefix_closed_and_deterministic() {
     // p-1 present on the same chain (A kept 0,1; B kept 0).
     // Queries still answer the kept prefixes exactly.
     let mut out = Vec::new();
-    t.overlap(&[1, 2, 3], &mut out);
+    let mut sc = OverlapScratch::default();
+    t.overlap(&[1, 2, 3], &mut sc, &mut out);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].depth, 2);
-    t.overlap(&[5, 6], &mut out);
+    t.overlap(&[5, 6], &mut sc, &mut out);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].depth, 1);
 }
@@ -120,14 +121,15 @@ fn lineage_exactness_content_coincidence_never_over_matches() {
     t.store(h, None, &[(1, 7), (2, 8)]).expect("X");
     t.store(h, None, &[(3, 9), (4, 8)]).expect("Y");
     let mut out = Vec::new();
+    let mut sc = OverlapScratch::default();
     // Query [7, 8]: depth 2 via X only.
-    t.overlap(&[7, 8], &mut out);
+    t.overlap(&[7, 8], &mut sc, &mut out);
     assert_eq!((out[0].holder, out[0].depth), (h, 2));
     // Query [9, 8]: depth 2 via Y only.
-    t.overlap(&[9, 8], &mut out);
+    t.overlap(&[9, 8], &mut sc, &mut out);
     assert_eq!((out[0].holder, out[0].depth), (h, 2));
     // Query [5, 8]: content 8 exists at position 1 (twice!) but no
     // chain has lineage [5] -> depth 0, no answer at all.
-    t.overlap(&[5, 8], &mut out);
+    t.overlap(&[5, 8], &mut sc, &mut out);
     assert!(out.is_empty(), "lineage-blind positional match leaked");
 }

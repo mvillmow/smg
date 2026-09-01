@@ -23,14 +23,14 @@ pub type BlockKey = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HolderId {
     index: u32,
-    generation: u32,
+    generation: u64,
 }
 
 impl HolderId {
     /// Raw (index, generation) — for callers keeping side tables
     /// keyed by holder. Stale ids stay detectable through the
     /// generation.
-    pub fn parts(self) -> (u32, u32) {
+    pub fn parts(self) -> (u32, u64) {
         (self.index, self.generation)
     }
 }
@@ -121,7 +121,7 @@ impl HolderState {
 
 #[derive(Debug)]
 struct HolderSlot {
-    generation: u32,
+    generation: u64,
     /// `None` = retired slot awaiting reuse.
     state: Option<HolderState>,
 }
@@ -145,6 +145,61 @@ fn splitmix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Interned, immutable, sorted holder set. Consecutive positions of a
+/// shared chain hold IDENTICAL sets; hash-consing them means (a) the
+/// query walk proves "membership unchanged since the previous
+/// position" by POINTER EQUALITY — a sound O(1) run-skip, unlike the
+/// oracle's count heuristic — and (b) the per-position duplication of
+/// holder arrays collapses to one allocation per distinct set (the
+/// run-compression memory win, without a linked tree).
+type SetRef = std::sync::Arc<[u32]>;
+
+#[derive(Debug, Default)]
+struct SetInterner {
+    /// set-content hash -> interned sets with that hash.
+    table: FxHashMap<u64, Vec<SetRef>>,
+}
+
+impl SetInterner {
+    fn hash_of(set: &[u32]) -> u64 {
+        let mut h = 0x51_7C_C1_B7_27_22_0A_95u64 ^ (set.len() as u64);
+        for &x in set {
+            h = splitmix(h ^ (x as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        }
+        h
+    }
+
+    /// Intern a sorted holder array (consumes the scratch build).
+    fn intern(&mut self, set: &[u32]) -> SetRef {
+        let h = Self::hash_of(set);
+        let bucket = self.table.entry(h).or_default();
+        for existing in bucket.iter() {
+            if existing.as_ref() == set {
+                return existing.clone();
+            }
+        }
+        let arc: SetRef = set.into();
+        bucket.push(arc.clone());
+        arc
+    }
+
+    /// Release a reference that a membership is dropping. When only
+    /// the table still holds the set, it is removed (single-writer,
+    /// so the count is exact here).
+    fn release(&mut self, set: SetRef) {
+        let h = Self::hash_of(&set);
+        // The caller's clone + the table's = 2 when orphaned.
+        if std::sync::Arc::strong_count(&set) == 2 {
+            if let Some(bucket) = self.table.get_mut(&h) {
+                bucket.retain(|s| !std::sync::Arc::ptr_eq(s, &set));
+                if bucket.is_empty() {
+                    self.table.remove(&h);
+                }
+            }
+        }
+    }
+}
+
 /// Membership at one (position, content) entry, lineage-disambiguated.
 /// The common case — one holder, one lineage — is inline and
 /// allocation-free (§9). Shared entries hold one dense sorted holder
@@ -156,8 +211,8 @@ enum Membership {
         lineage: u64,
         holder: u32,
     },
-    /// Buckets sorted by lineage; holders sorted ascending within.
-    Many(Vec<(u64, Vec<u32>)>),
+    /// Buckets sorted by lineage; holders are interned sorted sets.
+    Many(Vec<(u64, SetRef)>),
 }
 
 /// What [`Membership::insert`] did — drives both counter maintenance
@@ -174,7 +229,7 @@ enum Inserted {
 }
 
 impl Membership {
-    fn insert(&mut self, lineage: u64, holder: u32) -> Inserted {
+    fn insert(&mut self, lineage: u64, holder: u32, interner: &mut SetInterner) -> Inserted {
         match self {
             Membership::One {
                 lineage: l,
@@ -182,36 +237,42 @@ impl Membership {
             } => {
                 if *l == lineage && *h == holder {
                     Inserted::Existing
-                } else {
-                    let same_lineage = *l == lineage;
-                    let mut buckets = vec![(*l, vec![*h])];
-                    match buckets[0].0.cmp(&lineage) {
-                        std::cmp::Ordering::Equal => {
-                            buckets[0].1.push(holder);
-                            buckets[0].1.sort_unstable();
-                        }
-                        std::cmp::Ordering::Less => buckets.push((lineage, vec![holder])),
-                        std::cmp::Ordering::Greater => buckets.insert(0, (lineage, vec![holder])),
-                    }
-                    *self = Membership::Many(buckets);
-                    if same_lineage {
-                        Inserted::AddedToExistingLineage
+                } else if *l == lineage {
+                    let set = if *h < holder {
+                        [*h, holder]
                     } else {
-                        Inserted::AddedNewLineage
-                    }
+                        [holder, *h]
+                    };
+                    *self = Membership::Many(vec![(lineage, interner.intern(&set))]);
+                    Inserted::AddedToExistingLineage
+                } else {
+                    let mut buckets = vec![(*l, interner.intern(&[*h]))];
+                    let pos = usize::from(*l < lineage);
+                    buckets.insert(pos, (lineage, interner.intern(&[holder])));
+                    *self = Membership::Many(buckets);
+                    Inserted::AddedNewLineage
                 }
             }
             Membership::Many(buckets) => {
                 match buckets.binary_search_by_key(&lineage, |&(l, _)| l) {
-                    Ok(bi) => match buckets[bi].1.binary_search(&holder) {
-                        Ok(_) => Inserted::Existing,
-                        Err(at) => {
-                            buckets[bi].1.insert(at, holder);
-                            Inserted::AddedToExistingLineage
+                    Ok(bi) => {
+                        let set = &buckets[bi].1;
+                        match set.binary_search(&holder) {
+                            Ok(_) => Inserted::Existing,
+                            Err(at) => {
+                                let mut grown = Vec::with_capacity(set.len() + 1);
+                                grown.extend_from_slice(&set[..at]);
+                                grown.push(holder);
+                                grown.extend_from_slice(&set[at..]);
+                                let old =
+                                    std::mem::replace(&mut buckets[bi].1, interner.intern(&grown));
+                                interner.release(old);
+                                Inserted::AddedToExistingLineage
+                            }
                         }
-                    },
+                    }
                     Err(bi) => {
-                        buckets.insert(bi, (lineage, vec![holder]));
+                        buckets.insert(bi, (lineage, interner.intern(&[holder])));
                         Inserted::AddedNewLineage
                     }
                 }
@@ -220,7 +281,7 @@ impl Membership {
     }
 
     /// Remove; true when the whole membership is now empty.
-    fn remove(&mut self, lineage: u64, holder: u32) -> bool {
+    fn remove(&mut self, lineage: u64, holder: u32, interner: &mut SetInterner) -> bool {
         match self {
             Membership::One {
                 lineage: l,
@@ -228,10 +289,18 @@ impl Membership {
             } => *l == lineage && *h == holder,
             Membership::Many(buckets) => {
                 if let Ok(bi) = buckets.binary_search_by_key(&lineage, |&(l, _)| l) {
-                    if let Ok(at) = buckets[bi].1.binary_search(&holder) {
-                        buckets[bi].1.remove(at);
-                        if buckets[bi].1.is_empty() {
-                            buckets.remove(bi);
+                    let set = &buckets[bi].1;
+                    if let Ok(at) = set.binary_search(&holder) {
+                        if set.len() == 1 {
+                            let (_, old) = buckets.remove(bi);
+                            interner.release(old);
+                        } else {
+                            let mut shrunk = Vec::with_capacity(set.len() - 1);
+                            shrunk.extend_from_slice(&set[..at]);
+                            shrunk.extend_from_slice(&set[at + 1..]);
+                            let old =
+                                std::mem::replace(&mut buckets[bi].1, interner.intern(&shrunk));
+                            interner.release(old);
                         }
                     }
                 }
@@ -257,6 +326,15 @@ impl Membership {
     }
 }
 
+/// Caller-owned query scratch: keeps `overlap` allocation-free once
+/// warm while the tree itself stays `&self` on the read path (§8).
+#[derive(Debug, Default)]
+pub struct OverlapScratch {
+    active: Vec<u32>,
+    next: Vec<u32>,
+    lineages: Vec<u64>,
+}
+
 pub struct RadixTree {
     cfg: Config,
     entries: FxHashMap<(u32, ContentHash), Membership>,
@@ -265,11 +343,7 @@ pub struct RadixTree {
     free: Vec<u32>,
     holder_blocks_total: u64,
     distinct_lineage_entries: u64,
-    /// Scratch for the query walk (kept to stay allocation-free on
-    /// the hot path once warm).
-    scratch_active: Vec<u32>,
-    scratch_next: Vec<u32>,
-    scratch_lineages: Vec<u64>,
+    interner: SetInterner,
 }
 
 impl RadixTree {
@@ -282,9 +356,7 @@ impl RadixTree {
             free: Vec::new(),
             holder_blocks_total: 0,
             distinct_lineage_entries: 0,
-            scratch_active: Vec::new(),
-            scratch_next: Vec::new(),
-            scratch_lineages: Vec::new(),
+            interner: SetInterner::default(),
         }
     }
 
@@ -308,6 +380,10 @@ impl RadixTree {
             slot.state = Some(state);
             index
         } else {
+            assert!(
+                self.slots.len() < u32::MAX as usize,
+                "holder slot space exhausted (u32 indices)"
+            );
             self.slots.push(HolderSlot {
                 generation: 0,
                 state: Some(state),
@@ -415,6 +491,7 @@ impl RadixTree {
                     // accepts it.
                     Self::unindex(
                         &mut self.entries,
+                        &mut self.interner,
                         &mut self.distinct_lineage_entries,
                         id.index,
                         existing,
@@ -467,6 +544,7 @@ impl RadixTree {
             self.holder_blocks_total -= 1;
             Self::unindex(
                 &mut self.entries,
+                &mut self.interner,
                 &mut self.distinct_lineage_entries,
                 id.index,
                 info,
@@ -503,6 +581,7 @@ impl RadixTree {
             self.holder_blocks_total -= 1;
             Self::unindex(
                 &mut self.entries,
+                &mut self.interner,
                 &mut self.distinct_lineage_entries,
                 id.index,
                 info,
@@ -527,6 +606,7 @@ impl RadixTree {
         for (_, info) in registry {
             Self::unindex(
                 &mut self.entries,
+                &mut self.interner,
                 &mut self.distinct_lineage_entries,
                 id.index,
                 info,
@@ -546,13 +626,18 @@ impl RadixTree {
     /// phase 2's cheap merge is sequential. This is what makes exact
     /// matching latency-competitive without the oracle's unsound
     /// skip heuristics.
-    pub fn overlap(&mut self, chain: &[ContentHash], out: &mut Vec<Overlap>) {
+    pub fn overlap(
+        &self,
+        chain: &[ContentHash],
+        scratch: &mut OverlapScratch,
+        out: &mut Vec<Overlap>,
+    ) {
         out.clear();
         if chain.is_empty() {
             return;
         }
         // Phase 0: lineages up front.
-        let mut lineages = std::mem::take(&mut self.scratch_lineages);
+        let lineages = &mut scratch.lineages;
         lineages.clear();
         let mut lineage = 0u64;
         for (p, &content) in chain.iter().enumerate() {
@@ -584,12 +669,12 @@ impl RadixTree {
                 }
                 Some(Membership::Many(buckets)) => {
                     let run = if buckets.len() == 1 {
-                        (buckets[0].0 == lineages[p]).then(|| buckets[0].1.as_slice())
+                        (buckets[0].0 == lineages[p]).then(|| &*buckets[0].1)
                     } else {
                         buckets
                             .binary_search_by_key(&lineages[p], |&(l, _)| l)
                             .ok()
-                            .map(|bi| buckets[bi].1.as_slice())
+                            .map(|bi| &*buckets[bi].1)
                     };
                     match run {
                         Some(run) => {
@@ -606,12 +691,17 @@ impl RadixTree {
             }
         }
         // Phase 2: sequential merge over dense holder runs.
-        let mut active = std::mem::take(&mut self.scratch_active);
-        let mut next = std::mem::take(&mut self.scratch_next);
+        let mut active = std::mem::take(&mut scratch.active);
+        let mut next = std::mem::take(&mut scratch.next);
         active.clear();
         next.clear();
         let mut survivors_depth = 0u32;
         let mut one_hold = [0u32; 1];
+        // The interned-set identity `active` currently equals, when it
+        // exactly equals one: pointer equality against a position's
+        // run then proves "membership unchanged" in O(1), soundly
+        // (interning guarantees identical sets share one allocation).
+        let mut active_src: Option<*const u32> = None;
         for (p, probe) in probes.iter().enumerate() {
             let run: &[u32] = match probe {
                 RunProbe::One(h) => {
@@ -626,10 +716,18 @@ impl RadixTree {
                     break;
                 }
                 active.extend_from_slice(run);
+                if matches!(probe, RunProbe::Slice(_)) {
+                    active_src = Some(run.as_ptr());
+                }
             } else {
-                if run == active.as_slice() {
-                    // Unchanged membership (the common shared-run
-                    // case): one memcmp, no rebuild.
+                if active_src.is_some_and(|src| std::ptr::eq(src, run.as_ptr())) {
+                    // O(1) sound run-skip: same interned set object.
+                } else if run == active.as_slice() {
+                    // Content-equal after a hand-built subset: resync
+                    // to the interned identity.
+                    if matches!(probe, RunProbe::Slice(_)) {
+                        active_src = Some(run.as_ptr());
+                    }
                 } else {
                     // Merge-intersect two sorted runs; dropped
                     // holders get depth p in the same pass.
@@ -650,6 +748,13 @@ impl RadixTree {
                         ai += 1;
                     }
                     std::mem::swap(&mut active, &mut next);
+                    // next ⊆ run; equal lengths ⟹ equal sets.
+                    active_src = if active.len() == run.len() && matches!(probe, RunProbe::Slice(_))
+                    {
+                        Some(run.as_ptr())
+                    } else {
+                        None
+                    };
                 }
             }
             if active.is_empty() {
@@ -662,9 +767,8 @@ impl RadixTree {
             self.push_answer(h, survivors_depth, out);
         }
         drop(probes);
-        self.scratch_active = active;
-        self.scratch_next = next;
-        self.scratch_lineages = lineages;
+        scratch.active = active;
+        scratch.next = next;
     }
 
     /// Position-ordered enumeration (snapshot/Pull; §4). Order is
@@ -823,7 +927,7 @@ impl RadixTree {
                         }
                         prev_l = Some(*l);
                         let mut prev_h = None;
-                        for &h in holders {
+                        for &h in holders.iter() {
                             if prev_h.is_some_and(|p: u32| p >= h) {
                                 return Err(format!("unsorted holders at ({pos},{content:#x})"));
                             }
@@ -853,6 +957,34 @@ impl RadixTree {
                 "distinct_lineage_entries {} != recount {}",
                 self.distinct_lineage_entries, distinct
             ));
+        }
+        // Interner coherence: every bucket's set is findable in the
+        // table under its content hash, and the table holds no orphan
+        // sets (kept alive by nothing but the table = a leak).
+        for m in self.entries.values() {
+            if let Membership::Many(buckets) = m {
+                for (_, set) in buckets {
+                    let h = SetInterner::hash_of(set);
+                    let found = self
+                        .interner
+                        .table
+                        .get(&h)
+                        .is_some_and(|v| v.iter().any(|s| std::sync::Arc::ptr_eq(s, set)));
+                    if !found {
+                        return Err(format!("interned set {:?} missing from table", &set[..]));
+                    }
+                }
+            }
+        }
+        for (h, sets) in &self.interner.table {
+            for set in sets {
+                if std::sync::Arc::strong_count(set) == 1 {
+                    return Err(format!(
+                        "orphan interned set under hash {h:#x}: {:?}",
+                        &set[..]
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -891,6 +1023,7 @@ impl RadixTree {
     /// key — the caller then treats the store as a duplicate and the
     /// new key is never registered (deterministic; audited).
     fn index_block(&mut self, holder: u32, info: BlockInfo) -> bool {
+        let interner = &mut self.interner;
         match self.entries.entry((info.pos, info.content)) {
             std::collections::hash_map::Entry::Vacant(vacant) => {
                 vacant.insert(Membership::One {
@@ -901,7 +1034,7 @@ impl RadixTree {
                 true
             }
             std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                match occupied.get_mut().insert(info.lineage, holder) {
+                match occupied.get_mut().insert(info.lineage, holder, interner) {
                     Inserted::Existing => false,
                     Inserted::AddedToExistingLineage => true,
                     Inserted::AddedNewLineage => {
@@ -915,6 +1048,7 @@ impl RadixTree {
 
     fn unindex(
         entries: &mut FxHashMap<(u32, ContentHash), Membership>,
+        interner: &mut SetInterner,
         distinct: &mut u64,
         holder: u32,
         info: BlockInfo,
@@ -923,7 +1057,7 @@ impl RadixTree {
             return;
         };
         let shared = membership.lineage_shared_beyond(info.lineage, holder);
-        if membership.remove(info.lineage, holder) {
+        if membership.remove(info.lineage, holder, interner) {
             entries.remove(&(info.pos, info.content));
         }
         if !shared {

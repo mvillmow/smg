@@ -107,6 +107,17 @@ impl Model {
                 chain: chain_idx,
                 pos,
             };
+            // §4 twin-key rule: a DIFFERENT key already occupying this
+            // exact (chain, position) with the same content is the
+            // same block in every observable sense — duplicate, the
+            // new key is never registered.
+            if h.registry.get(&key).is_none_or(|p| *p != placement) {
+                let chain = &h.chains[chain_idx];
+                if chain.present.get(&pos).map(|&(k, c)| (k != key, c)) == Some((true, content)) {
+                    duplicates += 1;
+                    continue;
+                }
+            }
             match h.registry.get(&key) {
                 Some(existing) if *existing == placement => {
                     duplicates += 1;
@@ -196,6 +207,32 @@ impl Model {
             .chains
             .iter()
             .any(|c| c.present.get(&pos).map(|&(_, content)| content) == Some(q))
+    }
+
+    /// Position-ordered (pos, key, content) across the forest —
+    /// the model's answer to `enumerate` (sorted by (pos, key)).
+    pub fn enumerate(&self, holder: usize) -> Vec<(u32, u64, u64)> {
+        let mut v: Vec<(u32, u64, u64)> = self.holders[holder]
+            .chains
+            .iter()
+            .flat_map(|c| c.present.iter().map(|(&p, &(k, content))| (p, k, content)))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Distinct (position, content, lineage-prefix) across all
+    /// holders — the model's answer to stats().distinct_entries.
+    pub fn distinct_entries(&self) -> u64 {
+        let mut set = std::collections::HashSet::new();
+        for h in &self.holders {
+            for c in &h.chains {
+                for (&p, &(_, content)) in &c.present {
+                    set.insert((p, content, c.lineage[..=p as usize].to_vec()));
+                }
+            }
+        }
+        set.len() as u64
     }
 
     /// Does `holder` hold a LINEAGE-TRUE block at `pos` for this query
