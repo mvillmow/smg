@@ -309,6 +309,19 @@ impl Membership {
         }
     }
 
+    /// Is this exact (lineage, holder) pair present?
+    fn contains(&self, lineage: u64, holder: u32) -> bool {
+        match self {
+            Membership::One {
+                lineage: l,
+                holder: h,
+            } => *l == lineage && *h == holder,
+            Membership::Many(buckets) => buckets
+                .binary_search_by_key(&lineage, |&(l, _)| l)
+                .is_ok_and(|bi| buckets[bi].1.binary_search(&holder).is_ok()),
+        }
+    }
+
     /// Does any OTHER holder share (lineage) here?
     fn lineage_shared_beyond(&self, lineage: u64, holder: u32) -> bool {
         match self {
@@ -484,42 +497,55 @@ impl RadixTree {
                     duplicates += 1;
                     continue;
                 }
-                Some(&existing) => {
-                    // §4: re-registration MOVES the block. The old
-                    // placement is unindexed and the key removed; it
-                    // is re-registered below only if the destination
-                    // accepts it.
-                    Self::unindex(
-                        &mut self.entries,
-                        &mut self.interner,
-                        &mut self.distinct_lineage_entries,
-                        id.index,
-                        existing,
-                    );
-                    self.slots[id.index as usize]
-                        .state
-                        .as_mut()
-                        .expect("checked live")
-                        .registry
-                        .remove(&key);
-                    self.holder_blocks_total -= 1;
-                }
-                None => {}
+                _ => {}
             }
-            if self.index_block(id.index, info) {
-                let state = self.slots[id.index as usize]
+            // §4 alias pre-check, BEFORE any mutation: if the holder
+            // already holds this exact (position, content, lineage)
+            // under another key, the store is a duplicate — and a
+            // would-be MOVE is refused NON-destructively (the old
+            // placement stays; review finding: the earlier order
+            // unindexed first and destroyed a block while reporting
+            // a no-op).
+            let dest_taken = self
+                .entries
+                .get(&(info.pos, info.content))
+                .is_some_and(|m| m.contains(info.lineage, id.index));
+            if dest_taken {
+                duplicates += 1;
+                continue;
+            }
+            if let Some(&existing) = self.slots[id.index as usize]
+                .state
+                .as_ref()
+                .expect("checked live")
+                .registry
+                .get(&key)
+            {
+                // §4: re-registration MOVES the block.
+                Self::unindex(
+                    &mut self.entries,
+                    &mut self.interner,
+                    &mut self.distinct_lineage_entries,
+                    id.index,
+                    existing,
+                );
+                self.slots[id.index as usize]
                     .state
                     .as_mut()
-                    .expect("checked live");
-                state.registry.insert(key, info);
-                self.holder_blocks_total += 1;
-                applied += 1;
-            } else {
-                // Same holder already holds this exact (position,
-                // content, lineage) under another key: a duplicate in
-                // every observable sense.
-                duplicates += 1;
+                    .expect("checked live")
+                    .registry
+                    .remove(&key);
+                self.holder_blocks_total -= 1;
             }
+            let inserted = self.index_block(id.index, info);
+            debug_assert!(inserted, "alias pre-check guarantees insertion");
+            let state = self.slots[id.index as usize]
+                .state
+                .as_mut()
+                .expect("checked live");
+            state.registry.insert(key, info);
+            self.holder_blocks_total += 1;
+            applied += 1;
         }
         Ok(StoreOutcome {
             applied,
@@ -688,6 +714,9 @@ impl RadixTree {
                     }
                 }
                 None => break,
+            }
+            if matches!(probes.last(), Some(RunProbe::Miss)) {
+                break;
             }
         }
         // Phase 2: sequential merge over dense holder runs.

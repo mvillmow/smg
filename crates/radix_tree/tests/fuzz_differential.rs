@@ -237,6 +237,10 @@ fn run_one_chaos(seed: u64) {
 
     let run = |script: &[COp]| -> (Vec<BTreeMap<usize, u32>>, u64, u64) {
         let mut tree = RadixTree::new(Config { max_chain_len: 64 });
+        // The model is total (defined on arbitrary inputs), so chaos
+        // now runs under the same hard referee gate as the
+        // in-contract fuzz — keyed by chaos slot.
+        let mut model = Model::with_max(slots, 64);
         let mut ids: Vec<Option<HolderId>> = (0..slots)
             .map(|s| Some(tree.create_holder(&format!("chaos-{s}"))))
             .collect();
@@ -258,27 +262,45 @@ fn run_one_chaos(seed: u64) {
                             1 => Some(key_pool[(*parent_pick as usize / 3) % key_pool.len()]),
                             _ => Some(parent_pick | 1),
                         };
-                        let _ = tree.store(id, parent, blocks);
+                        let subject = tree.store(id, parent, blocks);
+                        let modeled = model.store(*slot, parent, blocks);
+                        let pair = (
+                            subject.is_ok(),
+                            !matches!(
+                                modeled,
+                                StoreResult::ParentNotFound | StoreResult::ChainTooLong
+                            ),
+                        );
+                        assert!(
+                            pair.0 == pair.1,
+                            "store acceptance diverged (seed {seed} op {i}): {subject:?} vs {modeled:?}"
+                        );
                     }
                 }
                 COp::Remove { slot, keys } => {
                     if let Some(id) = ids[*slot] {
-                        tree.remove(id, keys);
+                        let a = tree.remove(id, keys);
+                        let b = model.remove(*slot, keys);
+                        assert_eq!(a, b, "remove count diverged (seed {seed} op {i})");
                     }
                 }
                 COp::Clear { slot } => {
                     if let Some(id) = ids[*slot] {
                         tree.clear(id);
+                        model.clear(*slot);
                     }
                 }
                 COp::Truncate { slot, keep } => {
                     if let Some(id) = ids[*slot] {
-                        tree.truncate_tail(id, *keep);
+                        let a = tree.truncate_tail(id, *keep);
+                        let b = model.truncate_tail(*slot, *keep);
+                        assert_eq!(a, b, "truncate count diverged (seed {seed} op {i})");
                     }
                 }
                 COp::Retire { slot } => {
                     if let Some(id) = ids[*slot].take() {
                         tree.retire_holder(id);
+                        model.clear(*slot);
                         stale.push(id);
                     }
                 }
@@ -302,17 +324,44 @@ fn run_one_chaos(seed: u64) {
                 }
                 COp::Query { probe } => {
                     tree.overlap(probe, &mut qscratch, &mut scratch);
-                    let mut m = BTreeMap::new();
+                    let mut by_slot = BTreeMap::new();
                     for o in scratch.iter() {
-                        m.insert(o.holder.parts().0 as usize, o.depth);
+                        // Map subject holder ids back to chaos slots;
+                        // an unmapped id would be a stale-holder leak.
+                        let slot = ids
+                            .iter()
+                            .position(|x| *x == Some(o.holder))
+                            .unwrap_or_else(|| {
+                                panic!("answer for unknown holder (seed {seed} op {i})")
+                            });
+                        by_slot.insert(slot, o.depth);
                     }
-                    answers.push(m);
+                    assert_eq!(
+                        by_slot,
+                        model.overlap(probe),
+                        "chaos subject != model (seed {seed} op {i})"
+                    );
+                    answers.push(by_slot);
                 }
             }
             tree.audit()
                 .unwrap_or_else(|e| panic!("chaos audit failed: seed {seed} op {i}: {e}"));
+            for (slot, id) in ids.iter().enumerate() {
+                if let Some(id) = id {
+                    assert_eq!(
+                        tree.holder_blocks(*id),
+                        model.holder_blocks(slot),
+                        "chaos holder_blocks diverged (seed {seed} op {i} slot {slot})"
+                    );
+                }
+            }
         }
         let stats = tree.stats();
+        assert_eq!(
+            stats.distinct_entries,
+            model.distinct_entries(),
+            "chaos distinct_entries diverged (seed {seed})"
+        );
         (answers, stats.holder_blocks, stats.distinct_entries)
     };
     // Determinism: two independent executions of the same soup agree.

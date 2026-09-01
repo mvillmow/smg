@@ -1,56 +1,65 @@
-//! The trivially-correct model of SPEC.md §6/§7.
+//! The trivially-correct model of SPEC.md §4/§6/§7.
 //!
-//! Chosen for obviousness over speed: chains store their lineage as
-//! literal content vectors, depth is computed by scanning every chain
-//! of every holder, and nothing is amortized. If this model and an
-//! implementation disagree, the implementation is wrong (or the spec
-//! is — either way, loudly).
+//! Representationally complete: every block carries its OWN literal
+//! lineage (the content prefix it was stored under, including
+//! itself), exactly mirroring the subject's registry of
+//! (position, content, lineage-fingerprint) — with the fingerprint
+//! replaced by the literal vector, so no hashing and no collisions.
+//! This makes the model defined on ARBITRARY inputs (aliases, moves,
+//! twin keys), which lets the chaos fuzz use it as referee too.
+//!
+//! §4 alias semantics, mirrored exactly:
+//! - same key, same (pos, content, lineage): duplicate;
+//! - different key, same (pos, content, lineage) already held: the
+//!   new key is a duplicate and is NEVER registered — and when that
+//!   key was previously registered elsewhere (a refused MOVE), its
+//!   old placement stays intact;
+//! - same key, different placement: MOVE (old placement removed).
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    rc::Rc,
+};
 
 use super::Op;
 
-/// A stored block's placement inside one holder's forest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Placement {
-    chain: usize,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockRec {
     pos: u32,
-}
-
-#[derive(Debug, Clone, Default)]
-struct Chain {
-    /// Positions currently present: pos -> (key, content).
-    present: BTreeMap<u32, (u64, u64)>,
-    /// Append-only lineage: content by position AS STORED. Removal
-    /// leaves lineage intact (a block's identity includes the prefix
-    /// it was stored under, §3), so re-parented children keep
-    /// matching their original chain.
-    lineage: Vec<u64>,
+    content: u64,
+    /// Literal lineage: contents at positions 0..=pos as stored.
+    lineage: Rc<Vec<u64>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Holder {
-    chains: Vec<Chain>,
-    registry: HashMap<u64, Placement>,
+    registry: HashMap<u64, BlockRec>,
 }
 
-/// Model-level store outcome, mirroring the §4 error surface the
-/// generator and (later) the R1 core must agree on.
+/// Model-level store outcome, mirroring the §4 error surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreResult {
     Applied { applied: u32, duplicates: u32 },
     ParentNotFound,
+    ChainTooLong,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Model {
     holders: Vec<Holder>,
+    max_chain_len: u32,
 }
 
 impl Model {
     pub fn new(holder_count: usize) -> Self {
+        Self::with_max(holder_count, 65_536)
+    }
+
+    /// Mirror a subject configured with a specific max_chain_len.
+    pub fn with_max(holder_count: usize, max_chain_len: u32) -> Self {
         Self {
             holders: vec![Holder::default(); holder_count],
+            max_chain_len,
         }
     }
 
@@ -72,7 +81,12 @@ impl Model {
         }
     }
 
-    fn store(&mut self, holder: usize, parent: Option<u64>, blocks: &[(u64, u64)]) -> StoreResult {
+    pub fn store(
+        &mut self,
+        holder: usize,
+        parent: Option<u64>,
+        blocks: &[(u64, u64)],
+    ) -> StoreResult {
         if blocks.is_empty() {
             return StoreResult::Applied {
                 applied: 0,
@@ -80,64 +94,43 @@ impl Model {
             };
         }
         let h = &mut self.holders[holder];
-        let (chain_idx, start_pos) = match parent {
-            None => {
-                // A parent-None batch whose first block is already
-                // registered at position 0 extends/duplicates that
-                // chain rather than opening a twin (placement
-                // re-publish is the common case).
-                match h.registry.get(&blocks[0].0) {
-                    Some(p) if p.pos == 0 => (p.chain, 0),
-                    _ => {
-                        h.chains.push(Chain::default());
-                        (h.chains.len() - 1, 0)
-                    }
-                }
-            }
+        let (start_pos, mut prefix) = match parent {
+            None => (0u32, Vec::new()),
             Some(parent_key) => match h.registry.get(&parent_key) {
                 None => return StoreResult::ParentNotFound,
-                Some(p) => (p.chain, p.pos + 1),
+                Some(rec) => (rec.pos + 1, rec.lineage.as_ref().clone()),
             },
         };
+        if start_pos as u64 + blocks.len() as u64 > self.max_chain_len as u64 {
+            return StoreResult::ChainTooLong;
+        }
         let mut applied = 0u32;
         let mut duplicates = 0u32;
         for (i, &(key, content)) in blocks.iter().enumerate() {
             let pos = start_pos + i as u32;
-            let placement = Placement {
-                chain: chain_idx,
+            prefix.push(content);
+            let candidate = BlockRec {
                 pos,
+                content,
+                lineage: Rc::new(prefix.clone()),
             };
-            // §4 twin-key rule: a DIFFERENT key already occupying this
-            // exact (chain, position) with the same content is the
-            // same block in every observable sense — duplicate, the
-            // new key is never registered.
-            if h.registry.get(&key).is_none_or(|p| *p != placement) {
-                let chain = &h.chains[chain_idx];
-                if chain.present.get(&pos).map(|&(k, c)| (k != key, c)) == Some((true, content)) {
-                    duplicates += 1;
-                    continue;
-                }
+            if h.registry.get(&key) == Some(&candidate) {
+                duplicates += 1;
+                continue;
             }
-            match h.registry.get(&key) {
-                Some(existing) if *existing == placement => {
-                    duplicates += 1;
-                    continue;
-                }
-                Some(&existing) => {
-                    // §4: re-registering at a different placement MOVES
-                    // the block (out of chain-consistent scope, but
-                    // deterministic under per-holder order).
-                    h.chains[existing.chain].present.remove(&existing.pos);
-                }
-                None => {}
+            // Alias: any OTHER key already at this exact triple?
+            let aliased = h
+                .registry
+                .iter()
+                .any(|(&k, rec)| k != key && *rec == candidate);
+            if aliased {
+                // Duplicate in every observable sense; a would-be MOVE
+                // is refused non-destructively (old placement stays).
+                duplicates += 1;
+                continue;
             }
-            let chain = &mut h.chains[chain_idx];
-            if chain.lineage.len() <= pos as usize {
-                chain.lineage.resize(pos as usize + 1, 0);
-            }
-            chain.lineage[pos as usize] = content;
-            chain.present.insert(pos, (key, content));
-            h.registry.insert(key, placement);
+            // MOVE or fresh insert: (re)register.
+            h.registry.insert(key, candidate);
             applied += 1;
         }
         StoreResult::Applied {
@@ -146,45 +139,61 @@ impl Model {
         }
     }
 
-    fn remove(&mut self, holder: usize, keys: &[u64]) -> u32 {
+    pub fn remove(&mut self, holder: usize, keys: &[u64]) -> u32 {
         let h = &mut self.holders[holder];
         let mut removed = 0;
         for key in keys {
-            if let Some(p) = h.registry.remove(key) {
-                h.chains[p.chain].present.remove(&p.pos);
+            if h.registry.remove(key).is_some() {
                 removed += 1;
             }
         }
         removed
     }
 
-    fn clear(&mut self, holder: usize) {
+    pub fn clear(&mut self, holder: usize) {
         self.holders[holder] = Holder::default();
     }
 
-    /// §6 depth: the largest `d` such that ONE chain holds every
-    /// position `p < d` with content `query[p]` AND lineage exactly
-    /// `query[0..p]`. Lineage prefix equality plus presence.
-    pub fn depth(&self, holder: usize, query: &[u64]) -> u32 {
-        let mut best = 0u32;
-        for chain in &self.holders[holder].chains {
-            let mut d = 0u32;
-            for (p, &q) in query.iter().enumerate() {
-                let lineage_true = chain.lineage.get(p) == Some(&q);
-                let present_true = chain.present.get(&(p as u32)).map(|&(_, c)| c) == Some(q);
-                if lineage_true && present_true {
-                    d = p as u32 + 1;
-                } else {
-                    break;
-                }
-            }
-            best = best.max(d);
+    /// Forest-wide §4 truncate: strictly decreasing positions, ties
+    /// by key, until `keep` remain.
+    pub fn truncate_tail(&mut self, holder: usize, keep: u64) -> u64 {
+        let h = &mut self.holders[holder];
+        if h.registry.len() as u64 <= keep {
+            return 0;
         }
-        best
+        let mut ordered: Vec<(u32, u64)> = h.registry.iter().map(|(&k, r)| (r.pos, k)).collect();
+        ordered.sort_unstable();
+        let mut dropped = 0u64;
+        while h.registry.len() as u64 > keep {
+            let (_, key) = ordered.pop().expect("non-empty");
+            h.registry.remove(&key);
+            dropped += 1;
+        }
+        dropped
     }
 
-    /// Full holder->depth map for one query (§10.1: map equality,
-    /// never a depth multiset). Depth-0 holders are absent.
+    /// §6 depth: largest d such that for every p < d the holder has a
+    /// block at position p whose content is query[p] and whose
+    /// LITERAL lineage equals query[0..=p].
+    pub fn depth(&self, holder: usize, query: &[u64]) -> u32 {
+        let mut d = 0u32;
+        'outer: for (p, &q) in query.iter().enumerate() {
+            for rec in self.holders[holder].registry.values() {
+                if rec.pos == p as u32
+                    && rec.content == q
+                    && rec.lineage.len() == p + 1
+                    && rec.lineage[..] == query[..=p]
+                {
+                    d = p as u32 + 1;
+                    continue 'outer;
+                }
+            }
+            break;
+        }
+        d
+    }
+
+    /// Full holder->depth map (§10.1: map equality, depth-0 absent).
     pub fn overlap(&self, query: &[u64]) -> BTreeMap<usize, u32> {
         let mut out = BTreeMap::new();
         for holder in 0..self.holders.len() {
@@ -200,50 +209,49 @@ impl Model {
         self.holders[holder].registry.len() as u64
     }
 
-    /// Does `holder` hold content `q` anywhere at `pos` (any lineage)?
-    /// The divergence classifier's discriminator (§6 quirk classes).
-    pub fn holds_content_at(&self, holder: usize, pos: u32, q: u64) -> bool {
-        self.holders[holder]
-            .chains
-            .iter()
-            .any(|c| c.present.get(&pos).map(|&(_, content)| content) == Some(q))
-    }
-
-    /// Position-ordered (pos, key, content) across the forest —
-    /// the model's answer to `enumerate` (sorted by (pos, key)).
+    /// Position-ordered (pos, key, content) — the model's `enumerate`.
     pub fn enumerate(&self, holder: usize) -> Vec<(u32, u64, u64)> {
         let mut v: Vec<(u32, u64, u64)> = self.holders[holder]
-            .chains
+            .registry
             .iter()
-            .flat_map(|c| c.present.iter().map(|(&p, &(k, content))| (p, k, content)))
+            .map(|(&k, r)| (r.pos, k, r.content))
             .collect();
         v.sort_unstable();
         v
     }
 
-    /// Distinct (position, content, lineage-prefix) across all
-    /// holders — the model's answer to stats().distinct_entries.
+    /// Distinct (position, content, lineage) across all holders — the
+    /// model's stats().distinct_entries.
     pub fn distinct_entries(&self) -> u64 {
         let mut set = std::collections::HashSet::new();
         for h in &self.holders {
-            for c in &h.chains {
-                for (&p, &(_, content)) in &c.present {
-                    set.insert((p, content, c.lineage[..=p as usize].to_vec()));
-                }
+            for rec in h.registry.values() {
+                set.insert((rec.pos, rec.content, rec.lineage.clone()));
             }
         }
         set.len() as u64
     }
 
-    /// Does `holder` hold a LINEAGE-TRUE block at `pos` for this query
-    /// (present, right content, lineage == query[0..pos]) — i.e. the
-    /// only reason model depth stopped short of it is a missing
-    /// EARLIER position (a gap)?
+    /// Census discriminator: content match at pos under ANY lineage.
+    pub fn holds_content_at(&self, holder: usize, pos: u32, q: u64) -> bool {
+        self.holders[holder]
+            .registry
+            .values()
+            .any(|r| r.pos == pos && r.content == q)
+    }
+
+    /// Census discriminator: lineage-true block at pos for this query
+    /// (model depth stopped earlier only because of a gap).
     pub fn holds_lineage_true_at(&self, holder: usize, pos: u32, query: &[u64]) -> bool {
-        self.holders[holder].chains.iter().any(|c| {
-            c.present.get(&pos).map(|&(_, content)| content) == Some(query[pos as usize])
-                && c.lineage.len() > pos as usize
-                && c.lineage[..=pos as usize] == query[..=pos as usize]
+        self.holders[holder].registry.values().any(|r| {
+            r.pos == pos
+                && r.content == query[pos as usize]
+                && r.lineage.len() == pos as usize + 1
+                && r.lineage[..] == query[..=pos as usize]
         })
     }
+
+    /// Keep the compiler honest about BTreeMap being intentional.
+    #[allow(dead_code)]
+    fn _uses(_: &BTreeMap<usize, u32>) {}
 }
