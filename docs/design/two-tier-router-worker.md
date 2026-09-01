@@ -87,9 +87,18 @@ TokenSpeed runner image:
 - passed health, model discovery, non-streaming generation, SSE streaming, and
   client-disconnect cancellation; the Worker remained healthy afterward.
 
-Earlier B200 validation also passed vLLM non-streaming/streaming/draining and
-SGLang non-streaming. Stock SGLang 0.5.18 streaming remains blocked by its
-upstream request-normalization defect.
+The same two-tier ZMQ path passed on B200 with the latest official OSS vLLM
+image:
+
+- image: `vllm/vllm-openai:latest` (`vLLM 0.28.0`)
+- image digest: `sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14`
+- verified path: Router HTTP -> Rust Worker gRPC -> msgpack ZMQ IPC -> vLLM
+- passed health, model discovery, non-streaming generation, SSE through
+  `[DONE]`, client-disconnect cancellation, and draining; while the Worker was
+  draining, new generation returned 503 and Router liveness remained 200.
+
+B200 validation also passed SGLang non-streaming. Stock SGLang 0.5.18
+streaming remains blocked by its upstream request-normalization defect.
 
 ## Performance result
 
