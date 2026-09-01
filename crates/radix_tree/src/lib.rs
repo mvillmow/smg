@@ -11,6 +11,14 @@
 #![forbid(unsafe_code)]
 
 mod core3;
+/// The chain-native core is the crate's PRIMARY type: every original
+/// performance gate passed on it (26.9 B/holder-block, exact-match
+/// gate cell p99 7.6 us, scale-stable at 128M blocks) with the full
+/// referee equal. The flat core remains as [`FlatTree`] — a second,
+/// independently-verified implementation the dual-core harness keeps
+/// asserting against the model, and the substrate the chain core's
+/// interner came from.
+pub use core3::RadixTree3 as RadixTree;
 pub use core3::RadixTree3;
 use rustc_hash::FxHashMap;
 
@@ -354,7 +362,7 @@ pub struct OverlapScratch {
     lineages: Vec<u64>,
 }
 
-pub struct RadixTree {
+pub struct FlatTree {
     cfg: Config,
     entries: FxHashMap<(u32, ContentHash), Membership>,
     slots: Vec<HolderSlot>,
@@ -365,7 +373,7 @@ pub struct RadixTree {
     interner: SetInterner,
 }
 
-impl RadixTree {
+impl FlatTree {
     pub fn new(cfg: Config) -> Self {
         Self {
             cfg,

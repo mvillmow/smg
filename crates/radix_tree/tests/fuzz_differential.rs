@@ -28,7 +28,7 @@ use common::{
     workload::{self, Config as WlConfig},
     Op, Rng,
 };
-use radix_tree::{Config, HolderId, OverlapScratch, RadixTree, RadixTree3, StoreError};
+use radix_tree::{Config, FlatTree, HolderId, OverlapScratch, RadixTree3, StoreError};
 
 fn random_config(rng: &mut Rng) -> WlConfig {
     let holders = 2 + rng.below(255);
@@ -53,7 +53,7 @@ fn random_config(rng: &mut Rng) -> WlConfig {
 }
 
 enum Core {
-    Flat(RadixTree),
+    Flat(FlatTree),
     Chain(RadixTree3),
 }
 
@@ -66,7 +66,7 @@ struct Subject {
 
 impl Subject {
     fn new_flat(holders: usize) -> Self {
-        let mut tree = RadixTree::new(Config::default());
+        let mut tree = FlatTree::new(Config::default());
         let ids = (0..holders)
             .map(|h| tree.create_holder(&format!("holder-{h}")))
             .collect();
@@ -273,7 +273,7 @@ macro_rules! impl_core_api {
         }
     };
 }
-impl_core_api!(RadixTree);
+impl_core_api!(FlatTree);
 impl_core_api!(RadixTree3);
 
 /// Chaos: arbitrary op soup. Contract: no panic, audit always green,
@@ -499,14 +499,14 @@ fn run_one_chaos(seed: u64) {
         slots,
         &key_pool,
         &script,
-        RadixTree::new(Config { max_chain_len: 64 }),
+        FlatTree::new(Config { max_chain_len: 64 }),
     );
     let flat_b = chaos_run(
         seed,
         slots,
         &key_pool,
         &script,
-        RadixTree::new(Config { max_chain_len: 64 }),
+        FlatTree::new(Config { max_chain_len: 64 }),
     );
     assert_eq!(flat_a, flat_b, "flat chaos replay diverged (seed {seed})");
     let chain_a = chaos_run(

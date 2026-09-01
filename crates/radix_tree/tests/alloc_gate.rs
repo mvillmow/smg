@@ -8,7 +8,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use radix_tree::{Config, RadixTree, RadixTree3};
+use radix_tree::{Config, FlatTree, RadixTree3};
 
 struct Counting;
 
@@ -38,7 +38,7 @@ fn fresh_single_holder_stores_amortize_to_map_growth() {
 }
 
 fn run_flat() {
-    let mut tree = RadixTree::new(Config::default());
+    let mut tree = FlatTree::new(Config::default());
     let h = tree.create_holder("h");
     // Warm: one chain so first-touch allocations (scratch, maps) are
     // out of the measured window.

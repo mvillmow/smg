@@ -18,7 +18,7 @@ mod common;
 use std::time::Instant;
 
 use common::{oracle::Oracle, Op, Rng};
-use radix_tree::{Config, HolderId, OverlapScratch, RadixTree, RadixTree3};
+use radix_tree::{Config, FlatTree, HolderId, OverlapScratch, RadixTree3};
 
 // ---- §11 normative constants (default scale) ----
 // RADIX_BENCH_SCALE=large runs 8x blocks / 8x holders (~20 GB peak,
@@ -217,7 +217,7 @@ fn side() -> String {
 enum Sider {
     Oracle(Oracle, Vec<Vec<u64>>),
     R1(
-        RadixTree,
+        FlatTree,
         Vec<HolderId>,
         Vec<radix_tree::Overlap>,
         OverlapScratch,
@@ -340,7 +340,7 @@ fn pinned_workload() {
     let rss_before = rss_kib();
     let mut sider = match side_name.as_str() {
         "r1" => {
-            let mut tree = RadixTree::new(Config::default());
+            let mut tree = FlatTree::new(Config::default());
             let ids = (0..holders())
                 .map(|h| tree.create_holder(&format!("holder-{h}")))
                 .collect();

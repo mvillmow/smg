@@ -336,9 +336,16 @@ impl RadixTree3 {
             return Ok(Placed::Duplicate);
         }
         // Not covered: a move relocates the key first, then join.
+        // Key BEFORE membership (chain GC scans key maps; the
+        // reverse order makes GC see our own dying reference and
+        // leak the chain — the audit's orphan rule caught this).
+        // The CURSOR chain is pinned against GC for the gap between
+        // this removal and the add just below: an in-batch move can
+        // otherwise free the chain the batch is standing on, and the
+        // next block would write into a freed slot (chaos seed 2).
         if let Some(old) = self.state_of(holder).keys.get(&key).copied() {
-            self.remove_membership(holder, old);
             self.state_of_mut(holder).keys.remove(&key);
+            self.remove_membership_pinned(holder, old, Some(chain));
         }
         self.add_membership(holder, chain, pos);
         self.state_of_mut(holder).keys.insert(key, (chain, pos));
@@ -391,15 +398,18 @@ impl RadixTree3 {
             return;
         }
         let holder = id.parts().0;
-        let chains: Vec<u32> = self.state_of(holder).chains.iter().copied().collect();
+        // Wipe the key map FIRST: chain GC scans key maps for
+        // references, so clearing spans before keys made the GC see
+        // the holder's own keys and bail — every retire leaked its
+        // chains (caught by the churn-boundedness gate on the swap).
+        let state = self.state_of_mut(holder);
+        let key_count = state.keys.len() as u64;
+        state.keys = FxHashMap::default();
+        let chains: Vec<u32> = std::mem::take(&mut state.chains).into_iter().collect();
+        self.holder_blocks_total -= key_count;
         for chain in chains {
             self.drop_holder_from_chain(holder, chain);
         }
-        let key_count = self.state_of(holder).keys.len() as u64;
-        self.holder_blocks_total -= key_count;
-        let state = self.state_of_mut(holder);
-        state.keys = FxHashMap::default();
-        state.chains = rustc_hash::FxHashSet::default();
     }
 
     // ---- reads ----
@@ -657,6 +667,10 @@ impl RadixTree3 {
     }
 
     fn remove_membership(&mut self, holder: u32, at: (u32, u32)) {
+        self.remove_membership_pinned(holder, at, None);
+    }
+
+    fn remove_membership_pinned(&mut self, holder: u32, at: (u32, u32), pinned: Option<u32>) {
         let (chain, pos) = at;
         let mut m = self.take_position_membership(chain, pos);
         let mut now_empty = false;
@@ -683,7 +697,7 @@ impl RadixTree3 {
         self.put_position_membership(chain, pos, m);
         if now_empty {
             self.distinct_entries -= 1;
-            self.maybe_gc_chain(chain);
+            self.maybe_gc_chain_pinned(chain, pinned);
         }
         self.holder_blocks_total -= 1;
         // holder->chains index pruned lazily in drop_holder_from_chain
@@ -797,6 +811,13 @@ impl RadixTree3 {
 
     /// Free a chain when nothing references it.
     fn maybe_gc_chain(&mut self, chain: u32) {
+        self.maybe_gc_chain_pinned(chain, None);
+    }
+
+    fn maybe_gc_chain_pinned(&mut self, chain: u32, pinned: Option<u32>) {
+        if pinned == Some(chain) {
+            return;
+        }
         let cd = &self.chains[chain as usize];
         // Already freed (double-GC guard: reachable via a remove on
         // one path racing a parent-recursion free on another).
@@ -842,7 +863,7 @@ impl RadixTree3 {
                     pd.children.remove(idx);
                 }
                 let _ = base;
-                self.maybe_gc_chain(p);
+                self.maybe_gc_chain_pinned(p, pinned);
             }
         }
     }
@@ -1023,6 +1044,23 @@ impl RadixTree3 {
                         }
                     }
                 }
+            }
+        }
+        // GC coherence: a live chain must be referenced by spans,
+        // children, or at least one key map (otherwise the GC missed
+        // it — the leak class the churn gate caught).
+        let mut key_ref_chains: HashSet<u32> = HashSet::new();
+        for slot in &self.slots {
+            if let Some(state) = &slot.state {
+                for &(c, _) in state.keys.values() {
+                    key_ref_chains.insert(c);
+                }
+            }
+        }
+        for &ci in &live_chains {
+            let cd = &self.chains[ci as usize];
+            if cd.spans.is_empty() && cd.children.is_empty() && !key_ref_chains.contains(&ci) {
+                return Err(format!("live chain {ci} is orphaned (GC leak)"));
             }
         }
         let mut distinct = 0u64;
