@@ -979,9 +979,7 @@ class ServeOrchestrator:
     def _launch_sidecars(self) -> None:
         engine_transport = getattr(self.args, "connection_mode", "grpc")
         if engine_transport not in ("grpc", "zmq"):
-            raise ValueError(
-                "--router-worker-mode smg requires a grpc or zmq engine transport"
-            )
+            raise ValueError("--router-worker-mode smg requires a grpc or zmq engine transport")
         if self.backend not in ("sglang", "vllm", "tokenspeed"):
             raise ValueError(f"two-tier SMG Workers do not support backend {self.backend}")
         if engine_transport == "zmq" and self.backend == "sglang":

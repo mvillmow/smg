@@ -21,13 +21,13 @@ use pyo3::{
     prelude::*,
 };
 use smg::worker::{RuntimeType, ZmqWorkerTransport};
-use smg_grpc_client::worker_proto::{
-    self as proto,
-    worker_control_server::{WorkerControl, WorkerControlServer as TonicWorkerControlServer},
-};
 use smg_grpc_client::{
     worker_inference::{EngineTransport, EngineWorkerInference},
     worker_inference_proto::worker_inference_server::WorkerInferenceServer,
+    worker_proto::{
+        self as proto,
+        worker_control_server::{WorkerControl, WorkerControlServer as TonicWorkerControlServer},
+    },
 };
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;

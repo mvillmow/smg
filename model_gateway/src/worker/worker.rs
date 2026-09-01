@@ -2052,10 +2052,12 @@ mod tests {
     use tonic::{transport::Server, Request, Response, Status};
 
     use super::*;
-    use crate::routers::grpc::proto_wrapper::{ProtoGenerateRequest, ProtoResponseVariant};
-    use crate::worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder,
+    use crate::{
+        routers::grpc::proto_wrapper::{ProtoGenerateRequest, ProtoResponseVariant},
+        worker::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            BasicWorkerBuilder,
+        },
     };
 
     /// Health config that skips health checks — workers start Ready immediately.
