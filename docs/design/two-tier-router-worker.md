@@ -91,17 +91,18 @@ Earlier B200 validation also passed vLLM non-streaming/streaming/draining and
 SGLang non-streaming. Stock SGLang 0.5.18 streaming remains blocked by its
 upstream request-normalization defect.
 
-## Performance expectation
+## Performance result
 
-Rust gRPC alone does not guarantee a gain. The likely benefit comes from
-keeping parsing, streaming, backpressure, cancellation, and scheduler IPC in
-Rust while avoiding per-request Python/GIL work. Benchmark before making a
-performance claim:
+The [B200 TokenSpeed transport benchmark](../benchmarks/two-tier-transport-tokenspeed-b200-2026-08-31.md)
+compared three 30-second runs at 1, 8, and 16 RPS. ZMQ reduced the Router +
+Worker + engine-frontend CPU path by 41–43% and total service CPU by 5–12%,
+with no throughput difference in the tested range. It did not improve TTFT:
+at 8–16 RPS, p50 was 3–4 ms slower and p99 about 8 ms slower. E2E p50 and ITL
+p99 generally improved, while the high-load E2E tail was mixed.
 
-1. TTFT and inter-token latency at p50/p99;
-2. Router and Worker CPU per generated token;
-3. disconnect-to-engine-abort latency;
-4. overload queueing and backpressure.
+The result supports ZMQ as the colocated CPU-efficiency boundary, not as a
+latency or peak-throughput claim. Trace and optimize its first-frame wakeup
+path before claiming a TTFT improvement.
 
 ## Upstream alignment
 
