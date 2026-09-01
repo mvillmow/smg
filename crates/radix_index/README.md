@@ -63,7 +63,7 @@ the engine page size is what SMG uses today; BYTES exists for text-mode
   | `--peers` | none | sibling replicas to relay Publishes to (comma-separated URLs) |
   | `--bootstrap-from` | none | sibling to Pull state from before serving |
   | `--inferred-ttl-secs` | `180` | idle TTL for placement-fed holders |
-  | `--default-capacity-blocks` | unbounded | capacity for holders that never sent `Added` |
+  | `--default-capacity-blocks` | unbounded | RUNAWAY PROTECTION for holders that never sent `Added` — the index truncates only past 2x this value. Leave unbounded or set well above worker KV size: the placement feed carries no removal signal, so an index that races the worker's own eviction under-matches (measured); idle TTL is the freshness bound. |
   | `--sweep-interval-secs` | `5` | idle-sweep cadence |
   | `--apply-delay-stored-ms` / `--apply-delay-removed-ms` | `0` | staleness injection (experiments only) |
 

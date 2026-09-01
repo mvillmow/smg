@@ -272,13 +272,20 @@ impl Engine {
                             other => Err(other),
                         });
                     if stored.is_ok() && !holder.event_fed {
-                        // Capacity eviction, forest-wide and prefix-
-                        // closed (the tree owns the order; this
-                        // deliberately fixes the old last-chain-only
-                        // accounting).
-                        let held = tree.holder_blocks(holder.id);
-                        if held > holder.capacity_blocks {
-                            tree.truncate_tail(holder.id, holder.capacity_blocks);
+                        // Capacity is RUNAWAY PROTECTION, not an
+                        // eviction mirror: the placement feed carries
+                        // no removal signal, so index-side eviction
+                        // order can never match the worker's real
+                        // order — truncating AT the worker's size
+                        // races it and under-matches (measured: p95
+                        // prediction error 0 -> 9216 tokens when the
+                        // forest-correct accounting made the old
+                        // at-capacity bound actually bind). Truncate
+                        // only past 2x declared capacity; TTL remains
+                        // the freshness bound.
+                        let bound = holder.capacity_blocks.saturating_mul(2);
+                        if tree.holder_blocks(holder.id) > bound {
+                            tree.truncate_tail(holder.id, bound);
                         }
                     }
                 }

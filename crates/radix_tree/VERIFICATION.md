@@ -171,8 +171,17 @@ refused-move, u32 generation wrap, per-holder alias divergence,
 chain double-free, clear-order GC leak, move-order GC leak, cursor
 write-into-freed-slot, and the relay echo amplification — the last
 one a production-service protocol bug no unit test would have seen).
-What remains is the section below, and the R2 service switch onto
-the verified core.
+R2 IS DONE: the service engine runs on the verified core (kv_index
+dropped to a dev-dependency oracle), every service test green
+first-shot, and the end-to-end placement leg on the full sim rig
+matches or beats every reference — cached 0.9433 (old stack 0.9398;
+event-fed ground truth 0.9423), prediction error mean -5.4 / p95 0,
+zero request errors. One more real bug was caught on the way (#10):
+the forest-correct capacity accounting made the old calibrated
+at-capacity bound BIND, racing worker-side eviction the index cannot
+observe (p95 error 0 -> 9216 tokens); capacity is now runaway
+protection at 2x declared, documented, and the attribution leg
+proves the fix exact. What remains is the section below.
 
 ## What a single machine cannot prove (standing honesty)
 
