@@ -11,6 +11,10 @@
 //!   §7-scoped operation streams with shared prefixes, divergent
 //!   tails, duplicates, gaps, and content coincidence.
 
+// Each integration-test binary compiles this module independently and
+// uses a different slice of it; unused-in-this-binary is expected.
+#![allow(dead_code)]
+
 pub mod model;
 pub mod oracle;
 pub mod workload;
