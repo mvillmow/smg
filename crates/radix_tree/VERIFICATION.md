@@ -84,14 +84,19 @@ evidence linked/recorded next to it. Status legend: [ ] open,
   retrying its address), converged to sibling state by end. 0
   errors. Dynamic membership beyond pre-configured peers remains a
   documented design backlog item.
-- F6 [~] **Relay overflow** — the first 90s run instead EXPOSED A
+- F6 [x] **Relay overflow** — the first 90s run instead EXPOSED A
   REAL PROTOCOL BUG: ~190x apply amplification from symmetric peers
   echoing relayed placements forever (idempotent, so correctness
   held — invisible before the per-replica timeline existed). FIXED:
   the engine reports whether an apply changed state and the relay
   forwards only changing applies, so echoes die in one hop (bounded
-  O(K^2)). True overflow drill (small queue via RADIX_RELAY_QUEUE +
-  90s partition) running on the fixed relay.
+  O(K^2)). Verified on the fixed relay: apply counts dropped ~100x
+  to placement-rate levels, replicas in exact lockstep pre-fault.
+  TRUE OVERFLOW then measured (queue=2000, 90s partition): 39,167
+  relay drops at the ingest replica, ingest never blocked, ZERO
+  request errors, routing held (0.9424 cached), and the partitioned
+  replica's divergence stayed bounded per the TTL+re-placement
+  design. MET.
 - F7 [x] **Flap** — 3 kill/relaunch-with-bootstrap cycles on a live
   replica: 0 errors, routing held (0.939 cached), all flaps recorded
   with recovery.
@@ -117,13 +122,16 @@ evidence linked/recorded next to it. Status legend: [ ] open,
   166.7; flat core 169-171): 6.2x smaller than the incumbent. At
   128M blocks: 53.2 B/block (macOS-compression caveat noted, and
   still under the gate even pessimistically).
-- P4 [~] **Mixed-phase latency + soak** — mixed-phase MET: p50
+- P4 [x] **Mixed-phase latency + soak** — mixed-phase MET: p50
   ~400 ns / p99 ~5 us during live writes (8 us p99 at 128M blocks).
   Soak: the first 30-min run measured +27MB linear drift — which
   reproduced the retire-GC leak fixed an hour earlier (that soak had
   compiled a mid-edit tree); the fixed core's diagnostic soak is
   RSS-flat with every internal structure constant (debug_footprint)
-  across 28M ops. 15-min certifying soak on the pushed code running.
+  across 28M ops. CERTIFIED: 15-minute soak on the pushed code —
+  108M ops + 3.46M queries, RSS drift +2.7MB warm-up then +16KB over
+  the final 14 minutes, every internal structure constant to the
+  unit. MET.
 - P5 [x] **Writes >= 1M blocks/s mixed stream**: flat core 10.58M;
   R3 4.6M (trie-walk + span surgery cost; 4.6x over the gate, ~par
   with the oracle's 5.5M). Evidence: SPEC log + campaign3.
@@ -152,6 +160,19 @@ match latency. Block size is configurable end to end
 (`--kv-indexer-block-size` on the gateway, `--block-size` on the
 bridge, keyspace-keyed on the service) and MUST equal the engine page
 size — this table is why.
+
+## Campaign result
+
+Every locally-provable criterion is MET: 7/7 correctness, 7/7 fault
+tolerance, 6/6 performance — with the ORIGINAL gates, no amendments.
+Nine real bugs were found by the instruments and fixed with
+regression locks along the way (twin-key corruption, destructive
+refused-move, u32 generation wrap, per-holder alias divergence,
+chain double-free, clear-order GC leak, move-order GC leak, cursor
+write-into-freed-slot, and the relay echo amplification — the last
+one a production-service protocol bug no unit test would have seen).
+What remains is the section below, and the R2 service switch onto
+the verified core.
 
 ## What a single machine cannot prove (standing honesty)
 
