@@ -512,7 +512,7 @@ mod tests {
         loop {
             match try_smg_worker_reachable(&endpoint, 1).await {
                 Ok(discovery) => {
-                    assert_eq!(discovery.worker_id, "mock-127.0.0.1");
+                    assert_eq!(discovery.worker_id, format!("mock-worker-{port}"));
                     assert_eq!(discovery.engines.len(), 1);
                     assert_eq!(discovery.engines[0].model_ids, ["mock-model"]);
                     break;

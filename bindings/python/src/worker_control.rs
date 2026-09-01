@@ -483,10 +483,10 @@ fn start_server(
                         return;
                     }
                 };
+                runtime_running.store(true, Ordering::Release);
                 if started_tx.send(Ok(address)).is_err() {
                     return;
                 }
-                runtime_running.store(true, Ordering::Release);
                 let incoming = TcpListenerStream::new(listener);
                 if let Err(error) = Server::builder()
                     .add_service(TonicWorkerControlServer::new(service))

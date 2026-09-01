@@ -55,6 +55,28 @@ use crate::{
 /// Default HTTP client timeout for worker requests (in seconds)
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
 
+const TOKEN_ONLY_WIRE_FEATURE: &str = "token_only_wire";
+
+fn smg_worker_uses_token_only_wire(labels: &std::collections::HashMap<String, String>) -> bool {
+    if labels
+        .get("engine_transport")
+        .or_else(|| labels.get("smg.engine.engine_transport"))
+        .is_some_and(|transport| transport.eq_ignore_ascii_case("zmq"))
+    {
+        return true;
+    }
+
+    ["smg.features", "smg.engine_features"].iter().any(|key| {
+        labels.get(*key).is_some_and(|features| {
+            serde_json::from_str::<Vec<String>>(features).is_ok_and(|features| {
+                features
+                    .iter()
+                    .any(|feature| feature == TOKEN_ONLY_WIRE_FEATURE)
+            })
+        })
+    })
+}
+
 /// A worker's HTTP client handle, materialized on first use.
 ///
 /// Registration hands in a shared client from the worker client cache. A
@@ -1634,6 +1656,8 @@ impl Worker for BasicWorker {
                         let runtime = self.metadata.spec.runtime_type;
                         let runtime_str = runtime.to_string();
                         let worker_mode = self.metadata.spec.worker_mode;
+                        let token_only_wire =
+                            smg_worker_uses_token_only_wire(&self.metadata.spec.labels);
                         tracing::info!(
                             "Lazily initializing gRPC client ({}) for worker: {}",
                             runtime_str,
@@ -1645,7 +1669,9 @@ impl Worker for BasicWorker {
                                 .await
                                 .map(|client| {
                                     BackendClient::Smg(Arc::new(SmgBackendClient::new(
-                                        client, runtime,
+                                        client,
+                                        runtime,
+                                        token_only_wire,
                                     )))
                                 })
                         } else {
@@ -2034,6 +2060,7 @@ mod tests {
     use std::{pin::Pin, thread, time::Duration};
 
     use futures::{stream, Stream};
+    use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
     use openai_protocol::worker::HealthCheckConfig;
     use smg_grpc_client::{
         tokenspeed_proto,
@@ -2117,6 +2144,23 @@ mod tests {
         assert_eq!(config.failure_threshold, 5);
         assert_eq!(config.success_threshold, 3);
         assert!(config.disable_health_check);
+    }
+
+    #[test]
+    fn smg_token_only_wire_detects_transport_attribute_and_feature() {
+        let attribute =
+            std::collections::HashMap::from([("engine_transport".to_string(), "zmq".to_string())]);
+        assert!(smg_worker_uses_token_only_wire(&attribute));
+
+        let feature = std::collections::HashMap::from([(
+            "smg.engine_features".to_string(),
+            r#"["generate","token_only_wire"]"#.to_string(),
+        )]);
+        assert!(smg_worker_uses_token_only_wire(&feature));
+
+        let grpc =
+            std::collections::HashMap::from([("engine_transport".to_string(), "grpc".to_string())]);
+        assert!(!smg_worker_uses_token_only_wire(&grpc));
     }
 
     #[test]
@@ -2292,7 +2336,8 @@ mod tests {
             .worker_mode(WorkerMode::Smg)
             .control_url(Some("grpc://127.0.0.1:1".to_string()))
             .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::Sglang)
+            .runtime_type(RuntimeType::Vllm)
+            .label("engine_transport", "zmq")
             .health_config(no_health_check())
             .build();
         let client = worker
@@ -2301,17 +2346,34 @@ mod tests {
             .expect("connect WorkerInference")
             .expect("gRPC backend");
         assert!(matches!(client.as_ref(), BackendClient::Smg(_)));
-        assert_eq!(client.runtime_type(), RuntimeType::Sglang);
+        assert_eq!(client.runtime_type(), RuntimeType::Vllm);
+        assert!(client.uses_token_only_wire());
+
+        let mut request =
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                request_id: "smg-data".to_string(),
+                sampling_params: Some(tokenspeed_proto::SamplingParams {
+                    stop: vec!["Hello world".to_string()],
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            }));
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        assert_eq!(
+            client.finalize_generate_request(&mut request, Some(&tokenizer)),
+            ["Hello world"]
+        );
+        let ProtoGenerateRequest::TokenSpeed(finalized) = &request else {
+            panic!("expected TokenSpeed request");
+        };
+        let sampling = finalized.sampling_params.as_ref().expect("sampling params");
+        assert!(sampling.stop.is_empty());
+        assert_eq!(sampling.stop_token_ids, tokenizer.eos_token_ids());
 
         let mut client = client.as_ref().clone();
         let mut response = client
-            .generate(ProtoGenerateRequest::TokenSpeed(Box::new(
-                tokenspeed_proto::GenerateRequest {
-                    request_id: "smg-data".to_string(),
-                    stream: true,
-                    ..Default::default()
-                },
-            )))
+            .generate(request)
             .await
             .expect("WorkerInference generate");
         let item = response

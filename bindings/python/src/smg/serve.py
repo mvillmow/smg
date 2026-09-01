@@ -239,11 +239,6 @@ class SglangWorkerLauncher(WorkerLauncher):
     def build_command(
         self, args: argparse.Namespace, backend_args: list[str], host: str, port: int
     ) -> list[str]:
-        mode = getattr(args, "connection_mode", "grpc")
-        # Native SGLang gRPC runs alongside HTTP and requires a distinct port.
-        # Keep the externally advertised worker port for gRPC; the auxiliary
-        # HTTP frontend is not routed to and lives in a disjoint port band.
-        http_port = port + 20000 if port <= 45535 else port - 20000
         cmd = [
             sys.executable,
             "-m",
@@ -253,27 +248,17 @@ class SglangWorkerLauncher(WorkerLauncher):
             "--host",
             host,
             "--port",
-            str(http_port if mode == "grpc" else port),
+            str(port),
         ]
-        if mode == "grpc":
-            cmd.extend(["--grpc-port", str(port)])
+        if getattr(args, "connection_mode", "grpc") == "grpc":
+            cmd.append("--grpc-mode")
 
-        if mode == "http" and getattr(args, "enable_token_usage_details", False):
+        if getattr(args, "connection_mode", "grpc") == "http" and getattr(
+            args, "enable_token_usage_details", False
+        ):
             cmd.append("--enable-cache-report")
 
-        cmd.extend(
-            self._filter_backend_args(
-                backend_args,
-                [
-                    "--model-path",
-                    "--host",
-                    "--port",
-                    "--grpc-port",
-                    "--grpc-mode",
-                    "--smg-grpc-mode",
-                ],
-            )
-        )
+        cmd.extend(self._filter_backend_args(backend_args, ["--model-path", "--host", "--port"]))
         return cmd
 
 

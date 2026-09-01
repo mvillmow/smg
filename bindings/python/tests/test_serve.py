@@ -685,7 +685,7 @@ class TestSglangWorkerLauncher:
     """Test SglangWorkerLauncher.build_command()."""
 
     def test_build_command_grpc_mode_default(self):
-        """gRPC mode uses SGLang's native Rust service on the worker port."""
+        """Default connection_mode is grpc, so --grpc-mode should be present."""
         launcher = SglangWorkerLauncher()
         args = argparse.Namespace(model_path="/tmp/model", connection_mode="grpc")
         backend_args = ["--model-path", "/tmp/model", "--trust-remote-code"]
@@ -695,10 +695,8 @@ class TestSglangWorkerLauncher:
         assert "--host" in cmd
         assert "127.0.0.1" in cmd
         assert "--port" in cmd
-        assert cmd[cmd.index("--port") + 1] == "51000"
-        assert cmd[cmd.index("--grpc-port") + 1] == "31000"
-        assert "--grpc-mode" not in cmd
-        assert "--smg-grpc-mode" not in cmd
+        assert "31000" in cmd
+        assert "--grpc-mode" in cmd
         for arg in backend_args:
             assert arg in cmd
 

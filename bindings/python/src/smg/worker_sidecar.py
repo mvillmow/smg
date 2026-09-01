@@ -35,6 +35,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.engine_transport == "zmq" and args.engine_type == "sglang":
         raise ValueError("SGLang Worker transport does not support ZMQ yet")
     stopped = threading.Event()
+    features = ["generate", "stream", "abort"]
+    if args.engine_transport == "zmq":
+        features.append("token_only_wire")
     server = WorkerControlServer(
         bind_address=args.bind_address,
         worker_id=args.worker_id,
@@ -42,7 +45,7 @@ def main(argv: list[str] | None = None) -> None:
         hostname=socket.gethostname(),
         engine_endpoint=args.engine_endpoint,
         model_ids=args.model_ids,
-        features=["generate", "stream", "abort"],
+        features=features,
         max_concurrent_requests=max(0, args.max_concurrent_requests),
         inference_enabled=True,
         engine_attributes={

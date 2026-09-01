@@ -51,11 +51,20 @@ pub enum BackendClient {
 pub struct SmgBackendClient {
     inference: WorkerInferenceClient,
     runtime: RuntimeType,
+    token_only_wire: bool,
 }
 
 impl SmgBackendClient {
-    pub fn new(inference: WorkerInferenceClient, runtime: RuntimeType) -> Self {
-        Self { inference, runtime }
+    pub fn new(
+        inference: WorkerInferenceClient,
+        runtime: RuntimeType,
+        token_only_wire: bool,
+    ) -> Self {
+        Self {
+            inference,
+            runtime,
+            token_only_wire,
+        }
     }
 }
 
@@ -114,6 +123,17 @@ impl BackendClient {
         matches!(self, Self::Zmq(_))
     }
 
+    /// True when the engine-facing wire accepts token ids but cannot match
+    /// string stops. This includes direct ZMQ and an SMG Worker that advertises
+    /// a colocated ZMQ engine transport.
+    pub fn uses_token_only_wire(&self) -> bool {
+        match self {
+            Self::Smg(client) => client.token_only_wire,
+            Self::Zmq(_) => true,
+            Self::Grpc(_) => false,
+        }
+    }
+
     /// Finalize a built generate request for this backend's wire: resolve
     /// string `stop`s the engine cannot match (token-only wires and SGLang's
     /// `skip_tokenizer_init` workers) into `stop_token_ids`, folding in EOS
@@ -128,9 +148,13 @@ impl BackendClient {
         request: &mut ProtoGenerateRequest,
         tokenizer: Option<&Arc<dyn llm_tokenizer::traits::Tokenizer>>,
     ) -> Vec<String> {
-        let token_only_wire = self.is_zmq();
+        let token_only_wire = self.uses_token_only_wire();
         let router_stops = helpers::resolve_string_stops(request, tokenizer, token_only_wire);
-        if let Self::Zmq(client) = self {
+        if let Self::Smg(client) = self {
+            if client.token_only_wire && client.runtime == RuntimeType::Vllm {
+                fold_smg_vllm_eos_backstop(request, tokenizer);
+            }
+        } else if let Self::Zmq(client) = self {
             // EngineCore has no tokenizer, so stopping at EOS is this
             // frontend's job; TokenSpeed's scheduler stops at EOS itself, and
             // its requests are a different proto variant — the fold's own
@@ -472,6 +496,60 @@ impl BackendClient {
                 },
             ),
         }
+    }
+}
+
+/// Add tokenizer EOS ids to the portable TokenSpeed-shaped request used on
+/// the Router-to-Worker wire when the Worker ultimately targets tokenizer-less
+/// vLLM EngineCore. The Worker preserves these stop ids when translating to
+/// vLLM, so a repo-id deployment still stops at EOS when its local model path
+/// cannot be inspected.
+fn fold_smg_vllm_eos_backstop(
+    request: &mut ProtoGenerateRequest,
+    tokenizer: Option<&Arc<dyn llm_tokenizer::traits::Tokenizer>>,
+) {
+    let ProtoGenerateRequest::TokenSpeed(request) = request else {
+        return;
+    };
+    let Some(params) = request.sampling_params.as_mut() else {
+        return;
+    };
+    if params.ignore_eos {
+        return;
+    }
+    if let Some(tokenizer) = tokenizer {
+        for &id in tokenizer.eos_token_ids() {
+            if !params.stop_token_ids.contains(&id) {
+                params.stop_token_ids.push(id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
+
+    use super::*;
+
+    #[test]
+    fn smg_vllm_eos_backstop_updates_portable_request() {
+        let mut request =
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                sampling_params: Some(tokenspeed_proto::SamplingParams::default()),
+                ..Default::default()
+            }));
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+        fold_smg_vllm_eos_backstop(&mut request, Some(&tokenizer));
+
+        let ProtoGenerateRequest::TokenSpeed(request) = request else {
+            panic!("expected TokenSpeed request");
+        };
+        assert_eq!(
+            request.sampling_params.unwrap().stop_token_ids,
+            tokenizer.eos_token_ids()
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 # Two-Tier SMG Router/Worker Architecture
 
-Status: prototype on `feat/two-tier-router-worker`
+Status: prototype on `feat/two-tier-smg-worker-zmq`
 
 Scope: text generation only. LoRA management is excluded and will be handled
 in a separate PR.
@@ -31,6 +31,11 @@ The Router never connects directly to a node-local engine endpoint.
 `WorkerInference` provides engine-neutral tokenized generation, streaming, and
 abort. Engine-specific protobufs and scheduler details remain behind the
 Worker boundary.
+
+Workers advertise `token_only_wire` when the engine-facing transport cannot
+match string stops (currently ZMQ). The Router then retains string-stop
+trimming and supplies tokenizer EOS ids as a vLLM EngineCore backstop across
+the otherwise engine-neutral Worker hop.
 
 The first version deliberately excludes embeddings, multimodal tensors, and
 disaggregated execution until they have explicit contracts.

@@ -40,6 +40,8 @@ pub enum BackendType {
     /// vLLM engine. Routing behaves like the default; over ZMQ this pins the
     /// startup workers' wire protocol to vLLM EngineCore.
     Vllm,
+    /// TensorRT-LLM engine behind an SMG Worker data plane.
+    Trtllm,
     /// TokenSpeed engine. Routing behaves like the default; over ZMQ this pins
     /// the startup workers' wire protocol to TokenSpeed.
     Tokenspeed,
@@ -817,19 +819,23 @@ impl Router {
         // handshake carries no engine identity, so the wire protocol cannot be
         // probed. HTTP/gRPC keep auto-detection (None). Mirrors
         // `to_router_config` in model_gateway/src/main.rs.
-        let startup_worker_runtime_type =
-            if matches!(self.connection_mode, worker::ConnectionMode::Zmq)
-                || self.worker_mode == worker::WorkerMode::Smg
-            {
-                match self.backend {
-                    BackendType::Sglang => Some(worker::RuntimeType::Sglang),
-                    BackendType::Vllm => Some(worker::RuntimeType::Vllm),
-                    BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+        let startup_worker_runtime_type = if self.worker_mode == worker::WorkerMode::Smg {
+            match self.backend {
+                BackendType::Sglang => Some(worker::RuntimeType::Sglang),
+                BackendType::Vllm => Some(worker::RuntimeType::Vllm),
+                BackendType::Trtllm => Some(worker::RuntimeType::Trtllm),
+                BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
+                _ => None,
+            }
+        } else if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
+            match self.backend {
+                BackendType::Vllm => Some(worker::RuntimeType::Vllm),
+                BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
         config::RouterConfig::builder()
             .mode(mode)
