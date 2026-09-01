@@ -22,14 +22,14 @@ use common::{
     oracle::Oracle,
     workload, Op,
 };
-use radix_tree::{Config, FlatTree, HolderId, OverlapScratch, RadixTree3, StoreError};
+use radix_tree::{Config, FlatTree, HolderId, OverlapScratch, RadixTree, StoreError};
 
 /// The implementations under test (flat R1 and chain-native R3),
 /// driven by the harness Op protocol. Every observable is asserted
 /// for BOTH against the model.
 enum Core {
     Flat(FlatTree),
-    Chain(RadixTree3),
+    Chain(RadixTree),
 }
 
 struct Subject {
@@ -54,7 +54,7 @@ impl Subject {
     }
 
     fn new_chain(holders: usize) -> Self {
-        let mut tree = RadixTree3::new(Config::default());
+        let mut tree = RadixTree::new(Config::default());
         let ids = (0..holders)
             .map(|h| tree.create_holder(&format!("holder-{h}")))
             .collect();

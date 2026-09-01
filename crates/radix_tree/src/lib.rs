@@ -1,25 +1,26 @@
-//! Generic prefix-membership index — the R1 flat core.
+//! Generic prefix-membership index.
 //!
 //! The contract lives in `SPEC.md`; the referee lives in
-//! `tests/differential.rs` (this implementation must equal the model
-//! there, always). Shape per §9: a flat positional entry map keyed by
-//! `(position, content)` with lineage-disambiguated membership, plus
-//! an internal per-holder registry — order-insensitive set semantics,
-//! so §7 convergence holds by construction. Single-writer (§8): no
-//! locks, no atomics, no shards.
+//! `tests/differential.rs` (every implementation must equal the
+//! reference model there, always). Two cores share the contract:
+//! [`RadixTree`] (the chain-native primary, `chain.rs`) and
+//! [`FlatTree`] (below in this file) — a flat positional entry map
+//! keyed by `(position, content)` with lineage-disambiguated
+//! membership and an internal per-holder registry;
+//! order-insensitive set semantics make convergence hold by
+//! construction. Both are single-writer: no locks, no atomics, no
+//! shards (§8).
 
 #![forbid(unsafe_code)]
 
-mod core3;
-/// The chain-native core is the crate's PRIMARY type: every original
-/// performance gate passed on it (26.9 B/holder-block, exact-match
-/// gate cell p99 7.6 us, scale-stable at 128M blocks) with the full
-/// referee equal. The flat core remains as [`FlatTree`] — a second,
-/// independently-verified implementation the dual-core harness keeps
-/// asserting against the model, and the substrate the chain core's
-/// interner came from.
-pub use core3::RadixTree3 as RadixTree;
-pub use core3::RadixTree3;
+mod chain;
+/// The chain-native core is the crate's primary type: chains stored
+/// as contiguous data shared by every holder, membership as maximal
+/// runs over interned holder sets, one entry probe per query. The
+/// flat core remains as [`FlatTree`] — a second, independently
+/// verified implementation the dual-core harness keeps asserting
+/// against the model.
+pub use chain::RadixTree;
 use rustc_hash::FxHashMap;
 
 /// Position-independent content identity (the matching currency).
@@ -844,7 +845,7 @@ impl FlatTree {
         }
     }
 
-    // ---- verification (campaign C2) ----
+    // ---- verification ----
 
     /// Full-state consistency audit: recomputes every counter and
     /// cross-checks every structure from first principles. O(state);

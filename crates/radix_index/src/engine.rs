@@ -1,7 +1,7 @@
-//! The index engine: keyspaces of holders over a shared
-//! [`PositionalIndexer`], with epoch-scoped holder state, per-feed
-//! eviction semantics, and overlap queries. Pure and synchronous — the
-//! gRPC surface, relay, and bootstrap live in `server.rs`.
+//! The index engine: one `radix_tree::RadixTree` per keyspace, with
+//! epoch-scoped holder state, per-feed eviction semantics, and
+//! overlap queries. Pure and synchronous — the gRPC surface, relay,
+//! and bootstrap live in `server.rs`.
 //!
 //! Correctness model (see `.claude/kv-index-service/01-design.md`):
 //! - Event feed: one worker-sequenced stream per (holder, epoch); apply
@@ -16,9 +16,11 @@
 //! - Feed authority: a holder becomes event-fed on its first observed
 //!   removal (or an explicit `Added { event_fed: true }`); inferred
 //!   Stored updates for an event-fed holder are dropped.
-//! - Inferred eviction is tail-first per holder (prefix-closed, which
-//!   the jump search assumes), by capacity in blocks with a TTL floor
-//!   that retires whole idle holders.
+//! - Freshness is holder-granular: idle inferred holders are cleared
+//!   by TTL, idle dropped holders are RETIRED entirely. Capacity is
+//!   runaway protection only (truncate past 2x declared, tail-first
+//!   and prefix-closed) — the placement feed has no removal signal,
+//!   so index-side eviction must never race the worker's own.
 
 use std::{
     collections::HashMap,
@@ -684,10 +686,19 @@ mod tests {
             default_capacity_blocks: 4,
             ..EngineConfig::default()
         });
+        // Capacity is runaway protection: truncation fires only past
+        // 2x the declared value (racing the worker's own unobservable
+        // eviction was measured to under-match), so 8 blocks at
+        // capacity 4 stay put...
         engine.apply(&placement("w1", 3, 8));
-        // Head survives, tail evicted: prefix-closed at depth 4.
-        assert_eq!(scores(&engine, 3, 8), vec![("w1".into(), 4)]);
-        assert_eq!(engine.entry_count(), 4);
+        assert_eq!(scores(&engine, 3, 8), vec![("w1".into(), 8)]);
+        // ...and 12 blocks truncate to the 2x bound, prefix-closed:
+        // the HEAD survives (depth 8 from position 0), never a
+        // mid-chain hole.
+        engine.apply(&placement("w1", 3, 12));
+        assert_eq!(scores(&engine, 3, 12), vec![("w1".into(), 8)]);
+        assert_eq!(scores(&engine, 3, 4), vec![("w1".into(), 4)]);
+        assert_eq!(engine.entry_count(), 8);
     }
 
     #[test]

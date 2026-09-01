@@ -8,7 +8,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use radix_tree::{Config, FlatTree, RadixTree3};
+use radix_tree::{Config, FlatTree, RadixTree};
 
 struct Counting;
 
@@ -88,7 +88,7 @@ fn run_flat() {
 /// Same gate for the chain-native core: contents-Vec growth and span
 /// bookkeeping must amortize, never per-block allocate.
 fn run_chain() {
-    let mut tree = RadixTree3::new(Config::default());
+    let mut tree = RadixTree::new(Config::default());
     let h = tree.create_holder("h");
     let warm: Vec<(u64, u64)> = (1..=64u64).map(|i| (i, i ^ 0xABCD)).collect();
     tree.store(h, None, &warm).expect("warm");

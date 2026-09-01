@@ -1,4 +1,4 @@
-//! The R3 chain-native core (R3-DESIGN.md): chains as contiguous
+//! The chain-native core (R3-DESIGN.md): chains as contiguous
 //! data, canonical maximal-run membership spans, one entry probe per
 //! query. Same §4 API and §6/§7 contract as the flat core; the
 //! differential referee proves equality.
@@ -80,7 +80,7 @@ struct Slot3 {
     state: Option<HolderState3>,
 }
 
-pub struct RadixTree3 {
+pub struct RadixTree {
     cfg: Config,
     chains: Vec<ChainData>,
     free_chains: Vec<u32>,
@@ -100,7 +100,7 @@ pub struct RadixTree3 {
     distinct_entries: u64,
 }
 
-impl RadixTree3 {
+impl RadixTree {
     pub fn new(cfg: Config) -> Self {
         Self {
             cfg,
@@ -342,7 +342,8 @@ impl RadixTree3 {
         // The CURSOR chain is pinned against GC for the gap between
         // this removal and the add just below: an in-batch move can
         // otherwise free the chain the batch is standing on, and the
-        // next block would write into a freed slot (chaos seed 2).
+        // next block would write into a freed slot (found by the
+        // chaos fuzz).
         if let Some(old) = self.state_of(holder).keys.get(&key).copied() {
             self.state_of_mut(holder).keys.remove(&key);
             self.remove_membership_pinned(holder, old, Some(chain));
