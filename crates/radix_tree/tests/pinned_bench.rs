@@ -20,9 +20,25 @@ use std::time::Instant;
 use common::{oracle::Oracle, Op, Rng};
 use radix_tree::{Config, HolderId, RadixTree};
 
-// ---- §11 normative constants ----
-const TARGET_BLOCKS: u64 = 10_000_000;
-const HOLDERS: usize = 256;
+// ---- §11 normative constants (default scale) ----
+// RADIX_BENCH_SCALE=large runs 8x blocks / 8x holders (~20 GB peak,
+// ~60% of the 1.7e8 production target) to expose growth
+// nonlinearities the normative scale can't: hash-table growth stalls,
+// TLB pressure on a ~17 GB resident structure, query latency vs
+// table size. Gates are quoted at the DEFAULT scale; large-scale
+// runs are diagnostics.
+fn target_blocks() -> u64 {
+    match std::env::var("RADIX_BENCH_SCALE").as_deref() {
+        Ok("large") => 100_000_000,
+        _ => 10_000_000,
+    }
+}
+fn holders() -> usize {
+    match std::env::var("RADIX_BENCH_SCALE").as_deref() {
+        Ok("large") => 2048,
+        _ => 256,
+    }
+}
 /// (sharing factor H, share of total holder-blocks in percent).
 const SHARING_MIX: [(usize, u64); 3] = [(1, 50), (8, 35), (64, 15)];
 const SHARED_DEPTH: (u32, u32) = (8, 512); // log-uniform
@@ -51,7 +67,7 @@ fn build_families(rng: &mut Rng) -> Vec<Family> {
     // One forced gate family: H=64, shared length >= GATE_DEPTH.
     let mut budgets: Vec<(usize, u64)> = SHARING_MIX
         .iter()
-        .map(|&(h, pct)| (h, TARGET_BLOCKS * pct / 100))
+        .map(|&(h, pct)| (h, target_blocks() * pct / 100))
         .collect();
     let mut force_gate = true;
     for (h, budget) in budgets.iter_mut() {
@@ -75,15 +91,19 @@ fn build_families(rng: &mut Rng) -> Vec<Family> {
                 blocks.push((key, content));
                 prev_key = key;
             }
-            let mut holders = Vec::with_capacity(*h);
-            let base = rng.below(HOLDERS);
+            let holder_count = holders();
+            let mut members = Vec::with_capacity(*h);
+            let base = rng.below(holder_count);
             for k in 0..*h {
-                holders.push((base + k * 7) % HOLDERS);
+                members.push((base + k * 7) % holder_count);
             }
-            holders.sort_unstable();
-            holders.dedup();
-            used += shared_len as u64 * holders.len() as u64;
-            families.push(Family { blocks, holders });
+            members.sort_unstable();
+            members.dedup();
+            used += shared_len as u64 * members.len() as u64;
+            families.push(Family {
+                blocks,
+                holders: members,
+            });
         }
     }
     families
@@ -92,7 +112,7 @@ fn build_families(rng: &mut Rng) -> Vec<Family> {
 /// Expand families into the mixed write stream (stores + duplicates +
 /// gap removes), per-holder order preserved, §7-scoped interleave.
 fn build_ops(rng: &mut Rng, families: &[Family]) -> (Vec<Op>, u64) {
-    let mut per_holder: Vec<Vec<Op>> = vec![Vec::new(); HOLDERS];
+    let mut per_holder: Vec<Vec<Op>> = vec![Vec::new(); holders()];
     let mut holder_blocks = 0u64;
     for family in families {
         for &holder in &family.holders {
@@ -150,9 +170,9 @@ fn build_ops(rng: &mut Rng, families: &[Family]) -> (Vec<Op>, u64) {
             script.extend(gaps);
         }
     }
-    let mut cursors = vec![0usize; HOLDERS];
+    let mut cursors = vec![0usize; holders()];
     let mut ops = Vec::new();
-    let mut live: Vec<usize> = (0..HOLDERS)
+    let mut live: Vec<usize> = (0..holders())
         .filter(|&h| !per_holder[h].is_empty())
         .collect();
     while !live.is_empty() {
@@ -274,12 +294,12 @@ fn pinned_workload() {
     let mut sider = match side_name.as_str() {
         "r1" => {
             let mut tree = RadixTree::new(Config::default());
-            let ids = (0..HOLDERS)
+            let ids = (0..holders())
                 .map(|h| tree.create_holder(&format!("holder-{h}")))
                 .collect();
             Sider::R1(tree, ids, Vec::new())
         }
-        _ => Sider::Oracle(Oracle::new(HOLDERS), vec![Vec::new(); HOLDERS]),
+        _ => Sider::Oracle(Oracle::new(holders()), vec![Vec::new(); holders()]),
     };
     let fill_start = Instant::now();
     for op in &ops {
