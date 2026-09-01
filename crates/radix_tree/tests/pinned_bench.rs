@@ -318,6 +318,25 @@ fn pinned_workload() {
 
     let side_name = side();
     println!("side: {side_name}");
+    // P4 mixed-phase probes: built BEFORE the fill so latency can be
+    // sampled while the write stream runs.
+    let mut mixed_probes: Vec<Vec<u64>> = Vec::new();
+    for fam in families.iter().filter(|f| f.holders.len() == 64) {
+        if fam.blocks.len() >= GATE_DEPTH as usize && mixed_probes.len() < 32 {
+            mixed_probes.push(
+                fam.blocks[..GATE_DEPTH as usize]
+                    .iter()
+                    .map(|&(_, c)| c)
+                    .collect(),
+            );
+        }
+    }
+    for fam in families.iter().filter(|f| f.holders.len() == 1) {
+        if mixed_probes.len() < 64 {
+            let d = fam.blocks.len().min(64);
+            mixed_probes.push(fam.blocks[..d].iter().map(|&(_, c)| c).collect());
+        }
+    }
     let rss_before = rss_kib();
     let mut sider = match side_name.as_str() {
         "r1" => {
@@ -337,8 +356,25 @@ fn pinned_workload() {
         _ => Sider::Oracle(Oracle::new(holders()), vec![Vec::new(); holders()]),
     };
     let fill_start = Instant::now();
+    let mut mixed_lat: Vec<u64> = Vec::new();
+    let mut since_probe = 0u64;
+    let mut probe_idx = 0usize;
     for op in &ops {
         sider.apply(op);
+        if let Op::Store { blocks, .. } = op {
+            since_probe += blocks.len() as u64;
+        }
+        // P4: one probe query every ~250k stream blocks, timed inside
+        // the live write phase.
+        if since_probe >= 250_000 && !mixed_probes.is_empty() {
+            since_probe = 0;
+            let q = &mixed_probes[probe_idx % mixed_probes.len()];
+            probe_idx += 1;
+            let t = Instant::now();
+            let n = sider.query(q);
+            mixed_lat.push(t.elapsed().as_nanos() as u64);
+            std::hint::black_box(n);
+        }
     }
     let fill = fill_start.elapsed();
     let rss_after = rss_kib();
@@ -388,6 +424,15 @@ fn pinned_workload() {
     }
     cells.push(("miss".to_string(), misses));
 
+    if !mixed_lat.is_empty() {
+        mixed_lat.sort_unstable();
+        println!(
+            "cell mixed-phase: n={} p50={}ns p99={}ns (queries during live writes)",
+            mixed_lat.len(),
+            percentile(&mixed_lat, 0.50),
+            percentile(&mixed_lat, 0.99),
+        );
+    }
     for (label, queries) in &cells {
         if queries.is_empty() {
             println!("cell {label}: EMPTY (workload bug)");
@@ -410,6 +455,67 @@ fn pinned_workload() {
             lat.len(),
             percentile(&lat, 0.50),
             percentile(&lat, 0.99),
+        );
+    }
+    // P4 soak (RADIX_BENCH_SOAK_SECS): steady-state churn — cyclic
+    // duplicate re-publish (idempotent placement churn), retire/create
+    // holder cycles, and a query stream. RSS must stay flat: growth
+    // here is a leak by definition (no new state is being added).
+    let soak_secs: u64 = std::env::var("RADIX_BENCH_SOAK_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if soak_secs > 0 {
+        println!("soak: {soak_secs}s of duplicate/holder churn + queries");
+        let soak_start = Instant::now();
+        let mut last_report = Instant::now();
+        let rss_soak_start = rss_kib();
+        let mut op_i = 0usize;
+        let mut probe_i = 0usize;
+        let mut churn_cycle = 0u64;
+        let mut qps = 0u64;
+        let mut ops_applied = 0u64;
+        while soak_start.elapsed().as_secs() < soak_secs {
+            for _ in 0..2000 {
+                sider.apply(&ops[op_i % ops.len()]);
+                op_i += 1;
+            }
+            ops_applied += 2000;
+            for _ in 0..64 {
+                if !mixed_probes.is_empty() {
+                    let q = &mixed_probes[probe_i % mixed_probes.len()];
+                    probe_i += 1;
+                    std::hint::black_box(sider.query(q));
+                    qps += 1;
+                }
+            }
+            if let Sider::R1(tree, _, _, _) = &mut sider {
+                churn_cycle += 1;
+                let h = tree.create_holder(&format!("soak-churn-{churn_cycle}"));
+                let _ = tree.store(h, None, &[(churn_cycle | 1, churn_cycle | 1)]);
+                tree.retire_holder(h);
+            } else if let Sider::R3(tree, _, _, _) = &mut sider {
+                churn_cycle += 1;
+                let h = tree.create_holder(&format!("soak-churn-{churn_cycle}"));
+                let _ = tree.store(h, None, &[(churn_cycle | 1, churn_cycle | 1)]);
+                tree.retire_holder(h);
+            }
+            if last_report.elapsed().as_secs() >= 60 {
+                last_report = Instant::now();
+                println!(
+                    "soak t={}s rss={} KiB (drift {:+} KiB) ops={} queries={}",
+                    soak_start.elapsed().as_secs(),
+                    rss_kib(),
+                    rss_kib() as i64 - rss_soak_start as i64,
+                    ops_applied,
+                    qps
+                );
+            }
+        }
+        let drift = rss_kib() as i64 - rss_soak_start as i64;
+        println!(
+            "soak done: rss drift {:+} KiB over {soak_secs}s ({} ops, {} queries)",
+            drift, ops_applied, qps
         );
     }
     std::hint::black_box(&sider as *const _);
