@@ -24,28 +24,19 @@ evidence linked/recorded next to it. Status legend: [ ] open,
   counter, forward+reverse containment, bucket order, name/free-list
   coherence, interner coherence; green after EVERY op across the
   fuzz. First extended run caught real state corruption (twin-key
-  membership sharing) within minutes.: a debug-audit method proving
-  cross-structure consistency (registry <-> entries <-> counters <->
-  name maps <-> free list) after every operation in fuzz mode — this
-  catches state corruption that answer-comparison alone cannot.
+  membership sharing) within minutes.
 - C3 [x] **Out-of-contract determinism** — the referee model is now
   TOTAL (per-block literal lineages; every §4 alias rule mirrored,
   chain bound mirrored), so chaos runs under the same hard gate:
   subject == model on arbitrary inputs, deterministic replay, no
   panics, audit green. Two more real bugs fixed on the way: the
   destructive refused-move, and the twin-key drop semantics now
-  normative in SPEC §4.: deliberately violate
-  chain-consistency (duplicate keys across positions, moves, parent
-  inversions, post-clear orphans): no panics, invariants hold,
-  behavior deterministic under per-holder order.
+  normative in SPEC §4.
 - C4 [x] **Boundary audit** — ChainTooLong atomicity tested;
   positions capped to the u32 wire range in the walk; generation
   wrap: u64 now (reviewers wrapped u32 empirically in ~3 min of
   tight churn; u64 is ~10^19 retires of one slot); slot-space
-  exhaustion guarded loudly.: max_chain_len edges, position u32
-  bounds, empty batches, holder-slot reuse at scale, generation
-  wraparound analysis (u32 wrap = 4e9 retires of ONE slot —
-  quantified, documented).
+  exhaustion guarded loudly.
 - C5 [x] **Lineage collision analysis** — quantified, and R3 made
   structurally immune. Flat core: a collision matters only between
   two lineages coexisting in ONE (position, content) bucket;
@@ -64,10 +55,7 @@ evidence linked/recorded next to it. Status legend: [ ] open,
   Verdicts: accounting exact, lifecycle sound, walk sound. Every
   confirmed finding fixed (destructive refused-move, u32 generation,
   &mut-self read path, Miss-probe waste, model/spec/subject alias
-  alignment) with regression coverage via the total-model chaos gate.: independent reviewers attack
-  lib.rs (counter maintenance, generation logic, merge walk, move
-  semantics, panic surfaces); every finding fixed or refuted with a
-  test.
+  alignment) with regression coverage via the total-model chaos gate.
 - C7 [x] **Oracle parity, in-contract**: oracle never under-matches
   the model; every over-match classifies into the three documented
   quirk classes. Evidence: differential runs, census in test output.
@@ -79,28 +67,26 @@ evidence linked/recorded next to it. Status legend: [ ] open,
   partitioned replica TTL-drained to zero, relay queue absorbed the
   window (0 drops), heal replayed ~1M blocks in 20s; residual gap ==
   pre-partition state exactly (the designed TTL+re-placement bound,
-  measured).: full inter-replica partition
-  (severable TCP proxies) injected mid-load and healed; per-replica
-  metrics timeline shows bounded divergence during and reconvergence
-  after; zero request errors.
+  measured).
 - F2 [x] **Wedged replica** (SIGSTOP 45s) — ingest never blocked,
   0 errors, and after SIGCONT the replica converged EXACTLY (applies
-  equal to within in-flight).: TCP up, nothing drains —
-  relay-drop counters climb, ingest never blocks, resume converges.
+  equal to within in-flight).
 - F3 [x] **Replica count** (smoke) — 1/2/4 replicas: 0 errors at
   every K; mild accuracy dip at K=4 consistent with shared-box relay
-  CPU, no protocol failure.: 1 / 2 / 4 replicas, routing parity and
-  relay cost measured.
+  CPU, no protocol failure.
 - F4 [x] **Kill + relaunch under load** (rerun) — 0 errors; degraded
   window = the outage (gateways fast-fail to local fallback), then
   recovery via peer bootstrap, matching M2's shape.
-- F5 [ ] **Add replica under live load**: bootstrap-while-writing
-  converges to sibling answers.
-- F6 [ ] **Relay overflow**: partition long enough to overflow the
-  bounded relay queue; divergence bounded by TTL + re-placement as
-  designed, measured.
-- F7 [ ] **Client under flap**: gateway fast-fail/fallback correct
-  across repeated index restarts (extends M2's single-kill evidence).
+- F5 [~] **Add replica under live load** — deferred-replica drill
+  built (peers pre-configured, replica starts mid-run and bootstraps
+  under load, the k8s StatefulSet shape); run queued (campaign4).
+  Dynamic membership beyond pre-configured peers remains a design
+  backlog item, documented.
+- F6 [~] **Relay overflow** — 90s partition (vs the 45s the queue
+  absorbed) queued (campaign4); expecting relay_dropped > 0 and
+  post-heal divergence bounded by TTL + re-placement.
+- F7 [~] **Flap** — kill/relaunch-with-bootstrap x3 drill built;
+  run queued (campaign4).
 
 ## Pillar 3 — Extreme performance (original gates, no amendment)
 
@@ -110,20 +96,17 @@ evidence linked/recorded next to it. Status legend: [ ] open,
   miss 250 vs 750ns); oracle keeps only the skip-powered gate cell.
   CAVEAT: RSS-based memory is INVALID at this footprint on macOS
   (compressed memory) — bytes/block evidence stays at the 12.8M
-  scale; large-scale memory needs a Linux/staging box.: 128M holder-blocks (~75% of production
-  target), both implementations, box otherwise idle — growth
-  nonlinearities quantified. (First attempt invalidated: concurrent
-  benches contaminated RSS/fill; protocol now enforced.)
-- P2 [ ] **Gate cell p99 <= 10 us EXACT** at the normative scale:
-  requires sound write-time run metadata (the R3 skip mechanism,
-  pulled forward — verification of a shared span in O(1) per run
-  WITHOUT the oracle's unsound count-equality acceptance).
-- P3 [ ] **Memory <= 100 B/holder-block absolute** (and <= oracle on
-  the same bench): requires the registry redesign (dense per-chain
-  storage) — pulled forward from R3.
-- P4 [ ] **Mixed-phase latency**: query percentiles measured WHILE
-  the write stream runs (today's cells are quiesced), plus soak-hours
-  throughput stability and RSS flatness (leak detection).
+  scale; large-scale memory needs a Linux/staging box.
+- P2 [~] **Gate cell p99 <= 10 us EXACT** at the normative scale —
+  the R3 chain-native core is BUILT and referee-equal (contents
+  stored contiguously; one entry probe + linear scan + span reads);
+  gate measurement queued (campaign3).
+- P3 [~] **Memory <= 100 B/holder-block absolute** (and <= oracle on
+  the same bench) — R3 stores chain data once per chain and dropped
+  chain-side keys entirely; gate measurement queued (campaign3).
+- P4 [~] **Mixed-phase latency + soak** — bench instrumented (probe
+  queries inside the live write phase; RADIX_BENCH_SOAK_SECS churn
+  with RSS-drift-is-a-leak semantics); runs queued (campaign3/4).
 - P5 [x] **Writes >= 1M blocks/s mixed stream**: 10.58M measured
   (1.9x oracle). Evidence: SPEC measurement log.
 - P6 [x] **Allocation: amortized zero per single-holder block**:
