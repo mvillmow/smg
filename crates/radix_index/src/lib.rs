@@ -7,6 +7,7 @@ pub mod bridge;
 pub mod client;
 pub mod engine;
 pub mod server;
+pub mod wire_hash;
 
 pub use engine::{
     placement_chain, AddedControl, ApplyOutcome, Engine, EngineConfig, HolderScore, KeyspaceKey,
@@ -76,6 +77,7 @@ impl From<&UpdateMsg> for proto::Update {
                     SymbolKind::Bytes => proto::SymbolKind::Bytes as i32,
                 },
                 block_size: u.keyspace.block_size,
+                hash_scheme: wire_hash::HASH_SCHEME_V1,
             }),
             holder: u.holder.clone(),
             epoch: u.epoch,

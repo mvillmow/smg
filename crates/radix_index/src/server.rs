@@ -203,6 +203,14 @@ impl RadixIndex for IndexService {
         tokio::spawn(async move {
             while let Some(update) = inbound.next().await {
                 let Ok(update) = update else { break };
+                // Hash-scheme gate: a publisher on a scheme this build
+                // cannot serve would poison the keyspace with hashes
+                // that match nothing — reject loudly instead.
+                let scheme = update.keyspace.as_ref().map_or(0, |k| k.hash_scheme);
+                if !crate::wire_hash::scheme_supported(scheme) {
+                    tracing::warn!(scheme, holder = %update.holder, "unsupported hash scheme; update dropped");
+                    continue;
+                }
                 let mut delay = Duration::ZERO;
                 for event in &update.events {
                     match event.kind.as_ref() {
@@ -239,6 +247,18 @@ impl RadixIndex for IndexService {
             while let Some(query) = inbound.next().await {
                 let Ok(query) = query else { break };
                 stats.queries.fetch_add(1, Ordering::Relaxed);
+                let scheme = query.keyspace.as_ref().map_or(0, |k| k.hash_scheme);
+                if !crate::wire_hash::scheme_supported(scheme) {
+                    tracing::warn!(scheme, "unsupported hash scheme; empty answer");
+                    let answer = proto::Match {
+                        query_id: query.query_id,
+                        scores: Vec::new(),
+                    };
+                    if tx.send(Ok(answer)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 let keyspace = query.keyspace.as_ref();
                 let key = KeyspaceKey {
                     model: keyspace.map(|k| k.model.clone()).unwrap_or_default(),

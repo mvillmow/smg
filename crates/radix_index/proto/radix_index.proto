@@ -37,6 +37,10 @@ message Keyspace {
   string model = 1;
   SymbolKind symbol_kind = 2;
   uint32 block_size = 3;
+  // Wire hash scheme version; 0 (unset) means scheme 1. An index
+  // rejects updates/queries whose scheme it cannot serve, so hash
+  // drift fails loudly instead of matching nothing.
+  uint32 hash_scheme = 4;
 }
 
 message Block {

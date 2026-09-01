@@ -474,21 +474,13 @@ pub struct EngineStats {
 /// wire blocks, using the indexer's own rolling prefix hash so every
 /// publisher synthesizes byte-identical chains for identical prefixes.
 pub fn placement_chain(content_hashes: &[ContentHash]) -> Vec<WireBlock> {
-    let mut out = Vec::with_capacity(content_hashes.len());
-    let mut prev = SequenceHash(0);
-    for (i, &content_hash) in content_hashes.iter().enumerate() {
-        let seq_hash = if i == 0 {
-            SequenceHash(content_hash.0)
-        } else {
-            kv_index::chain_prefix_hash(prev, content_hash)
-        };
-        out.push(WireBlock {
+    crate::wire_hash::placement_chain(content_hashes)
+        .into_iter()
+        .map(|(seq_hash, content_hash)| WireBlock {
             seq_hash,
             content_hash,
-        });
-        prev = seq_hash;
-    }
-    out
+        })
+        .collect()
 }
 
 #[cfg(test)]

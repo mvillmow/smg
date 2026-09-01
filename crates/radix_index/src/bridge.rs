@@ -11,7 +11,6 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use kv_index::compute_content_hash;
 use smg_grpc_client::{common_proto, tokenspeed_scheduler::TokenSpeedSchedulerClient};
 use tokio::sync::mpsc;
 
@@ -22,6 +21,7 @@ pub fn keyspace(model: &str, block_size: u32) -> proto::Keyspace {
         model: model.to_string(),
         symbol_kind: proto::SymbolKind::Tokens as i32,
         block_size,
+        hash_scheme: crate::wire_hash::HASH_SCHEME_V1,
     }
 }
 
@@ -46,7 +46,7 @@ pub fn convert_batch(
                             .iter()
                             .map(|b| proto::Block {
                                 seq_hash: b.block_hash as u64,
-                                content_hash: compute_content_hash(&b.token_ids).0,
+                                content_hash: crate::wire_hash::content_hash(&b.token_ids).0,
                             })
                             .collect(),
                     })

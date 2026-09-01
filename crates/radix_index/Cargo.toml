@@ -23,6 +23,7 @@ path = "src/bin/bench.rs"
 
 [dependencies]
 kv-index = { path = "../kv_index" }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 smg-grpc-client = { path = "../grpc_client" }
 tonic.workspace = true
 tonic-prost.workspace = true
