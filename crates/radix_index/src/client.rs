@@ -14,13 +14,13 @@ use std::{
 };
 
 use futures::StreamExt;
-use kv_index::ContentHash;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     bridge,
     engine::placement_chain,
     proto::{self, radix_index_client::RadixIndexClient},
+    ContentHash,
 };
 
 /// What a routing-time query resolved to; the caller maps this onto its

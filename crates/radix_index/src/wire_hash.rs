@@ -20,7 +20,7 @@
 //! Keyspace messages carry `hash_scheme`; 0 (unset) means v1 for
 //! backward compatibility with in-flight publishers.
 
-use kv_index::{ContentHash, SequenceHash};
+use crate::{ContentHash, SequenceHash};
 
 /// The only scheme in existence. Proto `hash_scheme = 0` means this.
 pub const HASH_SCHEME_V1: u32 = 1;
@@ -98,18 +98,31 @@ mod tests {
         };
         for _ in 0..64 {
             let block: Vec<u32> = (0..256).map(|_| (next() & 0x3FFFF) as u32).collect();
-            assert_eq!(content_hash(&block), kv_index::compute_content_hash(&block));
-            let prev = SequenceHash(next());
-            let cur = ContentHash(next());
             assert_eq!(
-                chain_prefix_hash(prev, cur),
-                kv_index::chain_prefix_hash(prev, cur)
+                content_hash(&block).0,
+                kv_index::compute_content_hash(&block).0
+            );
+            let prev = next();
+            let cur = next();
+            assert_eq!(
+                chain_prefix_hash(SequenceHash(prev), ContentHash(cur)).0,
+                kv_index::chain_prefix_hash(
+                    kv_index::SequenceHash(prev),
+                    kv_index::ContentHash(cur)
+                )
+                .0
             );
         }
         let tokens: Vec<u32> = (0..1000).collect();
         assert_eq!(
-            request_content_hashes(&tokens, 256),
+            request_content_hashes(&tokens, 256)
+                .iter()
+                .map(|h| h.0)
+                .collect::<Vec<_>>(),
             kv_index::compute_request_content_hashes(&tokens, 256)
+                .iter()
+                .map(|h| h.0)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -169,17 +182,17 @@ mod tests {
         println!(
             "GOLDEN_CHAIN_FROM_ZERO: {:#x}",
             kv_index::chain_prefix_hash(
-                SequenceHash(0),
-                ContentHash(kv_index::compute_content_hash(&ascending).0)
+                kv_index::SequenceHash(0),
+                kv_index::ContentHash(kv_index::compute_content_hash(&ascending).0)
             )
             .0
         );
         let tokens: Vec<u32> = (0..768).collect();
         let hashes = kv_index::compute_request_content_hashes(&tokens, 256);
-        let mut prev = SequenceHash(0);
+        let mut prev = kv_index::SequenceHash(0);
         for (i, &h) in hashes.iter().enumerate() {
             let seq = if i == 0 {
-                SequenceHash(h.0)
+                kv_index::SequenceHash(h.0)
             } else {
                 kv_index::chain_prefix_hash(prev, h)
             };

@@ -67,7 +67,6 @@ async fn main() {
         .unwrap_or_default();
     let bootstrap: Option<String> = parse_flag(&args, "--bootstrap-from");
     let cfg = EngineConfig {
-        jump_size: 64,
         inferred_ttl: Duration::from_secs(parse_flag(&args, "--inferred-ttl-secs").unwrap_or(180)),
         default_capacity_blocks: parse_flag(&args, "--default-capacity-blocks").unwrap_or(u64::MAX),
     };

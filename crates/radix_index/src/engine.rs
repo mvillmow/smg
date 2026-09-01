@@ -25,9 +25,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use kv_index::{
-    ContentHash, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap, WorkerId,
-};
+use radix_tree::{Config as TreeConfig, HolderId, Overlap, OverlapScratch, RadixTree, StoreError};
+
+use crate::{ContentHash, SequenceHash};
 
 /// One block on the wire: position-chained identity + content identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,8 +103,6 @@ pub struct HolderScore {
 }
 
 pub struct EngineConfig {
-    /// Jump stride for the positional index query search.
-    pub jump_size: usize,
     /// Idle TTL for INFERRED holder state; an inferred holder with no
     /// publish inside the window is cleared entirely (coarse but
     /// prefix-closed). Event-fed holders are never TTL'd — their
@@ -118,7 +116,6 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            jump_size: 64,
             inferred_ttl: Duration::from_secs(180),
             default_capacity_blocks: u64::MAX,
         }
@@ -126,25 +123,20 @@ impl Default for EngineConfig {
 }
 
 struct HolderState {
-    worker_id: WorkerId,
+    id: HolderId,
     epoch: u64,
     last_seq: u64,
     event_fed: bool,
     capacity_blocks: u64,
     dropped: bool,
-    /// Reverse map the indexer's write path requires (caller-owned).
-    blocks: WorkerBlockMap,
-    /// Position-ordered chain, maintained for INFERRED holders only, so
-    /// capacity eviction can pop the tail and keep the prefix closed.
-    /// Event-fed holders evict wherever their engine says.
-    chain: Vec<SequenceHash>,
     last_publish: Instant,
 }
 
 struct KeyspaceState {
-    indexer: PositionalIndexer,
+    tree: RadixTree,
+    scratch: OverlapScratch,
+    answers: Vec<Overlap>,
     holders: HashMap<String, HolderState>,
-    by_worker_id: HashMap<WorkerId, String>,
 }
 
 /// The engine: all keyspaces. One lock over everything — apply and query
@@ -180,49 +172,43 @@ impl Engine {
         if update.keyspace.block_size == 0 {
             return (ApplyOutcome::KeyspaceMismatch, 0, false);
         }
-        let KeyspaceState {
-            indexer,
-            holders,
-            by_worker_id,
-        } = spaces
+        let space = spaces
             .entry(update.keyspace.clone())
             .or_insert_with(|| KeyspaceState {
-                indexer: PositionalIndexer::new(self.cfg.jump_size),
+                tree: RadixTree::new(TreeConfig::default()),
+                scratch: OverlapScratch::default(),
+                answers: Vec::new(),
                 holders: HashMap::new(),
-                by_worker_id: HashMap::new(),
             });
 
-        if !holders.contains_key(&update.holder) {
-            let Ok(worker_id) = indexer.intern_worker(&update.holder) else {
-                return (ApplyOutcome::KeyspaceMismatch, 0, false);
-            };
-            by_worker_id.insert(worker_id, update.holder.clone());
-            holders.insert(
+        if !space.holders.contains_key(&update.holder) {
+            let id = space.tree.create_holder(&update.holder);
+            space.holders.insert(
                 update.holder.clone(),
                 HolderState {
-                    worker_id,
+                    id,
                     epoch: update.epoch,
                     last_seq: 0,
                     event_fed: false,
                     capacity_blocks: self.cfg.default_capacity_blocks,
                     dropped: false,
-                    blocks: WorkerBlockMap::default(),
-                    chain: Vec::new(),
                     last_publish: Instant::now(),
                 },
             );
         }
-        let holder = holders
+        let tree = &mut space.tree;
+        let holder = space
+            .holders
             .get_mut(&update.holder)
             .expect("holder inserted above");
 
+        let mut changed = false;
+        let len_before = tree.holder_blocks(holder.id);
+
         // Epoch gate: higher epoch supersedes (implicit clear), lower is
         // dropped, equal proceeds.
-        let mut changed = false;
-        let len_before = holder.blocks.len();
         if update.epoch > holder.epoch {
-            indexer.apply_cleared(holder.worker_id, &mut holder.blocks);
-            holder.chain.clear();
+            tree.clear(holder.id);
             holder.epoch = update.epoch;
             holder.last_seq = 0;
             changed = true;
@@ -272,42 +258,39 @@ impl Engine {
                         // First sequenced traffic pins feed authority too:
                         // a holder with a real event stream is observed.
                         holder.event_fed = true;
-                        holder.chain.clear();
                     }
-                    let stored: Vec<StoredBlock> = blocks
+                    let pairs: Vec<(u64, u64)> = blocks
                         .iter()
-                        .map(|b| StoredBlock {
-                            seq_hash: b.seq_hash,
-                            content_hash: b.content_hash,
-                        })
+                        .map(|b| (b.seq_hash.0, b.content_hash.0))
                         .collect();
-                    let applied = indexer
-                        .apply_stored(holder.worker_id, &stored, *parent, &mut holder.blocks)
-                        .or_else(|_| {
+                    let stored = tree
+                        .store(holder.id, parent.map(|p| p.0), &pairs)
+                        .or_else(|e| match e {
                             // Unresolvable parent re-anchors at position 0,
                             // mirroring the gateway monitor's recovery.
-                            indexer.apply_stored(
-                                holder.worker_id,
-                                &stored,
-                                None,
-                                &mut holder.blocks,
-                            )
+                            StoreError::ParentNotFound => tree.store(holder.id, None, &pairs),
+                            other => Err(other),
                         });
-                    if applied.is_ok() && !holder.event_fed {
-                        Self::extend_chain(holder, blocks);
-                        Self::evict_tail(indexer, holder);
+                    if stored.is_ok() && !holder.event_fed {
+                        // Capacity eviction, forest-wide and prefix-
+                        // closed (the tree owns the order; this
+                        // deliberately fixes the old last-chain-only
+                        // accounting).
+                        let held = tree.holder_blocks(holder.id);
+                        if held > holder.capacity_blocks {
+                            tree.truncate_tail(holder.id, holder.capacity_blocks);
+                        }
                     }
                 }
                 WireEvent::Removed { seq_hashes } => {
                     if !holder.event_fed {
                         holder.event_fed = true;
-                        holder.chain.clear();
                     }
-                    indexer.apply_removed(holder.worker_id, seq_hashes, &mut holder.blocks);
+                    let keys: Vec<u64> = seq_hashes.iter().map(|h| h.0).collect();
+                    tree.remove(holder.id, &keys);
                 }
                 WireEvent::Cleared => {
-                    indexer.apply_cleared(holder.worker_id, &mut holder.blocks);
-                    holder.chain.clear();
+                    tree.clear(holder.id);
                     changed = true;
                 }
             }
@@ -315,50 +298,30 @@ impl Engine {
         // Registry-length delta covers stores and removes; mixed
         // batches that net to zero blocks still flip `changed` via
         // the Cleared/control arms above or are true no-ops.
-        changed |= holder.blocks.len() != len_before;
+        changed |= tree.holder_blocks(holder.id) != len_before;
         (outcome, holder.last_seq, changed)
     }
 
-    /// Position-ordered chain bookkeeping for inferred holders. The
-    /// stored blocks landed at parent_pos+1.. (or 0): reflect that in the
-    /// tail vector so capacity eviction stays prefix-closed.
-    fn extend_chain(holder: &mut HolderState, blocks: &[WireBlock]) {
-        let Some(first) = blocks.first() else { return };
-        let Some(&(start_pos, _, _)) = holder.blocks.get(&first.seq_hash) else {
-            return;
-        };
-        if holder.chain.len() < start_pos {
-            // A gap should be impossible for deterministic placement
-            // chains; anchor defensively at the current tail.
-            return;
-        }
-        holder.chain.truncate(start_pos);
-        holder.chain.extend(blocks.iter().map(|b| b.seq_hash));
-    }
-
-    fn evict_tail(indexer: &PositionalIndexer, holder: &mut HolderState) {
-        let capacity = usize::try_from(holder.capacity_blocks).unwrap_or(usize::MAX);
-        while holder.chain.len() > capacity {
-            let Some(tail) = holder.chain.pop() else {
-                break;
-            };
-            indexer.apply_removed(holder.worker_id, &[tail], &mut holder.blocks);
-        }
-    }
-
-    /// TTL sweep: clear inferred holders idle beyond the window. Cheap
-    /// (per-holder timestamps only); run from a timer.
+    /// TTL sweep: clear inferred holders idle beyond the window, and
+    /// RETIRE dropped holders entirely (including event-fed ones —
+    /// the lifecycle leak the old engine carried). Cheap per-holder
+    /// timestamps; run from a timer.
     pub fn sweep_idle(&self) {
         let ttl = self.cfg.inferred_ttl;
         let mut spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
         for space in spaces.values_mut() {
-            let KeyspaceState {
-                indexer, holders, ..
-            } = space;
-            for holder in holders.values_mut() {
-                if !holder.event_fed && holder.last_publish.elapsed() > ttl {
-                    indexer.apply_cleared(holder.worker_id, &mut holder.blocks);
-                    holder.chain.clear();
+            let mut retire: Vec<String> = Vec::new();
+            for (name, holder) in space.holders.iter_mut() {
+                let idle = holder.last_publish.elapsed() > ttl;
+                if holder.dropped && idle {
+                    retire.push(name.clone());
+                } else if !holder.event_fed && idle {
+                    space.tree.clear(holder.id);
+                }
+            }
+            for name in retire {
+                if let Some(holder) = space.holders.remove(&name) {
+                    space.tree.retire_holder(holder.id);
                 }
             }
         }
@@ -367,30 +330,33 @@ impl Engine {
     /// Overlap query: per-holder matched prefix depth, dropped holders
     /// excluded. Missing keyspace = empty answer (advisory semantics).
     pub fn find_matches(&self, keyspace: &KeyspaceKey, hashes: &[ContentHash]) -> Vec<HolderScore> {
-        let spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(space) = spaces.get(keyspace) else {
+        let mut spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(space) = spaces.get_mut(keyspace) else {
             return Vec::new();
         };
-        let overlap = space.indexer.find_matches(hashes, false);
-        let mut scores = Vec::with_capacity(overlap.scores.len());
-        for (worker_id, matched) in overlap.scores {
-            let Some(holder_key) = space.by_worker_id.get(&worker_id) else {
+        let chain: Vec<u64> = hashes.iter().map(|h| h.0).collect();
+        let KeyspaceState {
+            tree,
+            scratch,
+            answers,
+            holders,
+        } = space;
+        tree.overlap(&chain, scratch, answers);
+        let mut scores = Vec::with_capacity(answers.len());
+        for o in answers.iter() {
+            let Some(name) = tree.holder_name(o.holder) else {
                 continue;
             };
-            let Some(holder) = space.holders.get(holder_key) else {
+            let Some(holder) = holders.get(name) else {
                 continue;
             };
-            if holder.dropped || matched == 0 {
+            if holder.dropped || o.depth == 0 {
                 continue;
             }
             scores.push(HolderScore {
-                holder: holder_key.clone(),
-                matched_blocks: matched,
-                total_blocks: overlap
-                    .tree_sizes
-                    .get(&worker_id)
-                    .copied()
-                    .unwrap_or_default() as u64,
+                holder: name.to_string(),
+                matched_blocks: o.depth,
+                total_blocks: o.total_blocks,
                 event_fed: holder.event_fed,
             });
         }
@@ -399,27 +365,23 @@ impl Engine {
     }
 
     /// Serialize current state as synthetic Updates (for `Pull`): one
-    /// Stored per holder carrying its full chain in position order, under
+    /// Stored per holder carrying its blocks in position order, under
     /// the holder's current epoch, unsequenced-for-inferred /
     /// watermark-seq-for-observed so the puller lands with the same
-    /// dedup posture.
+    /// dedup posture. (Gap positions collapse to a contiguous chain,
+    /// as before: bootstrap equivalence is scoped to gap-free
+    /// holders; gapped ones converge through the feeds.)
     pub fn snapshot(&self) -> Vec<UpdateMsg> {
         let spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
         let mut out = Vec::new();
         for (key, space) in spaces.iter() {
             for (holder_key, holder) in &space.holders {
-                // Reconstruct position order from the reverse map.
-                let mut ordered: Vec<(usize, SequenceHash, ContentHash)> = holder
-                    .blocks
-                    .iter()
-                    .map(|(&seq, &(pos, content, _))| (pos, seq, content))
-                    .collect();
-                ordered.sort_by_key(|&(pos, _, _)| pos);
-                let blocks: Vec<WireBlock> = ordered
-                    .iter()
-                    .map(|&(_, seq_hash, content_hash)| WireBlock {
-                        seq_hash,
-                        content_hash,
+                let blocks: Vec<WireBlock> = space
+                    .tree
+                    .enumerate(holder.id)
+                    .map(|(_pos, k, content)| WireBlock {
+                        seq_hash: SequenceHash(k),
+                        content_hash: ContentHash(content),
                     })
                     .collect();
                 out.push(UpdateMsg {
@@ -449,7 +411,10 @@ impl Engine {
     /// Total indexed blocks across keyspaces (stats/tests).
     pub fn entry_count(&self) -> usize {
         let spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
-        spaces.values().map(|s| s.indexer.entry_count()).sum()
+        spaces
+            .values()
+            .map(|s| s.tree.stats().distinct_entries as usize)
+            .sum()
     }
 
     /// Point-in-time gauges for the metrics endpoint. One pass under the
@@ -461,7 +426,7 @@ impl Engine {
             ..EngineStats::default()
         };
         for space in spaces.values() {
-            stats.blocks += space.indexer.entry_count();
+            stats.blocks += space.tree.stats().distinct_entries as usize;
             for holder in space.holders.values() {
                 stats.holders += 1;
                 if holder.event_fed {
@@ -501,10 +466,10 @@ pub fn placement_chain(content_hashes: &[ContentHash]) -> Vec<WireBlock> {
 
 #[cfg(test)]
 mod tests {
-    use kv_index::compute_content_hash;
     use rand::{rngs::StdRng, seq::SliceRandom, RngExt, SeedableRng};
 
     use super::*;
+    use crate::wire_hash::content_hash as compute_content_hash;
 
     fn keyspace() -> KeyspaceKey {
         KeyspaceKey {
@@ -739,7 +704,7 @@ mod tests {
         assert_eq!(scores(&engine, 11, 6), vec![("w1".into(), 5)]);
 
         // A placement for the now event-fed holder is rejected.
-        let (outcome, _) = engine.apply(&placement("w1", 12, 3));
+        let (outcome, _, _) = engine.apply(&placement("w1", 12, 3));
         assert_eq!(outcome, ApplyOutcome::FeedRejected);
         assert!(scores(&engine, 12, 3).is_empty());
 
@@ -778,7 +743,7 @@ mod tests {
 
         // The bootstrapped replica keeps the event holder's dedup posture:
         // the watermark seq travels, so a replayed old batch is dropped.
-        let (outcome, _) = b.apply(&event_batch("w2", 2, vec![WireEvent::Cleared]));
+        let (outcome, _, _) = b.apply(&event_batch("w2", 2, vec![WireEvent::Cleared]));
         assert_eq!(outcome, ApplyOutcome::Deduped);
     }
 }

@@ -22,7 +22,7 @@ name = "radix-index-bench"
 path = "src/bin/bench.rs"
 
 [dependencies]
-kv-index = { path = "../kv_index" }
+radix-tree = { path = "../radix_tree" }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 smg-grpc-client = { path = "../grpc_client" }
 tonic.workspace = true
@@ -36,6 +36,7 @@ tracing-subscriber = { workspace = true }
 rustc-hash = "2"
 
 [dev-dependencies]
+kv-index = { path = "../kv_index" }
 rand = { workspace = true }
 mock-worker = { path = "../mock_worker" }
 portpicker = "0.1"

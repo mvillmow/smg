@@ -9,9 +9,9 @@
 
 use std::time::Instant;
 
-use kv_index::compute_content_hash;
 use radix_index::{
-    placement_chain, Engine, EngineConfig, KeyspaceKey, SymbolKind, UpdateMsg, WireEvent,
+    placement_chain, wire_hash::content_hash as compute_content_hash, Engine, EngineConfig,
+    KeyspaceKey, SymbolKind, UpdateMsg, WireEvent,
 };
 
 fn parse_flag<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {

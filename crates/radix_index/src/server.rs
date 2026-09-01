@@ -13,7 +13,6 @@ use std::{
 };
 
 use futures::{Stream, StreamExt};
-use kv_index::ContentHash;
 use tokio::sync::mpsc;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 
@@ -24,7 +23,7 @@ use crate::{
         radix_index_client::RadixIndexClient,
         radix_index_server::{RadixIndex, RadixIndexServer},
     },
-    UpdateMsg,
+    ContentHash, UpdateMsg,
 };
 
 type AckStream = Pin<Box<dyn Stream<Item = Result<proto::PublishAck, Status>> + Send>>;

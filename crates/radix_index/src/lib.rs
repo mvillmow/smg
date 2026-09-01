@@ -19,7 +19,17 @@ pub mod proto {
     tonic::include_proto!("radix_index");
 }
 
-use kv_index::{ContentHash, SequenceHash};
+/// Position-independent content identity — the wire's matching
+/// currency. Owned by the service (R2 dropped the kv_index import;
+/// the numeric scheme lives in [`wire_hash`], pinned by golden
+/// vectors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContentHash(pub u64);
+
+/// Position-aware block identity (backend block hash on the event
+/// feed; deterministic chain hash on the placement feed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SequenceHash(pub u64);
 
 impl From<&proto::Update> for UpdateMsg {
     fn from(u: &proto::Update) -> Self {
