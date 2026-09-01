@@ -13,13 +13,14 @@ evidence linked/recorded next to it. Status legend: [ ] open,
 
 ## Pillar 1 — Correctness
 
-- C1 [~] **Continuous differential fuzz**: the model-referee harness
-  scaled from 16 seeds to a sustained campaign — hours of randomized
-  workloads over a WIDE config space (holders 2..512, chains to
-  max_chain_len edges, gap/dup/clear rates to extremes, content
-  coincidence, forest fan-out), RadixTree == model on every
-  checkpoint of every seed. Target: >= 10,000 seeds, zero
-  divergences, plus a standing soak entry point.
+- C1 [x] **Continuous differential fuzz** — 10,000 seeds green in
+  one 3.4-hour run (12,382s): randomized configs (holders 2..256,
+  chains to 512, extreme dup/gap/clear/coincidence rates), ~3,300
+  chaos runs interleaved, model equality at every checkpoint, audit
+  at every op, deterministic replay. Zero divergences. The standing
+  entry point (RADIX_FUZZ_SEEDS/RADIX_FUZZ_START) remains for
+  continuous use; the dual-core harness now covers R3 in the same
+  runs going forward.
 - C2 [x] **Internal invariant checker** — audit() recomputes every
   counter, forward+reverse containment, bucket order, name/free-list
   coherence, interner coherence; green after EVERY op across the
