@@ -6054,6 +6054,7 @@ name = "radix-tree"
 version = "0.1.0"
 dependencies = [
  "kv-index",
+ "rustc-hash 2.1.3",
 ]
 
 [[package]]

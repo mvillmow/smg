@@ -18,6 +18,7 @@ mod common;
 use std::time::Instant;
 
 use common::{oracle::Oracle, Op, Rng};
+use radix_tree::{Config, HolderId, RadixTree};
 
 // ---- §11 normative constants ----
 const TARGET_BLOCKS: u64 = 10_000_000;
@@ -185,9 +186,69 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[idx]
 }
 
+/// Which implementation this process measures. One side per process
+/// so RSS deltas are clean (§11 protocol):
+///   RADIX_BENCH_SIDE=oracle (default) | r1
+fn side() -> String {
+    std::env::var("RADIX_BENCH_SIDE").unwrap_or_else(|_| "oracle".into())
+}
+
+#[allow(clippy::large_enum_variant)] // bench-local, two instances ever
+enum Sider {
+    Oracle(Oracle, Vec<Vec<u64>>),
+    R1(RadixTree, Vec<HolderId>, Vec<radix_tree::Overlap>),
+}
+
+impl Sider {
+    fn apply(&mut self, op: &Op) {
+        match self {
+            Sider::Oracle(oracle, chains) => {
+                oracle.apply(op);
+                if let Op::Store {
+                    holder,
+                    parent,
+                    blocks,
+                } = op
+                {
+                    // Engine glue the §11 oracle side must carry:
+                    // last-chain Vec (reset on parent-None anchors).
+                    let chain = &mut chains[*holder];
+                    if parent.is_none() {
+                        chain.clear();
+                    }
+                    chain.extend(blocks.iter().map(|&(k, _)| k));
+                }
+            }
+            Sider::R1(tree, ids, _) => match op {
+                Op::Store {
+                    holder,
+                    parent,
+                    blocks,
+                } => {
+                    let _ = tree.store(ids[*holder], *parent, blocks);
+                }
+                Op::Remove { holder, keys } => {
+                    tree.remove(ids[*holder], keys);
+                }
+                Op::Clear { holder } => tree.clear(ids[*holder]),
+            },
+        }
+    }
+
+    fn query(&mut self, q: &[u64]) -> usize {
+        match self {
+            Sider::Oracle(oracle, _) => oracle.overlap(q).len(),
+            Sider::R1(tree, _, out) => {
+                tree.overlap(q, out);
+                out.len()
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "pinned benchmark; run --release --ignored --nocapture"]
-fn oracle_baseline() {
+fn pinned_workload() {
     let mut rng = Rng::new(20260901);
     let families = build_families(&mut rng);
     let (ops, holder_blocks) = build_ops(&mut rng, &families);
@@ -207,27 +268,22 @@ fn oracle_baseline() {
         holder_blocks
     );
 
+    let side_name = side();
+    println!("side: {side_name}");
     let rss_before = rss_kib();
-    let mut oracle = Oracle::new(HOLDERS);
-    // Engine glue the §11 oracle side must carry: last-chain Vec per
-    // holder (reset on parent-None anchors, as engine extend_chain
-    // does) and the id->holder map (inside Oracle already).
-    let mut chains: Vec<Vec<u64>> = vec![Vec::new(); HOLDERS];
+    let mut sider = match side_name.as_str() {
+        "r1" => {
+            let mut tree = RadixTree::new(Config::default());
+            let ids = (0..HOLDERS)
+                .map(|h| tree.create_holder(&format!("holder-{h}")))
+                .collect();
+            Sider::R1(tree, ids, Vec::new())
+        }
+        _ => Sider::Oracle(Oracle::new(HOLDERS), vec![Vec::new(); HOLDERS]),
+    };
     let fill_start = Instant::now();
     for op in &ops {
-        oracle.apply(op);
-        if let Op::Store {
-            holder,
-            parent,
-            blocks,
-        } = op
-        {
-            let chain = &mut chains[*holder];
-            if parent.is_none() {
-                chain.clear();
-            }
-            chain.extend(blocks.iter().map(|&(k, _)| k));
-        }
+        sider.apply(op);
     }
     let fill = fill_start.elapsed();
     let rss_after = rss_kib();
@@ -288,9 +344,9 @@ fn oracle_baseline() {
         let mut lat: Vec<u64> = Vec::with_capacity(queries.len());
         for q in queries {
             let t = Instant::now();
-            let out = oracle.overlap(q);
+            let n = sider.query(q);
             let ns = t.elapsed().as_nanos() as u64;
-            std::hint::black_box(out);
+            std::hint::black_box(n);
             lat.push(ns);
         }
         lat.sort_unstable();
@@ -301,5 +357,5 @@ fn oracle_baseline() {
             percentile(&lat, 0.99),
         );
     }
-    std::hint::black_box(chains);
+    std::hint::black_box(&sider as *const _);
 }

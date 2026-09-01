@@ -452,3 +452,43 @@ measurements):
 5. **Two implementations in-tree during the window** — bounded by R2
    removing the service's import; the gateway's `kv_index` and this
    crate never share a caller afterward.
+
+## Measurement log (append-only; gates unchanged above)
+
+R0 oracle baseline and R1 results on the §11 pinned workload
+(12.84M resident holder-blocks; medians of 3 runs, Apple Silicon,
+system allocator):
+
+| metric | oracle + engine glue | R1 flat core | §11 gate | verdict |
+|---|---|---|---|---|
+| fill (mixed stream) | 5.47M blocks/s | **10.58M blocks/s** | ≥ 1M | PASS (10.6×) |
+| allocations / fresh single-holder block | n/a | **0.0002** | amortized zero | PASS |
+| memory (B/holder-block) | 166.7 | 170.9 | ≤ oracle AND ≤ 100 | FAIL by +2.5% / FAIL |
+| overlap p50, miss | 250 ns | **208 ns** | — | — |
+| overlap p50, H=8 | 1.5 µs | 1.9 µs | — | — |
+| overlap p50, H=64 (log-uniform depths) | 4.9 µs | **4.4 µs** | — | — |
+| gate cell (d=78, W=64) p99 | 6.0 µs (unsound skip) | 18.0 µs (exact) | ≤ 10 µs | FAIL |
+
+Open decisions the failed gates raise (maintainer's call, not
+quietly amended):
+
+1. The absolute 100 B/holder-block came from §9's idealized
+   arithmetic; measurement says BOTH designs pay ~165–170 B on this
+   allocator (hash-table load factors and headers the estimate
+   ignored). R1 is a memory TIE with the incumbent (+2.5%), reached
+   while deleting the standing order structure (position order now
+   derived on demand in the cold truncate/enumerate paths).
+2. The 10 µs gate-cell budget bought exactness headroom against the
+   oracle's 6 µs — but the oracle's number is produced by the
+   count-equality skip this contract rejects as unsound. Exact
+   verification of 64 candidates × 78 positions measures ~13–18 µs
+   (two-phase walk: independent probes overlap their cache misses;
+   dense per-lineage holder runs; memcmp fast path on unchanged
+   membership). Still ~110× under the 2 ms routing deadline.
+
+Both misses are precisely what R3's run compression targets
+(structural runs make shared spans O(1) to verify and collapse the
+entry side): the options are to amend the R1 gates to the measured
+basis (≤ oracle + 5% memory; ≤ 20 µs gate-cell p99) and keep the
+original numbers as R3's bar, or to hold R2 until R3-grade run
+metadata lands. R2 does NOT proceed until this is decided.
