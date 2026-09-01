@@ -31,10 +31,18 @@ type AckStream = Pin<Box<dyn Stream<Item = Result<proto::PublishAck, Status>> + 
 type MatchStream = Pin<Box<dyn Stream<Item = Result<proto::Match, Status>> + Send>>;
 type PullStream = Pin<Box<dyn Stream<Item = Result<proto::Update, Status>> + Send>>;
 
-/// Bound on the per-peer relay queue; overflowing drops the oldest
-/// (divergence is bounded by TTL + re-placement + digest heal, and a
-/// wedged peer must not wedge ingest).
+/// Bound on the per-peer relay queue; overflowing drops updates
+/// (divergence is bounded by TTL + re-placement, and a wedged peer
+/// must not wedge ingest). Overridable via RADIX_RELAY_QUEUE for
+/// overflow drills.
 const RELAY_QUEUE: usize = 65_536;
+
+fn relay_queue_len() -> usize {
+    std::env::var("RADIX_RELAY_QUEUE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(RELAY_QUEUE)
+}
 
 /// Process counters for the metrics endpoint. Shared between the gRPC
 /// service and the admin listener.
@@ -106,7 +114,7 @@ impl IndexService {
     reason = "service-lifetime task; the index process is its own supervisor"
 )]
 fn spawn_relay(peer: String) -> mpsc::Sender<proto::Update> {
-    let (tx, mut rx) = mpsc::channel::<proto::Update>(RELAY_QUEUE);
+    let (tx, mut rx) = mpsc::channel::<proto::Update>(relay_queue_len());
     tokio::spawn(async move {
         loop {
             match RadixIndexClient::connect(peer.clone()).await {
@@ -183,11 +191,17 @@ impl RadixIndex for IndexService {
             while let Some((deadline, update)) = delayed_rx.recv().await {
                 tokio::time::sleep_until(deadline).await;
                 let msg = UpdateMsg::from(&update);
-                let (_outcome, applied_seq) = apply_engine.apply(&msg);
+                let (_outcome, applied_seq, state_changed) = apply_engine.apply(&msg);
                 apply_stats.applies.fetch_add(1, Ordering::Relaxed);
-                for peer in &apply_relay {
-                    if peer.try_send(update.clone()).is_err() {
-                        apply_stats.relay_dropped.fetch_add(1, Ordering::Relaxed);
+                // Relay ONLY state-changing applies: a relayed update
+                // echoed back by a symmetric peer is a no-op here and
+                // stops, instead of ping-ponging forever (bounded
+                // O(K^2) fan-out instead of unbounded amplification).
+                if state_changed {
+                    for peer in &apply_relay {
+                        if peer.try_send(update.clone()).is_err() {
+                            apply_stats.relay_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 let ack = proto::PublishAck {

@@ -510,6 +510,9 @@ fn pinned_workload() {
                     ops_applied,
                     qps
                 );
+                if let Sider::R3(tree, _, _, _) = &sider {
+                    println!("  footprint: {}", tree.debug_footprint());
+                }
             }
         }
         let drift = rss_kib() as i64 - rss_soak_start as i64;

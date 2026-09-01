@@ -868,6 +868,48 @@ impl RadixTree3 {
         }
     }
 
+    /// Internal structure sizes for leak hunting (soak diagnostics).
+    pub fn debug_footprint(&self) -> String {
+        let live_chains = self
+            .chains
+            .iter()
+            .filter(|c| !c.contents.is_empty())
+            .count();
+        let span_total: usize = self.chains.iter().map(|c| c.spans.len()).sum();
+        let span_cap: usize = self.chains.iter().map(|c| c.spans.capacity()).sum();
+        let content_cap: usize = self.chains.iter().map(|c| c.contents.capacity()).sum();
+        let child_total: usize = self.chains.iter().map(|c| c.children.len()).sum();
+        let intern_sets: usize = self.interner.table.values().map(|v| v.len()).sum();
+        let key_total: usize = self
+            .slots
+            .iter()
+            .filter_map(|s| s.state.as_ref())
+            .map(|s| s.keys.len())
+            .sum();
+        let key_cap: usize = self
+            .slots
+            .iter()
+            .filter_map(|s| s.state.as_ref())
+            .map(|s| s.keys.capacity())
+            .sum();
+        format!(
+            "chains {} (vec {}, free {}) contents_cap {} spans {} (cap {}) children {} roots {} intern {} ({} sets) slots {} keys {} (cap {})",
+            live_chains,
+            self.chains.len(),
+            self.free_chains.len(),
+            content_cap,
+            span_total,
+            span_cap,
+            child_total,
+            self.roots.len(),
+            self.interner.table.len(),
+            intern_sets,
+            self.slots.len(),
+            key_total,
+            key_cap,
+        )
+    }
+
     // ---- verification ----
 
     pub fn audit(&self) -> Result<(), String> {

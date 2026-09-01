@@ -164,9 +164,13 @@ impl Engine {
         }
     }
 
-    /// Apply one update. Returns what happened, plus the holder's applied
-    /// watermark for the publisher's ack.
-    pub fn apply(&self, update: &UpdateMsg) -> (ApplyOutcome, u64) {
+    /// Apply one update. Returns what happened, the holder's applied
+    /// watermark for the publisher's ack, and whether OBSERVABLE STATE
+    /// CHANGED — the relay forwards only changing applies, so a
+    /// symmetric-peer echo dies in one hop instead of ping-ponging
+    /// forever (the metrics timeline caught ~190x apply amplification
+    /// from exactly that loop).
+    pub fn apply(&self, update: &UpdateMsg) -> (ApplyOutcome, u64, bool) {
         let mut spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
 
         // A keyspace is created on first contact; a later publisher whose
@@ -174,7 +178,7 @@ impl Engine {
         // construction, so mismatch cannot silently merge. Reject only
         // the degenerate block size.
         if update.keyspace.block_size == 0 {
-            return (ApplyOutcome::KeyspaceMismatch, 0);
+            return (ApplyOutcome::KeyspaceMismatch, 0, false);
         }
         let KeyspaceState {
             indexer,
@@ -190,7 +194,7 @@ impl Engine {
 
         if !holders.contains_key(&update.holder) {
             let Ok(worker_id) = indexer.intern_worker(&update.holder) else {
-                return (ApplyOutcome::KeyspaceMismatch, 0);
+                return (ApplyOutcome::KeyspaceMismatch, 0, false);
             };
             by_worker_id.insert(worker_id, update.holder.clone());
             holders.insert(
@@ -214,16 +218,23 @@ impl Engine {
 
         // Epoch gate: higher epoch supersedes (implicit clear), lower is
         // dropped, equal proceeds.
+        let mut changed = false;
+        let len_before = holder.blocks.len();
         if update.epoch > holder.epoch {
             indexer.apply_cleared(holder.worker_id, &mut holder.blocks);
             holder.chain.clear();
             holder.epoch = update.epoch;
             holder.last_seq = 0;
+            changed = true;
         } else if update.epoch < holder.epoch {
-            return (ApplyOutcome::Deduped, holder.last_seq);
+            return (ApplyOutcome::Deduped, holder.last_seq, false);
         }
         holder.last_publish = Instant::now();
 
+        if update.added.is_some() || update.dropped {
+            // Control payloads always change holder posture.
+            changed = true;
+        }
         if let Some(added) = &update.added {
             holder.capacity_blocks = if added.capacity_blocks == 0 {
                 self.cfg.default_capacity_blocks
@@ -243,7 +254,7 @@ impl Engine {
         let sequenced = update.seq != 0;
         if sequenced {
             if update.seq <= holder.last_seq {
-                return (ApplyOutcome::Deduped, holder.last_seq);
+                return (ApplyOutcome::Deduped, holder.last_seq, changed);
             }
             holder.last_seq = update.seq;
         }
@@ -297,10 +308,15 @@ impl Engine {
                 WireEvent::Cleared => {
                     indexer.apply_cleared(holder.worker_id, &mut holder.blocks);
                     holder.chain.clear();
+                    changed = true;
                 }
             }
         }
-        (outcome, holder.last_seq)
+        // Registry-length delta covers stores and removes; mixed
+        // batches that net to zero blocks still flip `changed` via
+        // the Cleared/control arms above or are true no-ops.
+        changed |= holder.blocks.len() != len_before;
+        (outcome, holder.last_seq, changed)
     }
 
     /// Position-ordered chain bookkeeping for inferred holders. The
@@ -680,12 +696,12 @@ mod tests {
         // Restarted holder announces epoch 2 with a fresh (shorter) cache.
         let mut restarted = placement("w1", 5, 2);
         restarted.epoch = 2;
-        let (outcome, _) = engine.apply(&restarted);
+        let (outcome, _, _) = engine.apply(&restarted);
         assert_eq!(outcome, ApplyOutcome::Applied);
         assert_eq!(scores(&engine, 5, 6), vec![("w1".into(), 2)]);
 
         // A late epoch-1 update (relay stragglers) is dropped.
-        let (outcome, _) = engine.apply(&placement("w1", 5, 6));
+        let (outcome, _, _) = engine.apply(&placement("w1", 5, 6));
         assert_eq!(outcome, ApplyOutcome::Deduped);
         assert_eq!(scores(&engine, 5, 6), vec![("w1".into(), 2)]);
     }
