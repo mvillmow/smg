@@ -28,7 +28,7 @@ use common::{
     workload::{self, Config as WlConfig},
     Op, Rng,
 };
-use radix_tree::{Config, HolderId, OverlapScratch, RadixTree, StoreError};
+use radix_tree::{Config, HolderId, OverlapScratch, RadixTree, RadixTree3, StoreError};
 
 fn random_config(rng: &mut Rng) -> WlConfig {
     let holders = 2 + rng.below(255);
@@ -52,21 +52,38 @@ fn random_config(rng: &mut Rng) -> WlConfig {
     }
 }
 
+enum Core {
+    Flat(RadixTree),
+    Chain(RadixTree3),
+}
+
 struct Subject {
-    tree: RadixTree,
+    core: Core,
     ids: Vec<HolderId>,
     scratch: Vec<radix_tree::Overlap>,
     qscratch: OverlapScratch,
 }
 
 impl Subject {
-    fn new(holders: usize) -> Self {
+    fn new_flat(holders: usize) -> Self {
         let mut tree = RadixTree::new(Config::default());
         let ids = (0..holders)
             .map(|h| tree.create_holder(&format!("holder-{h}")))
             .collect();
         Self {
-            tree,
+            core: Core::Flat(tree),
+            ids,
+            scratch: Vec::new(),
+            qscratch: OverlapScratch::default(),
+        }
+    }
+    fn new_chain(holders: usize) -> Self {
+        let mut tree = RadixTree3::new(Config::default());
+        let ids = (0..holders)
+            .map(|h| tree.create_holder(&format!("holder-{h}")))
+            .collect();
+        Self {
+            core: Core::Chain(tree),
             ids,
             scratch: Vec::new(),
             qscratch: OverlapScratch::default(),
@@ -78,29 +95,56 @@ impl Subject {
                 holder,
                 parent,
                 blocks,
-            } => match self.tree.store(self.ids[*holder], *parent, blocks) {
-                Ok(_) => true,
-                Err(StoreError::ParentNotFound) => false,
-                Err(e) => panic!("unexpected store error {e:?}"),
-            },
+            } => {
+                let r = match &mut self.core {
+                    Core::Flat(t) => t.store(self.ids[*holder], *parent, blocks),
+                    Core::Chain(t) => t.store(self.ids[*holder], *parent, blocks),
+                };
+                match r {
+                    Ok(_) => true,
+                    Err(StoreError::ParentNotFound) => false,
+                    Err(e) => panic!("unexpected store error {e:?}"),
+                }
+            }
             Op::Remove { holder, keys } => {
-                self.tree.remove(self.ids[*holder], keys);
+                match &mut self.core {
+                    Core::Flat(t) => t.remove(self.ids[*holder], keys),
+                    Core::Chain(t) => t.remove(self.ids[*holder], keys),
+                };
                 true
             }
             Op::Clear { holder } => {
-                self.tree.clear(self.ids[*holder]);
+                match &mut self.core {
+                    Core::Flat(t) => t.clear(self.ids[*holder]),
+                    Core::Chain(t) => t.clear(self.ids[*holder]),
+                }
                 true
             }
         }
     }
     fn overlap(&mut self, query: &[u64]) -> BTreeMap<usize, u32> {
         let scratch = &mut self.scratch;
-        self.tree.overlap(query, &mut self.qscratch, scratch);
+        match &mut self.core {
+            Core::Flat(t) => t.overlap(query, &mut self.qscratch, scratch),
+            Core::Chain(t) => t.overlap(query, &mut self.qscratch, scratch),
+        }
         let mut out = BTreeMap::new();
         for o in scratch.iter() {
             out.insert(o.holder.parts().0 as usize, o.depth);
         }
         out
+    }
+    fn holder_blocks(&self, h: usize) -> u64 {
+        match &self.core {
+            Core::Flat(t) => t.holder_blocks(self.ids[h]),
+            Core::Chain(t) => t.holder_blocks(self.ids[h]),
+        }
+    }
+    fn audit(&self) -> Result<(), String> {
+        match &self.core {
+            Core::Flat(t) => t.audit(),
+            Core::Chain(t) => t.audit(),
+        }
     }
 }
 
@@ -110,51 +154,131 @@ fn run_one_in_contract(seed: u64) {
     let wl = workload::generate(seed, &cfg);
     let audit_every_op = wl.ops.len() < 4000;
     let mut model = Model::new(wl.holders);
-    let mut subject = Subject::new(wl.holders);
+    let mut subjects = [
+        Subject::new_flat(wl.holders),
+        Subject::new_chain(wl.holders),
+    ];
     let checkpoint_every = (wl.ops.len() / 6).max(1);
     for (i, op) in wl.ops.iter().enumerate() {
         let model_outcome = model.apply(op);
-        let subject_ok = subject.apply(op);
-        if let Op::Store { .. } = op {
-            let model_ok = !matches!(model_outcome, Some(StoreResult::ParentNotFound));
-            assert_eq!(
-                model_ok, subject_ok,
-                "acceptance diverged: seed {seed} op {i}"
-            );
-        }
-        if audit_every_op {
-            subject
-                .tree
-                .audit()
-                .unwrap_or_else(|e| panic!("audit failed: seed {seed} op {i}: {e}"));
+        for (ci, subject) in subjects.iter_mut().enumerate() {
+            let subject_ok = subject.apply(op);
+            if let Op::Store { .. } = op {
+                let model_ok = !matches!(model_outcome, Some(StoreResult::ParentNotFound));
+                assert_eq!(
+                    model_ok, subject_ok,
+                    "core{ci} acceptance diverged: seed {seed} op {i}"
+                );
+            }
+            if audit_every_op {
+                subject
+                    .audit()
+                    .unwrap_or_else(|e| panic!("core{ci} audit failed: seed {seed} op {i}: {e}"));
+            }
         }
         if i % checkpoint_every == 0 || i + 1 == wl.ops.len() {
-            if !audit_every_op {
-                subject
-                    .tree
-                    .audit()
-                    .unwrap_or_else(|e| panic!("audit failed: seed {seed} op {i}: {e}"));
-            }
-            for query in &wl.queries {
-                assert_eq!(
-                    subject.overlap(query),
-                    model.overlap(query),
-                    "subject != model: seed {seed} op {i}"
-                );
+            for (ci, subject) in subjects.iter_mut().enumerate() {
+                if !audit_every_op {
+                    subject.audit().unwrap_or_else(|e| {
+                        panic!("core{ci} audit failed: seed {seed} op {i}: {e}")
+                    });
+                }
+                for query in &wl.queries {
+                    assert_eq!(
+                        subject.overlap(query),
+                        model.overlap(query),
+                        "core{ci} != model: seed {seed} op {i}"
+                    );
+                }
             }
         }
     }
-    for h in 0..wl.holders {
-        assert_eq!(
-            subject.tree.holder_blocks(subject.ids[h]),
-            model.holder_blocks(h),
-            "holder_blocks diverged: seed {seed} holder {h}"
-        );
+    for (ci, subject) in subjects.iter().enumerate() {
+        for h in 0..wl.holders {
+            assert_eq!(
+                subject.holder_blocks(h),
+                model.holder_blocks(h),
+                "core{ci} holder_blocks diverged: seed {seed} holder {h}"
+            );
+        }
     }
 }
 
+/// Uniform surface over both cores for the generic chaos driver.
+trait CoreApi {
+    fn create_holder(&mut self, name: &str) -> HolderId;
+    fn store(
+        &mut self,
+        id: HolderId,
+        parent: Option<u64>,
+        blocks: &[(u64, u64)],
+    ) -> Result<radix_tree::StoreOutcome, StoreError>;
+    fn remove(&mut self, id: HolderId, keys: &[u64]) -> u32;
+    fn clear(&mut self, id: HolderId);
+    fn truncate_tail(&mut self, id: HolderId, keep: u64) -> u64;
+    fn retire_holder(&mut self, id: HolderId);
+    fn holder_blocks(&self, id: HolderId) -> u64;
+    fn holder_name(&self, id: HolderId) -> Option<&str>;
+    fn overlap(&self, q: &[u64], sc: &mut OverlapScratch, out: &mut Vec<radix_tree::Overlap>);
+    fn audit(&self) -> Result<(), String>;
+    fn distinct_entries(&self) -> u64;
+}
+
+macro_rules! impl_core_api {
+    ($t:ty) => {
+        impl CoreApi for $t {
+            fn create_holder(&mut self, name: &str) -> HolderId {
+                <$t>::create_holder(self, name)
+            }
+            fn store(
+                &mut self,
+                id: HolderId,
+                parent: Option<u64>,
+                blocks: &[(u64, u64)],
+            ) -> Result<radix_tree::StoreOutcome, StoreError> {
+                <$t>::store(self, id, parent, blocks)
+            }
+            fn remove(&mut self, id: HolderId, keys: &[u64]) -> u32 {
+                <$t>::remove(self, id, keys)
+            }
+            fn clear(&mut self, id: HolderId) {
+                <$t>::clear(self, id)
+            }
+            fn truncate_tail(&mut self, id: HolderId, keep: u64) -> u64 {
+                <$t>::truncate_tail(self, id, keep)
+            }
+            fn retire_holder(&mut self, id: HolderId) {
+                <$t>::retire_holder(self, id)
+            }
+            fn holder_blocks(&self, id: HolderId) -> u64 {
+                <$t>::holder_blocks(self, id)
+            }
+            fn holder_name(&self, id: HolderId) -> Option<&str> {
+                <$t>::holder_name(self, id)
+            }
+            fn overlap(
+                &self,
+                q: &[u64],
+                sc: &mut OverlapScratch,
+                out: &mut Vec<radix_tree::Overlap>,
+            ) {
+                <$t>::overlap(self, q, sc, out)
+            }
+            fn audit(&self) -> Result<(), String> {
+                <$t>::audit(self)
+            }
+            fn distinct_entries(&self) -> u64 {
+                <$t>::stats(self).distinct_entries
+            }
+        }
+    };
+}
+impl_core_api!(RadixTree);
+impl_core_api!(RadixTree3);
+
 /// Chaos: arbitrary op soup. Contract: no panic, audit always green,
-/// stale-id ops are loud no-ops, replay is deterministic.
+/// stale-id ops are loud no-ops, replay is deterministic — for BOTH
+/// cores, each against the total model.
 fn run_one_chaos(seed: u64) {
     #[derive(Clone, Debug)]
     enum COp {
@@ -235,8 +359,13 @@ fn run_one_chaos(seed: u64) {
         });
     }
 
-    let run = |script: &[COp]| -> (Vec<BTreeMap<usize, u32>>, u64, u64) {
-        let mut tree = RadixTree::new(Config { max_chain_len: 64 });
+    fn chaos_run<T: CoreApi>(
+        seed: u64,
+        slots: usize,
+        key_pool: &[u64],
+        script: &[COp],
+        mut tree: T,
+    ) -> (Vec<BTreeMap<usize, u32>>, u64) {
         // The model is total (defined on arbitrary inputs), so chaos
         // now runs under the same hard referee gate as the
         // in-contract fuzz — keyed by chaos slot.
@@ -356,18 +485,41 @@ fn run_one_chaos(seed: u64) {
                 }
             }
         }
-        let stats = tree.stats();
+        let distinct = tree.distinct_entries();
         assert_eq!(
-            stats.distinct_entries,
+            distinct,
             model.distinct_entries(),
             "chaos distinct_entries diverged (seed {seed})"
         );
-        (answers, stats.holder_blocks, stats.distinct_entries)
-    };
-    // Determinism: two independent executions of the same soup agree.
-    let a = run(&script);
-    let b = run(&script);
-    assert_eq!(a, b, "chaos replay diverged (seed {seed})");
+        (answers, distinct)
+    }
+    // Determinism per core, and cross-core agreement, all vs model.
+    let flat_a = chaos_run(
+        seed,
+        slots,
+        &key_pool,
+        &script,
+        RadixTree::new(Config { max_chain_len: 64 }),
+    );
+    let flat_b = chaos_run(
+        seed,
+        slots,
+        &key_pool,
+        &script,
+        RadixTree::new(Config { max_chain_len: 64 }),
+    );
+    assert_eq!(flat_a, flat_b, "flat chaos replay diverged (seed {seed})");
+    let chain_a = chaos_run(
+        seed,
+        slots,
+        &key_pool,
+        &script,
+        RadixTree3::new(Config { max_chain_len: 64 }),
+    );
+    assert_eq!(
+        flat_a, chain_a,
+        "flat vs chain chaos diverged (seed {seed})"
+    );
 }
 
 #[test]

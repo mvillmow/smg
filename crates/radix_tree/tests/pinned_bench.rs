@@ -18,7 +18,7 @@ mod common;
 use std::time::Instant;
 
 use common::{oracle::Oracle, Op, Rng};
-use radix_tree::{Config, HolderId, OverlapScratch, RadixTree};
+use radix_tree::{Config, HolderId, OverlapScratch, RadixTree, RadixTree3};
 
 // ---- §11 normative constants (default scale) ----
 // RADIX_BENCH_SCALE=large runs 8x blocks / 8x holders (~20 GB peak,
@@ -222,6 +222,12 @@ enum Sider {
         Vec<radix_tree::Overlap>,
         OverlapScratch,
     ),
+    R3(
+        RadixTree3,
+        Vec<HolderId>,
+        Vec<radix_tree::Overlap>,
+        OverlapScratch,
+    ),
 }
 
 impl Sider {
@@ -257,6 +263,19 @@ impl Sider {
                 }
                 Op::Clear { holder } => tree.clear(ids[*holder]),
             },
+            Sider::R3(tree, ids, _, _) => match op {
+                Op::Store {
+                    holder,
+                    parent,
+                    blocks,
+                } => {
+                    let _ = tree.store(ids[*holder], *parent, blocks);
+                }
+                Op::Remove { holder, keys } => {
+                    tree.remove(ids[*holder], keys);
+                }
+                Op::Clear { holder } => tree.clear(ids[*holder]),
+            },
         }
     }
 
@@ -264,6 +283,10 @@ impl Sider {
         match self {
             Sider::Oracle(oracle, _) => oracle.overlap(q).len(),
             Sider::R1(tree, _, out, qscratch) => {
+                tree.overlap(q, qscratch, out);
+                out.len()
+            }
+            Sider::R3(tree, _, out, qscratch) => {
                 tree.overlap(q, qscratch, out);
                 out.len()
             }
@@ -303,6 +326,13 @@ fn pinned_workload() {
                 .map(|h| tree.create_holder(&format!("holder-{h}")))
                 .collect();
             Sider::R1(tree, ids, Vec::new(), OverlapScratch::default())
+        }
+        "r3" => {
+            let mut tree = RadixTree3::new(Config::default());
+            let ids = (0..holders())
+                .map(|h| tree.create_holder(&format!("holder-{h}")))
+                .collect();
+            Sider::R3(tree, ids, Vec::new(), OverlapScratch::default())
         }
         _ => Sider::Oracle(Oracle::new(holders()), vec![Vec::new(); holders()]),
     };

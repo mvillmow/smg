@@ -22,24 +22,44 @@ use common::{
     oracle::Oracle,
     workload, Op,
 };
-use radix_tree::{Config, HolderId, OverlapScratch, RadixTree, StoreError};
+use radix_tree::{Config, HolderId, OverlapScratch, RadixTree, RadixTree3, StoreError};
 
-/// The implementation under test, driven by the harness Op protocol.
+/// The implementations under test (flat R1 and chain-native R3),
+/// driven by the harness Op protocol. Every observable is asserted
+/// for BOTH against the model.
+enum Core {
+    Flat(RadixTree),
+    Chain(RadixTree3),
+}
+
 struct Subject {
-    tree: RadixTree,
+    core: Core,
     ids: Vec<HolderId>,
     scratch: Vec<radix_tree::Overlap>,
     qscratch: OverlapScratch,
 }
 
 impl Subject {
-    fn new(holders: usize) -> Self {
+    fn new_flat(holders: usize) -> Self {
         let mut tree = RadixTree::new(Config::default());
         let ids = (0..holders)
             .map(|h| tree.create_holder(&format!("holder-{h}")))
             .collect();
         Self {
-            tree,
+            core: Core::Flat(tree),
+            ids,
+            scratch: Vec::new(),
+            qscratch: OverlapScratch::default(),
+        }
+    }
+
+    fn new_chain(holders: usize) -> Self {
+        let mut tree = RadixTree3::new(Config::default());
+        let ids = (0..holders)
+            .map(|h| tree.create_holder(&format!("holder-{h}")))
+            .collect();
+        Self {
+            core: Core::Chain(tree),
             ids,
             scratch: Vec::new(),
             qscratch: OverlapScratch::default(),
@@ -53,17 +73,29 @@ impl Subject {
                 holder,
                 parent,
                 blocks,
-            } => match self.tree.store(self.ids[*holder], *parent, blocks) {
-                Ok(_) => true,
-                Err(StoreError::ParentNotFound) => false,
-                Err(e) => panic!("unexpected store error {e:?}"),
-            },
+            } => {
+                let r = match &mut self.core {
+                    Core::Flat(t) => t.store(self.ids[*holder], *parent, blocks),
+                    Core::Chain(t) => t.store(self.ids[*holder], *parent, blocks),
+                };
+                match r {
+                    Ok(_) => true,
+                    Err(StoreError::ParentNotFound) => false,
+                    Err(e) => panic!("unexpected store error {e:?}"),
+                }
+            }
             Op::Remove { holder, keys } => {
-                self.tree.remove(self.ids[*holder], keys);
+                match &mut self.core {
+                    Core::Flat(t) => t.remove(self.ids[*holder], keys),
+                    Core::Chain(t) => t.remove(self.ids[*holder], keys),
+                };
                 true
             }
             Op::Clear { holder } => {
-                self.tree.clear(self.ids[*holder]);
+                match &mut self.core {
+                    Core::Flat(t) => t.clear(self.ids[*holder]),
+                    Core::Chain(t) => t.clear(self.ids[*holder]),
+                }
                 true
             }
         }
@@ -71,12 +103,43 @@ impl Subject {
 
     fn overlap(&mut self, query: &[u64]) -> BTreeMap<usize, u32> {
         let scratch = &mut self.scratch;
-        self.tree.overlap(query, &mut self.qscratch, scratch);
+        match &mut self.core {
+            Core::Flat(t) => t.overlap(query, &mut self.qscratch, scratch),
+            Core::Chain(t) => t.overlap(query, &mut self.qscratch, scratch),
+        }
         let mut out = BTreeMap::new();
         for o in scratch.iter() {
             out.insert(o.holder.parts().0 as usize, o.depth);
         }
         out
+    }
+
+    fn holder_blocks(&self, h: usize) -> u64 {
+        match &self.core {
+            Core::Flat(t) => t.holder_blocks(self.ids[h]),
+            Core::Chain(t) => t.holder_blocks(self.ids[h]),
+        }
+    }
+
+    fn enumerate(&self, h: usize) -> Vec<(u32, u64, u64)> {
+        match &self.core {
+            Core::Flat(t) => t.enumerate(self.ids[h]).collect(),
+            Core::Chain(t) => t.enumerate(self.ids[h]).collect(),
+        }
+    }
+
+    fn distinct_entries(&self) -> u64 {
+        match &self.core {
+            Core::Flat(t) => t.stats().distinct_entries,
+            Core::Chain(t) => t.stats().distinct_entries,
+        }
+    }
+
+    fn audit(&self) -> Result<(), String> {
+        match &self.core {
+            Core::Flat(t) => t.audit(),
+            Core::Chain(t) => t.audit(),
+        }
     }
 }
 
@@ -103,7 +166,10 @@ fn run_differential(seed: u64, cfg: &workload::Config) -> Census {
     let wl = workload::generate(seed, cfg);
     let mut model = Model::new(wl.holders);
     let mut oracle = Oracle::new(wl.holders);
-    let mut subject = Subject::new(wl.holders);
+    let mut subjects = [
+        Subject::new_flat(wl.holders),
+        Subject::new_chain(wl.holders),
+    ];
     let mut census = Census {
         queries: 0,
         holder_answers: 0,
@@ -116,17 +182,22 @@ fn run_differential(seed: u64, cfg: &workload::Config) -> Census {
     for (i, op) in wl.ops.iter().enumerate() {
         let model_outcome = model.apply(op);
         let oracle_ok = oracle.apply(op);
-        let subject_ok = subject.apply(op);
         if let Op::Store { .. } = op {
             let model_ok = !matches!(model_outcome, Some(StoreResult::ParentNotFound));
             assert_eq!(
                 model_ok, oracle_ok,
                 "oracle store acceptance diverged at op {i} (seed {seed}): {op:?}"
             );
-            assert_eq!(
-                model_ok, subject_ok,
-                "RadixTree store acceptance diverged at op {i} (seed {seed}): {op:?}"
-            );
+        }
+        for (ci, subject) in subjects.iter_mut().enumerate() {
+            let subject_ok = subject.apply(op);
+            if let Op::Store { .. } = op {
+                let model_ok = !matches!(model_outcome, Some(StoreResult::ParentNotFound));
+                assert_eq!(
+                    model_ok, subject_ok,
+                    "core{ci} store acceptance diverged at op {i} (seed {seed}): {op:?}"
+                );
+            }
         }
         if i % checkpoint_every == 0 || i + 1 == wl.ops.len() {
             checkpoint(
@@ -134,33 +205,33 @@ fn run_differential(seed: u64, cfg: &workload::Config) -> Census {
                 i,
                 &model,
                 &oracle,
-                &mut subject,
+                &mut subjects,
                 &wl.queries,
                 &mut census,
             );
         }
     }
     // Terminal per-holder accounting, enumeration, and distinct-entry
-    // parity (review finding: these observables were never
-    // model-checked).
-    for h in 0..wl.holders {
+    // parity, for BOTH cores.
+    for (ci, subject) in subjects.iter().enumerate() {
+        for h in 0..wl.holders {
+            assert_eq!(
+                subject.holder_blocks(h),
+                model.holder_blocks(h),
+                "core{ci} holder_blocks diverged for holder {h} (seed {seed})"
+            );
+            assert_eq!(
+                subject.enumerate(h),
+                model.enumerate(h),
+                "core{ci} enumerate diverged for holder {h} (seed {seed})"
+            );
+        }
         assert_eq!(
-            subject.tree.holder_blocks(subject.ids[h]),
-            model.holder_blocks(h),
-            "holder_blocks diverged for holder {h} (seed {seed})"
-        );
-        let got: Vec<(u32, u64, u64)> = subject.tree.enumerate(subject.ids[h]).collect();
-        assert_eq!(
-            got,
-            model.enumerate(h),
-            "enumerate diverged for holder {h} (seed {seed})"
+            subject.distinct_entries(),
+            model.distinct_entries(),
+            "core{ci} distinct_entries diverged (seed {seed})"
         );
     }
-    assert_eq!(
-        subject.tree.stats().distinct_entries,
-        model.distinct_entries(),
-        "distinct_entries diverged (seed {seed})"
-    );
     census
 }
 
@@ -169,28 +240,35 @@ fn checkpoint(
     at: usize,
     model: &Model,
     oracle: &Oracle,
-    subject: &mut Subject,
+    subjects: &mut [Subject; 2],
     queries: &[Vec<u64>],
     census: &mut Census,
 ) {
+    for (ci, subject) in subjects.iter().enumerate() {
+        subject
+            .audit()
+            .unwrap_or_else(|e| panic!("core{ci} audit failed (seed {seed}, op {at}): {e}"));
+    }
     for query in queries {
         census.queries += 1;
         let want = model.overlap(query);
-        // THE gate: the implementation equals the model, always.
-        let subject_map = subject.overlap(query);
-        assert_eq!(
-            subject_map,
-            want,
-            "RadixTree != model (seed {seed}, op {at}, query len {})",
-            query.len()
-        );
-        for o in subject.scratch.iter() {
-            let h = o.holder.parts().0 as usize;
+        // THE gate: both implementations equal the model, always.
+        for (ci, subject) in subjects.iter_mut().enumerate() {
+            let subject_map = subject.overlap(query);
             assert_eq!(
-                o.total_blocks,
-                model.holder_blocks(h),
-                "total_blocks diverged for holder {h} (seed {seed}, op {at})"
+                subject_map,
+                want,
+                "core{ci} != model (seed {seed}, op {at}, query len {})",
+                query.len()
             );
+            for o in subject.scratch.iter() {
+                let h = o.holder.parts().0 as usize;
+                assert_eq!(
+                    o.total_blocks,
+                    model.holder_blocks(h),
+                    "core{ci} total_blocks diverged for holder {h} (seed {seed}, op {at})"
+                );
+            }
         }
         let got = oracle.overlap(query);
         // Under-match anywhere = unclassifiable = fail.
@@ -266,10 +344,15 @@ fn model_converges_within_scope() {
         for reorder_seed in [7u64, 8, 9] {
             let ops = workload::reinterleave(reorder_seed, &wl.ops, wl.holders);
             let mut other = Model::new(wl.holders);
-            let mut subject = Subject::new(wl.holders);
+            let mut subjects = [
+                Subject::new_flat(wl.holders),
+                Subject::new_chain(wl.holders),
+            ];
             for op in &ops {
                 other.apply(op);
-                subject.apply(op);
+                for subject in subjects.iter_mut() {
+                    subject.apply(op);
+                }
             }
             for query in &wl.queries {
                 let want = reference.overlap(query);
@@ -278,18 +361,19 @@ fn model_converges_within_scope() {
                     other.overlap(query),
                     "model diverged under scoped reordering (seed {seed}/{reorder_seed})"
                 );
-                assert_eq!(
-                    subject.overlap(query),
-                    want,
-                    "RadixTree diverged under scoped reordering (seed {seed}/{reorder_seed})"
-                );
+                for (ci, subject) in subjects.iter_mut().enumerate() {
+                    assert_eq!(
+                        subject.overlap(query),
+                        want,
+                        "core{ci} diverged under scoped reordering (seed {seed}/{reorder_seed})"
+                    );
+                }
             }
             for h in 0..wl.holders {
                 assert_eq!(reference.holder_blocks(h), other.holder_blocks(h));
-                assert_eq!(
-                    subject.tree.holder_blocks(subject.ids[h]),
-                    reference.holder_blocks(h)
-                );
+                for subject in subjects.iter() {
+                    assert_eq!(subject.holder_blocks(h), reference.holder_blocks(h));
+                }
             }
         }
     }
@@ -300,7 +384,7 @@ fn model_converges_within_scope() {
 fn rejected_store_applies_nothing() {
     let mut model = Model::new(1);
     let mut oracle = Oracle::new(1);
-    let mut subject = Subject::new(1);
+    let mut subjects = [Subject::new_flat(1), Subject::new_chain(1)];
     let seeded = Op::Store {
         holder: 0,
         parent: None,
@@ -308,10 +392,15 @@ fn rejected_store_applies_nothing() {
     };
     model.apply(&seeded);
     oracle.apply(&seeded);
-    subject.apply(&seeded);
+    for subject in subjects.iter_mut() {
+        subject.apply(&seeded);
+    }
     let before_model = model.overlap(&[101, 102]);
     let before_oracle = oracle.overlap(&[101, 102]);
-    let before_subject = subject.overlap(&[101, 102]);
+    let before_subject: Vec<_> = subjects
+        .iter_mut()
+        .map(|s| s.overlap(&[101, 102]))
+        .collect();
     let bad = Op::Store {
         holder: 0,
         parent: Some(999),
@@ -319,10 +408,14 @@ fn rejected_store_applies_nothing() {
     };
     assert_eq!(model.apply(&bad), Some(StoreResult::ParentNotFound));
     assert!(!oracle.apply(&bad));
-    assert!(!subject.apply(&bad));
+    for subject in subjects.iter_mut() {
+        assert!(!subject.apply(&bad));
+    }
     assert_eq!(model.overlap(&[101, 102]), before_model);
     assert_eq!(oracle.overlap(&[101, 102]), before_oracle);
-    assert_eq!(subject.overlap(&[101, 102]), before_subject);
+    for (subject, before) in subjects.iter_mut().zip(&before_subject) {
+        assert_eq!(subject.overlap(&[101, 102]), *before);
+        assert_eq!(subject.holder_blocks(0), 2);
+    }
     assert_eq!(model.holder_blocks(0), 2);
-    assert_eq!(subject.tree.holder_blocks(subject.ids[0]), 2);
 }

@@ -134,6 +134,7 @@ fn placement_chain_keys(hashes: &[kv_index::ContentHash]) -> Vec<(u64, u64)> {
     out
 }
 
+#[allow(clippy::large_enum_variant)] // bench-local, one instance per process
 enum Side {
     Token(TokenTree),
     String(StringTree),

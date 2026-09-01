@@ -10,6 +10,8 @@
 
 #![forbid(unsafe_code)]
 
+mod core3;
+pub use core3::RadixTree3;
 use rustc_hash::FxHashMap;
 
 /// Position-independent content identity (the matching currency).
@@ -32,6 +34,10 @@ impl HolderId {
     /// generation.
     pub fn parts(self) -> (u32, u64) {
         (self.index, self.generation)
+    }
+
+    pub(crate) fn assemble(index: u32, generation: u64) -> Self {
+        Self { index, generation }
     }
 }
 
