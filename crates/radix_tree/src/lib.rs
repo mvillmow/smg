@@ -160,17 +160,30 @@ enum Membership {
     Many(Vec<(u64, Vec<u32>)>),
 }
 
+/// What [`Membership::insert`] did — drives both counter maintenance
+/// and the out-of-contract same-triple dedup in `store`.
+#[derive(PartialEq, Eq)]
+enum Inserted {
+    /// The (lineage, holder) pair was already present: the holder
+    /// already holds a block at this exact (position, content,
+    /// lineage) under a DIFFERENT key. Out-of-contract; the caller
+    /// treats it as a duplicate and does not register the new key.
+    Existing,
+    AddedToExistingLineage,
+    AddedNewLineage,
+}
+
 impl Membership {
-    /// Insert; true when newly added.
-    fn insert(&mut self, lineage: u64, holder: u32) -> bool {
+    fn insert(&mut self, lineage: u64, holder: u32) -> Inserted {
         match self {
             Membership::One {
                 lineage: l,
                 holder: h,
             } => {
                 if *l == lineage && *h == holder {
-                    false
+                    Inserted::Existing
                 } else {
+                    let same_lineage = *l == lineage;
                     let mut buckets = vec![(*l, vec![*h])];
                     match buckets[0].0.cmp(&lineage) {
                         std::cmp::Ordering::Equal => {
@@ -181,21 +194,25 @@ impl Membership {
                         std::cmp::Ordering::Greater => buckets.insert(0, (lineage, vec![holder])),
                     }
                     *self = Membership::Many(buckets);
-                    true
+                    if same_lineage {
+                        Inserted::AddedToExistingLineage
+                    } else {
+                        Inserted::AddedNewLineage
+                    }
                 }
             }
             Membership::Many(buckets) => {
                 match buckets.binary_search_by_key(&lineage, |&(l, _)| l) {
                     Ok(bi) => match buckets[bi].1.binary_search(&holder) {
-                        Ok(_) => false,
+                        Ok(_) => Inserted::Existing,
                         Err(at) => {
                             buckets[bi].1.insert(at, holder);
-                            true
+                            Inserted::AddedToExistingLineage
                         }
                     },
                     Err(bi) => {
                         buckets.insert(bi, (lineage, vec![holder]));
-                        true
+                        Inserted::AddedNewLineage
                     }
                 }
             }
@@ -392,25 +409,40 @@ impl RadixTree {
                     continue;
                 }
                 Some(&existing) => {
-                    // §4: re-registration MOVES the block.
+                    // §4: re-registration MOVES the block. The old
+                    // placement is unindexed and the key removed; it
+                    // is re-registered below only if the destination
+                    // accepts it.
                     Self::unindex(
                         &mut self.entries,
                         &mut self.distinct_lineage_entries,
                         id.index,
                         existing,
                     );
+                    self.slots[id.index as usize]
+                        .state
+                        .as_mut()
+                        .expect("checked live")
+                        .registry
+                        .remove(&key);
                     self.holder_blocks_total -= 1;
                 }
                 None => {}
             }
-            let state = self.slots[id.index as usize]
-                .state
-                .as_mut()
-                .expect("checked live");
-            state.registry.insert(key, info);
-            self.holder_blocks_total += 1;
-            self.index_block(id.index, info);
-            applied += 1;
+            if self.index_block(id.index, info) {
+                let state = self.slots[id.index as usize]
+                    .state
+                    .as_mut()
+                    .expect("checked live");
+                state.registry.insert(key, info);
+                self.holder_blocks_total += 1;
+                applied += 1;
+            } else {
+                // Same holder already holds this exact (position,
+                // content, lineage) under another key: a duplicate in
+                // every observable sense.
+                duplicates += 1;
+            }
         }
         Ok(StoreOutcome {
             applied,
@@ -665,6 +697,166 @@ impl RadixTree {
         }
     }
 
+    // ---- verification (campaign C2) ----
+
+    /// Full-state consistency audit: recomputes every counter and
+    /// cross-checks every structure from first principles. O(state);
+    /// meant for the fuzz harness and debug assertions, not the hot
+    /// path. Returns the first violation found.
+    pub fn audit(&self) -> Result<(), String> {
+        use std::collections::HashSet;
+        // Slot / name / free-list coherence.
+        let mut live = 0u64;
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if let Some(state) = &slot.state {
+                live += 1;
+                match self.by_name.get(&state.name) {
+                    Some(&i) if i as usize == idx => {}
+                    other => {
+                        return Err(format!(
+                            "by_name[{}] = {:?}, expected {}",
+                            state.name, other, idx
+                        ))
+                    }
+                }
+            }
+        }
+        if self.by_name.len() as u64 != live {
+            return Err(format!(
+                "by_name has {} entries, {} live slots",
+                self.by_name.len(),
+                live
+            ));
+        }
+        let mut seen_free = HashSet::new();
+        for &f in &self.free {
+            if f as usize >= self.slots.len() {
+                return Err(format!("free-list index {f} out of range"));
+            }
+            if self.slots[f as usize].state.is_some() {
+                return Err(format!("free-list index {f} is live"));
+            }
+            if !seen_free.insert(f) {
+                return Err(format!("free-list duplicate {f}"));
+            }
+        }
+        // Counters + forward containment (registry -> entries).
+        let mut blocks = 0u64;
+        for (idx, slot) in self.slots.iter().enumerate() {
+            let Some(state) = &slot.state else { continue };
+            blocks += state.registry.len() as u64;
+            for (&key, info) in &state.registry {
+                let Some(m) = self.entries.get(&(info.pos, info.content)) else {
+                    return Err(format!(
+                        "registry block {key:#x} of holder {idx} at ({},{:#x}) has no entry",
+                        info.pos, info.content
+                    ));
+                };
+                let mut found = false;
+                match m {
+                    Membership::One { lineage, holder } => {
+                        found = *lineage == info.lineage && *holder as usize == idx;
+                    }
+                    Membership::Many(buckets) => {
+                        if let Ok(bi) = buckets.binary_search_by_key(&info.lineage, |&(l, _)| l) {
+                            found = buckets[bi].1.binary_search(&(idx as u32)).is_ok();
+                        }
+                    }
+                }
+                if !found {
+                    return Err(format!(
+                        "membership missing for holder {idx} block {key:#x} at ({},{:#x}) lineage {:#x}",
+                        info.pos, info.content, info.lineage
+                    ));
+                }
+            }
+        }
+        if blocks != self.holder_blocks_total {
+            return Err(format!(
+                "holder_blocks_total {} != recount {}",
+                self.holder_blocks_total, blocks
+            ));
+        }
+        // Reverse containment (entries -> registries) + shape + distinct.
+        let mut holder_triples: Vec<HashSet<(u32, u64, u64)>> =
+            vec![HashSet::new(); self.slots.len()];
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if let Some(state) = &slot.state {
+                for info in state.registry.values() {
+                    holder_triples[idx].insert((info.pos, info.content, info.lineage));
+                }
+            }
+        }
+        let mut distinct = 0u64;
+        for (&(pos, content), m) in &self.entries {
+            match m {
+                Membership::One { lineage, holder } => {
+                    distinct += 1;
+                    if self
+                        .slots
+                        .get(*holder as usize)
+                        .and_then(|s| s.state.as_ref())
+                        .is_none()
+                    {
+                        return Err(format!(
+                            "entry ({pos},{content:#x}) holds retired holder {holder}"
+                        ));
+                    }
+                    if !holder_triples[*holder as usize].contains(&(pos, content, *lineage)) {
+                        return Err(format!(
+                            "entry ({pos},{content:#x}) lineage {lineage:#x} not in holder {holder}'s registry"
+                        ));
+                    }
+                }
+                Membership::Many(buckets) => {
+                    if buckets.is_empty() {
+                        return Err(format!("empty Many at ({pos},{content:#x})"));
+                    }
+                    let mut prev_l = None;
+                    for (l, holders) in buckets {
+                        distinct += 1;
+                        if holders.is_empty() {
+                            return Err(format!("empty bucket at ({pos},{content:#x})"));
+                        }
+                        if prev_l.is_some_and(|p: u64| p >= *l) {
+                            return Err(format!("unsorted buckets at ({pos},{content:#x})"));
+                        }
+                        prev_l = Some(*l);
+                        let mut prev_h = None;
+                        for &h in holders {
+                            if prev_h.is_some_and(|p: u32| p >= h) {
+                                return Err(format!("unsorted holders at ({pos},{content:#x})"));
+                            }
+                            prev_h = Some(h);
+                            if self
+                                .slots
+                                .get(h as usize)
+                                .and_then(|s| s.state.as_ref())
+                                .is_none()
+                            {
+                                return Err(format!(
+                                    "entry ({pos},{content:#x}) holds retired holder {h}"
+                                ));
+                            }
+                            if !holder_triples[h as usize].contains(&(pos, content, *l)) {
+                                return Err(format!(
+                                    "entry ({pos},{content:#x}) lineage {l:#x} not in holder {h}'s registry"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if distinct != self.distinct_lineage_entries {
+            return Err(format!(
+                "distinct_lineage_entries {} != recount {}",
+                self.distinct_lineage_entries, distinct
+            ));
+        }
+        Ok(())
+    }
+
     // ---- internals ----
 
     fn live(&self, id: HolderId) -> Option<&HolderState> {
@@ -693,7 +885,12 @@ impl RadixTree {
         });
     }
 
-    fn index_block(&mut self, holder: u32, info: BlockInfo) {
+    /// Add the (lineage, holder) membership for a block. Returns
+    /// false for the out-of-contract case where the holder ALREADY
+    /// holds this exact (position, content, lineage) under another
+    /// key — the caller then treats the store as a duplicate and the
+    /// new key is never registered (deterministic; audited).
+    fn index_block(&mut self, holder: u32, info: BlockInfo) -> bool {
         match self.entries.entry((info.pos, info.content)) {
             std::collections::hash_map::Entry::Vacant(vacant) => {
                 vacant.insert(Membership::One {
@@ -701,13 +898,16 @@ impl RadixTree {
                     holder,
                 });
                 self.distinct_lineage_entries += 1;
+                true
             }
             std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                let had_lineage = occupied.get().lineage_shared_beyond(info.lineage, holder)
-                    || matches!(occupied.get(), Membership::One { lineage, holder: h }
-                        if *lineage == info.lineage && *h == holder);
-                if occupied.get_mut().insert(info.lineage, holder) && !had_lineage {
-                    self.distinct_lineage_entries += 1;
+                match occupied.get_mut().insert(info.lineage, holder) {
+                    Inserted::Existing => false,
+                    Inserted::AddedToExistingLineage => true,
+                    Inserted::AddedNewLineage => {
+                        self.distinct_lineage_entries += 1;
+                        true
+                    }
                 }
             }
         }

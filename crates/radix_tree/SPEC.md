@@ -131,6 +131,12 @@ Write semantics (revised, all normative):
   **moves** the block (the prior placement is removed first) — the
   deterministic resolution the engine's re-anchor recovery needs.
   Chain-consistent workloads (§7) never do this.
+- A SECOND key stored by the same holder at an identical (position,
+  content, lineage) is counted a duplicate and NOT registered (and a
+  move landing on such a triple removes the moved key). Added after
+  the chaos fuzz caught the alternative corrupting shared membership
+  state: two keys, one membership pair, first removal orphaning the
+  second (campaign C1, chaos seed 7).
 - `remove` of an unknown key is a no-op (counts only actual removals).
 - **`truncate_tail` on the forest**: remove blocks in strictly
   decreasing position order across ALL chains, ties at a position
