@@ -20,15 +20,29 @@ evidence linked/recorded next to it. Status legend: [ ] open,
   coincidence, forest fan-out), RadixTree == model on every
   checkpoint of every seed. Target: >= 10,000 seeds, zero
   divergences, plus a standing soak entry point.
-- C2 [ ] **Internal invariant checker**: a debug-audit method proving
+- C2 [x] **Internal invariant checker** — audit() recomputes every
+  counter, forward+reverse containment, bucket order, name/free-list
+  coherence, interner coherence; green after EVERY op across the
+  fuzz. First extended run caught real state corruption (twin-key
+  membership sharing) within minutes.: a debug-audit method proving
   cross-structure consistency (registry <-> entries <-> counters <->
   name maps <-> free list) after every operation in fuzz mode — this
   catches state corruption that answer-comparison alone cannot.
-- C3 [ ] **Out-of-contract determinism**: deliberately violate
+- C3 [x] **Out-of-contract determinism** — the referee model is now
+  TOTAL (per-block literal lineages; every §4 alias rule mirrored,
+  chain bound mirrored), so chaos runs under the same hard gate:
+  subject == model on arbitrary inputs, deterministic replay, no
+  panics, audit green. Two more real bugs fixed on the way: the
+  destructive refused-move, and the twin-key drop semantics now
+  normative in SPEC §4.: deliberately violate
   chain-consistency (duplicate keys across positions, moves, parent
   inversions, post-clear orphans): no panics, invariants hold,
   behavior deterministic under per-holder order.
-- C4 [ ] **Boundary audit**: max_chain_len edges, position u32
+- C4 [x] **Boundary audit** — ChainTooLong atomicity tested;
+  positions capped to the u32 wire range in the walk; generation
+  wrap: u64 now (reviewers wrapped u32 empirically in ~3 min of
+  tight churn; u64 is ~10^19 retires of one slot); slot-space
+  exhaustion guarded loudly.: max_chain_len edges, position u32
   bounds, empty batches, holder-slot reuse at scale, generation
   wraparound analysis (u32 wrap = 4e9 retires of ONE slot —
   quantified, documented).
@@ -36,7 +50,12 @@ evidence linked/recorded next to it. Status legend: [ ] open,
   probability at 1.7e8-block production scale, quantified; upgrade
   path (128-bit) evaluated with measured memory cost if the bound is
   not comfortably negligible.
-- C6 [ ] **Adversarial code review**: independent reviewers attack
+- C6 [x] **Adversarial code review** — four reviewers (accounting /
+  lifecycle / query walk / panics+OOB), 138 tool calls of attack.
+  Verdicts: accounting exact, lifecycle sound, walk sound. Every
+  confirmed finding fixed (destructive refused-move, u32 generation,
+  &mut-self read path, Miss-probe waste, model/spec/subject alias
+  alignment) with regression coverage via the total-model chaos gate.: independent reviewers attack
   lib.rs (counter maintenance, generation logic, merge walk, move
   semantics, panic surfaces); every finding fixed or refuted with a
   test.
@@ -46,16 +65,26 @@ evidence linked/recorded next to it. Status legend: [ ] open,
 
 ## Pillar 2 — Fault tolerance
 
-- F1 [~] **Network partition**: full inter-replica partition
+- F1 [x] **Network partition** — 45s full inter-replica partition
+  under load: 0 errors, routing held (0.9414 follow-up cached),
+  partitioned replica TTL-drained to zero, relay queue absorbed the
+  window (0 drops), heal replayed ~1M blocks in 20s; residual gap ==
+  pre-partition state exactly (the designed TTL+re-placement bound,
+  measured).: full inter-replica partition
   (severable TCP proxies) injected mid-load and healed; per-replica
   metrics timeline shows bounded divergence during and reconvergence
   after; zero request errors.
-- F2 [~] **Wedged replica** (SIGSTOP): TCP up, nothing drains —
+- F2 [x] **Wedged replica** (SIGSTOP 45s) — ingest never blocked,
+  0 errors, and after SIGCONT the replica converged EXACTLY (applies
+  equal to within in-flight).: TCP up, nothing drains —
   relay-drop counters climb, ingest never blocks, resume converges.
-- F3 [~] **Replica count**: 1 / 2 / 4 replicas, routing parity and
+- F3 [x] **Replica count** (smoke) — 1/2/4 replicas: 0 errors at
+  every K; mild accuracy dip at K=4 consistent with shared-box relay
+  CPU, no protocol failure.: 1 / 2 / 4 replicas, routing parity and
   relay cost measured.
-- F4 [ ] **Kill + relaunch under load** (M2 drill rerun on current
-  binaries): zero errors, one-bin recovery via peer bootstrap.
+- F4 [x] **Kill + relaunch under load** (rerun) — 0 errors; degraded
+  window = the outage (gateways fast-fail to local fallback), then
+  recovery via peer bootstrap, matching M2's shape.
 - F5 [ ] **Add replica under live load**: bootstrap-while-writing
   converges to sibling answers.
 - F6 [ ] **Relay overflow**: partition long enough to overflow the
@@ -66,7 +95,13 @@ evidence linked/recorded next to it. Status legend: [ ] open,
 
 ## Pillar 3 — Extreme performance (original gates, no amendment)
 
-- P1 [~] **Solo large-scale**: 128M holder-blocks (~75% of production
+- P1 [x] **Solo large-scale** — 128M holder-blocks (cap chosen for
+  the 48GB box), both sides, solo protocol: R1 degrades ~2x gentler
+  than the oracle (fill 5.63M vs 2.28M bl/s; H=1 p50 1.5 vs 3.9us;
+  miss 250 vs 750ns); oracle keeps only the skip-powered gate cell.
+  CAVEAT: RSS-based memory is INVALID at this footprint on macOS
+  (compressed memory) — bytes/block evidence stays at the 12.8M
+  scale; large-scale memory needs a Linux/staging box.: 128M holder-blocks (~75% of production
   target), both implementations, box otherwise idle — growth
   nonlinearities quantified. (First attempt invalidated: concurrent
   benches contaminated RSS/fill; protocol now enforced.)
