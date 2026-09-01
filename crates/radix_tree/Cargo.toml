@@ -1,0 +1,15 @@
+[package]
+name = "radix-tree"
+version = "0.1.0"
+edition = "2021"
+description = "Generic prefix-membership index (spec stage; see SPEC.md)"
+license = "Apache-2.0"
+
+[dependencies]
+# Deliberately empty: zero SMG dependencies (SPEC.md §1), and no core
+# code lands before the verification harness exists (§12 R0).
+
+[dev-dependencies]
+# The differential oracle. Dev-only: the published crate never
+# depends on SMG code.
+kv-index = { path = "../kv_index" }

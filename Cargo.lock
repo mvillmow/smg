@@ -6046,6 +6046,14 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "radix-tree"
+version = "0.1.0"
+dependencies = [
+ "kv-index",
 ]
 
 [[package]]
