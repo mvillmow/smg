@@ -532,6 +532,7 @@ struct Router {
     max_buffered_request_bytes: u64,
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
+    mm_per_request_image_limit: Option<usize>,
     /// Appended last for positional constructor compatibility.
     worker_mode: worker::WorkerMode,
 }
@@ -933,6 +934,7 @@ impl Router {
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .mm_per_request_image_limit(self.mm_per_request_image_limit)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -1108,6 +1110,7 @@ impl Router {
         max_buffered_request_bytes = 1_048_576,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
+        mm_per_request_image_limit = None,
         worker_mode = String::from("engine"),
     ))]
     #[expect(clippy::too_many_arguments)]
@@ -1257,6 +1260,7 @@ impl Router {
         max_buffered_request_bytes: u64,
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
+        mm_per_request_image_limit: Option<usize>,
         worker_mode: String,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
@@ -1427,6 +1431,7 @@ impl Router {
             max_buffered_request_bytes,
             kv_connector_annotation,
             kv_engine_id_annotation,
+            mm_per_request_image_limit,
             worker_mode,
         })
     }
