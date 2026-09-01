@@ -78,16 +78,23 @@ evidence linked/recorded next to it. Status legend: [ ] open,
 - F4 [x] **Kill + relaunch under load** (rerun) — 0 errors; degraded
   window = the outage (gateways fast-fail to local fallback), then
   recovery via peer bootstrap, matching M2's shape.
-- F5 [~] **Add replica under live load** — deferred-replica drill
-  built (peers pre-configured, replica starts mid-run and bootstraps
-  under load, the k8s StatefulSet shape); run queued (campaign4).
-  Dynamic membership beyond pre-configured peers remains a design
-  backlog item, documented.
-- F6 [~] **Relay overflow** — 90s partition (vs the 45s the queue
-  absorbed) queued (campaign4); expecting relay_dropped > 0 and
-  post-heal divergence bounded by TTL + re-placement.
-- F7 [~] **Flap** — kill/relaunch-with-bootstrap x3 drill built;
-  run queued (campaign4).
+- F5 [x] **Add replica under live load** — deferred replica started
+  mid-run: bootstrapped 1.26M blocks from a sibling under live
+  writes, picked up the live relay immediately (peers had been
+  retrying its address), converged to sibling state by end. 0
+  errors. Dynamic membership beyond pre-configured peers remains a
+  documented design backlog item.
+- F6 [~] **Relay overflow** — the first 90s run instead EXPOSED A
+  REAL PROTOCOL BUG: ~190x apply amplification from symmetric peers
+  echoing relayed placements forever (idempotent, so correctness
+  held — invisible before the per-replica timeline existed). FIXED:
+  the engine reports whether an apply changed state and the relay
+  forwards only changing applies, so echoes die in one hop (bounded
+  O(K^2)). True overflow drill (small queue via RADIX_RELAY_QUEUE +
+  90s partition) running on the fixed relay.
+- F7 [x] **Flap** — 3 kill/relaunch-with-bootstrap cycles on a live
+  replica: 0 errors, routing held (0.939 cached), all flaps recorded
+  with recovery.
 
 ## Pillar 3 — Extreme performance (original gates, no amendment)
 
@@ -110,9 +117,13 @@ evidence linked/recorded next to it. Status legend: [ ] open,
   166.7; flat core 169-171): 6.2x smaller than the incumbent. At
   128M blocks: 53.2 B/block (macOS-compression caveat noted, and
   still under the gate even pessimistically).
-- P4 [~] **Mixed-phase latency + soak** — bench instrumented (probe
-  queries inside the live write phase; RADIX_BENCH_SOAK_SECS churn
-  with RSS-drift-is-a-leak semantics); runs queued (campaign3/4).
+- P4 [~] **Mixed-phase latency + soak** — mixed-phase MET: p50
+  ~400 ns / p99 ~5 us during live writes (8 us p99 at 128M blocks).
+  Soak: the first 30-min run measured +27MB linear drift — which
+  reproduced the retire-GC leak fixed an hour earlier (that soak had
+  compiled a mid-edit tree); the fixed core's diagnostic soak is
+  RSS-flat with every internal structure constant (debug_footprint)
+  across 28M ops. 15-min certifying soak on the pushed code running.
 - P5 [x] **Writes >= 1M blocks/s mixed stream**: flat core 10.58M;
   R3 4.6M (trie-walk + span surgery cost; 4.6x over the gate, ~par
   with the oracle's 5.5M). Evidence: SPEC log + campaign3.
