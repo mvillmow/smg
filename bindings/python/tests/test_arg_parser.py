@@ -1431,6 +1431,7 @@ class TestRouterArgsFieldOrder:
         "max_buffered_request_bytes",
         "kv_connector_annotation",
         "kv_engine_id_annotation",
+        "worker_mode",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1465,6 +1466,7 @@ class TestRouterArgsFieldOrder:
             "max_buffered_request_bytes",
             "kv_connector_annotation",
             "kv_engine_id_annotation",
+            "worker_mode",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

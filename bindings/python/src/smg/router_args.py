@@ -35,7 +35,6 @@ def _parse_int_csv(value: str) -> list[int]:
 class RouterArgs:
     # Worker configuration
     worker_urls: list[str] = dataclasses.field(default_factory=list)
-    worker_mode: str = "engine"
     host: str = "0.0.0.0"
     port: int = 30000
     # Dedicated port for liveness/readiness/health probes (k8s, load balancers, monitors), served from an
@@ -250,6 +249,8 @@ class RouterArgs:
     max_buffered_request_bytes: int = 1048576
     kv_connector_annotation: str = "smg.ai/kv-connector"
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
+    # Appended to preserve the positional RouterArgs constructor contract.
+    worker_mode: str = "engine"
 
     @staticmethod
     def add_cli_args(
