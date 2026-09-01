@@ -84,8 +84,12 @@ pub struct RadixTree3 {
     cfg: Config,
     chains: Vec<ChainData>,
     free_chains: Vec<u32>,
-    /// Root chains by their start lineage (single query entry probe).
-    roots: FxHashMap<u64, u32>,
+    /// Root chains by their start lineage. The value is a collision
+    /// list (essentially always length 1): entries are CONTENT-
+    /// verified on every resolution, which makes R3 immune to
+    /// fingerprint collisions — the flat core cannot verify (it
+    /// stores no contents), R3 always can.
+    roots: FxHashMap<u64, Vec<u32>>,
     slots: Vec<Slot3>,
     by_name: FxHashMap<String, u32>,
     free: Vec<u32>,
@@ -244,9 +248,16 @@ impl RadixTree3 {
         // Resolve the target (chain, pos) for this block canonically.
         let target: (u32, u32) = match *cursor {
             None => {
-                // Root anchor: canonical root chain by root lineage.
-                match self.roots.get(&lineage) {
-                    Some(&c) => (c, 0),
+                // Root anchor: canonical root chain by root lineage,
+                // CONTENT-verified (a colliding lineage with a
+                // different first content gets its own chain).
+                let existing = self.roots.get(&lineage).and_then(|list| {
+                    list.iter()
+                        .copied()
+                        .find(|&c| self.chains[c as usize].contents[0] == content)
+                });
+                match existing {
+                    Some(c) => (c, 0),
                     None => {
                         let c = self.alloc_chain(ChainData {
                             parent: None,
@@ -257,7 +268,7 @@ impl RadixTree3 {
                             spans: Vec::new(),
                             children: Vec::new(),
                         });
-                        self.roots.insert(lineage, c);
+                        self.roots.entry(lineage).or_default().push(c);
                         (c, 0)
                     }
                 }
@@ -404,7 +415,11 @@ impl RadixTree3 {
             return;
         }
         let root_lineage = lineage_root(chain_query[0]);
-        let Some(&root) = self.roots.get(&root_lineage) else {
+        let Some(root) = self.roots.get(&root_lineage).and_then(|list| {
+            list.iter()
+                .copied()
+                .find(|&c| self.chains[c as usize].contents[0] == chain_query[0])
+        }) else {
             return;
         };
         // Walk the trie along the query, collecting the matched path
@@ -810,7 +825,12 @@ impl RadixTree3 {
         self.free_chains.push(chain);
         match parent {
             None => {
-                self.roots.remove(&start_lineage);
+                if let Some(list) = self.roots.get_mut(&start_lineage) {
+                    list.retain(|&c| c != chain);
+                    if list.is_empty() {
+                        self.roots.remove(&start_lineage);
+                    }
+                }
             }
             Some((p, fork_pos)) => {
                 let content = first_content.expect("chains are non-empty");
@@ -917,7 +937,11 @@ impl RadixTree3 {
             }
             match cd.parent {
                 None => {
-                    if cd.base_pos != 0 || self.roots.get(&cd.start_lineage) != Some(&ci) {
+                    let listed = self
+                        .roots
+                        .get(&cd.start_lineage)
+                        .is_some_and(|l| l.contains(&ci));
+                    if cd.base_pos != 0 || !listed {
                         return Err(format!("root chain {ci} unindexed"));
                     }
                 }
@@ -937,10 +961,19 @@ impl RadixTree3 {
                 return Err(format!("chain {ci} end_lineage stale"));
             }
         }
-        for (&l, &c) in &self.roots {
-            let cd = &self.chains[c as usize];
-            if cd.parent.is_some() || cd.start_lineage != l || freed_chains.contains(&c) {
-                return Err(format!("roots entry {l:#x} bad"));
+        for (&l, list) in &self.roots {
+            if list.is_empty() {
+                return Err(format!("roots entry {l:#x} empty list"));
+            }
+            let mut contents_seen = HashSet::new();
+            for &c in list {
+                let cd = &self.chains[c as usize];
+                if cd.parent.is_some() || cd.start_lineage != l || freed_chains.contains(&c) {
+                    return Err(format!("roots entry {l:#x} bad chain {c}"));
+                }
+                if !contents_seen.insert(cd.contents[0]) {
+                    return Err(format!("roots entry {l:#x} duplicate first content"));
+                }
             }
         }
         // Key maps <-> coverage; counters.

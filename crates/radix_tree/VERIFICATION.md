@@ -46,10 +46,19 @@ evidence linked/recorded next to it. Status legend: [ ] open,
   bounds, empty batches, holder-slot reuse at scale, generation
   wraparound analysis (u32 wrap = 4e9 retires of ONE slot —
   quantified, documented).
-- C5 [ ] **Lineage collision analysis**: 64-bit fingerprint collision
-  probability at 1.7e8-block production scale, quantified; upgrade
-  path (128-bit) evaluated with measured memory cost if the bound is
-  not comfortably negligible.
+- C5 [x] **Lineage collision analysis** — quantified, and R3 made
+  structurally immune. Flat core: a collision matters only between
+  two lineages coexisting in ONE (position, content) bucket;
+  multi-lineage buckets require content coincidence (rare) and the
+  joint probability is bounded by sum(n_bucket^2)/2^65 — < 1e-12 at
+  the 1.7e8-block production scale. Documented residual for R1 only.
+  R3: every lineage-keyed resolution is CONTENT-VERIFIED (roots carry
+  collision lists checked against literal first contents; forks are
+  content-keyed; walks compare stored contents directly), so a
+  collision can never cross-credit or merge chains — the analysis
+  turned up a latent unverified root resolution in the initial R3
+  and it is fixed with an audit rule. This immunity is an R3-only
+  property: the flat core stores no contents to verify against.
 - C6 [x] **Adversarial code review** — four reviewers (accounting /
   lifecycle / query walk / panics+OOB), 138 tool calls of attack.
   Verdicts: accounting exact, lifecycle sound, walk sound. Every
