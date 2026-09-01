@@ -64,6 +64,15 @@ class WorkerControlLifecycle:
         instance_id = _optional_env(environ, "SMG_WORKER_INSTANCE_ID")
         zone = _optional_env(environ, "SMG_WORKER_ZONE") or ""
         inference_enabled = _bool_env(environ, "SMG_WORKER_INFERENCE_ENABLED")
+        engine_transport = _optional_env(environ, "SMG_WORKER_ENGINE_TRANSPORT") or "grpc"
+        zmq_handshake_address = _optional_env(environ, "SMG_WORKER_ZMQ_HANDSHAKE_ADDRESS")
+        engine_count_raw = _optional_env(environ, "SMG_WORKER_ENGINE_COUNT") or "1"
+        try:
+            engine_count = int(engine_count_raw)
+        except ValueError as error:
+            raise ValueError("SMG_WORKER_ENGINE_COUNT must be a positive integer") from error
+        if engine_count <= 0:
+            raise ValueError("SMG_WORKER_ENGINE_COUNT must be a positive integer")
 
         try:
             from smg.worker import WorkerControlServer
@@ -93,6 +102,9 @@ class WorkerControlLifecycle:
             max_concurrent_requests=max(0, max_concurrent_requests),
             inference_enabled=inference_enabled,
             engine_attributes=dict(engine_attributes or {}),
+            engine_transport=engine_transport,
+            zmq_handshake_address=zmq_handshake_address,
+            engine_count=engine_count,
         )
         return cls(server=server)
 

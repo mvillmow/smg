@@ -3,6 +3,7 @@
 pub mod builder;
 pub mod capacity;
 pub mod circuit_breaker;
+pub mod engine_transport;
 pub mod error;
 pub mod event;
 pub mod hash_ring;
@@ -30,6 +31,7 @@ pub mod worker;
 pub use builder::BasicWorkerBuilder;
 pub use capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+pub use engine_transport::ZmqWorkerTransport;
 pub use error::{WorkerError, WorkerResult};
 pub use hash_ring::HashRing;
 pub use http_client::WorkerHttpClientCache;

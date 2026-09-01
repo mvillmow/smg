@@ -20,12 +20,13 @@ use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
     prelude::*,
 };
+use smg::worker::{RuntimeType, ZmqWorkerTransport};
 use smg_grpc_client::worker_proto::{
     self as proto,
     worker_control_server::{WorkerControl, WorkerControlServer as TonicWorkerControlServer},
 };
 use smg_grpc_client::{
-    worker_inference::EngineWorkerInference,
+    worker_inference::{EngineTransport, EngineWorkerInference},
     worker_inference_proto::worker_inference_server::WorkerInferenceServer,
 };
 use tokio::sync::oneshot;
@@ -191,6 +192,32 @@ struct BridgeConfig {
     health: Arc<Mutex<HealthSnapshot>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerEngineTransport {
+    Grpc,
+    Zmq,
+}
+
+fn parse_engine_transport(value: &str) -> PyResult<WorkerEngineTransport> {
+    match value.to_ascii_lowercase().as_str() {
+        "grpc" => Ok(WorkerEngineTransport::Grpc),
+        "zmq" => Ok(WorkerEngineTransport::Zmq),
+        _ => Err(PyValueError::new_err(format!(
+            "unknown Worker engine transport {value:?}; expected grpc or zmq"
+        ))),
+    }
+}
+
+fn parse_zmq_runtime(engine_type: &str) -> PyResult<RuntimeType> {
+    match engine_type.to_ascii_lowercase().as_str() {
+        "vllm" => Ok(RuntimeType::Vllm),
+        "tokenspeed" | "ts" => Ok(RuntimeType::TokenSpeed),
+        other => Err(PyValueError::new_err(format!(
+            "Worker ZMQ transport is not implemented for {other}"
+        ))),
+    }
+}
+
 /// Rust-owned WorkerControl server with lifecycle driven from Python.
 #[pyclass(name = "WorkerControlServer")]
 pub struct PyWorkerControlServer {
@@ -221,6 +248,9 @@ impl PyWorkerControlServer {
         max_concurrent_requests = 0,
         inference_enabled = false,
         engine_attributes = None,
+        engine_transport = String::from("grpc"),
+        zmq_handshake_address = None,
+        engine_count = 1,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -238,6 +268,9 @@ impl PyWorkerControlServer {
         max_concurrent_requests: u32,
         inference_enabled: bool,
         engine_attributes: Option<HashMap<String, String>>,
+        engine_transport: String,
+        zmq_handshake_address: Option<String>,
+        engine_count: usize,
     ) -> PyResult<Self> {
         if worker_id.trim().is_empty() {
             return Err(PyValueError::new_err("worker_id must not be empty"));
@@ -248,6 +281,9 @@ impl PyWorkerControlServer {
         if engine_endpoint.trim().is_empty() {
             return Err(PyValueError::new_err("engine_endpoint must not be empty"));
         }
+        if model_ids.is_empty() {
+            return Err(PyValueError::new_err("model_ids must not be empty"));
+        }
         let bind_address: SocketAddr = bind_address
             .parse()
             .map_err(|error| PyValueError::new_err(format!("invalid bind_address: {error}")))?;
@@ -256,11 +292,23 @@ impl PyWorkerControlServer {
             message: "starting".to_string(),
         }));
         let serving = Arc::new(AtomicBool::new(false));
+        let engine_transport = parse_engine_transport(&engine_transport)?;
+        if engine_count == 0 {
+            return Err(PyValueError::new_err("engine_count must be positive"));
+        }
+        let zmq_runtime = (engine_transport == WorkerEngineTransport::Zmq)
+            .then(|| parse_zmq_runtime(&engine_type))
+            .transpose()?;
         let inference = inference_enabled.then(|| InferenceConfig {
             engine_type: engine_type.clone(),
             engine_endpoint: engine_endpoint.clone(),
+            model_id: model_ids[0].clone(),
             max_concurrent_requests,
             serving: Arc::clone(&serving),
+            engine_transport,
+            zmq_runtime,
+            zmq_handshake_address,
+            engine_count,
         });
         let config = BridgeConfig {
             worker_id: worker_id.clone(),
@@ -374,6 +422,14 @@ fn start_server(
     serving: Arc<AtomicBool>,
     inference: Option<InferenceConfig>,
 ) -> PyResult<PyWorkerControlServer> {
+    let startup_timeout = if inference
+        .as_ref()
+        .is_some_and(|config| config.engine_transport == WorkerEngineTransport::Zmq)
+    {
+        Duration::from_secs(610)
+    } else {
+        Duration::from_secs(5)
+    };
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (done_tx, done_rx) = mpsc::sync_channel(1);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -397,13 +453,7 @@ fn start_server(
             let runtime_running = Arc::clone(&thread_running);
             runtime.block_on(async move {
                 let inference = match inference {
-                    Some(config) => match EngineWorkerInference::connect(
-                        &config.engine_type,
-                        &config.engine_endpoint,
-                        config.max_concurrent_requests,
-                    )
-                    .await
-                    {
+                    Some(config) => match connect_inference(&config).await {
                         Ok(service) => Some(WorkerInferenceServer::new(
                             service.with_serving_flag(config.serving),
                         )),
@@ -459,7 +509,7 @@ fn start_server(
         })?;
 
     let address = started_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(startup_timeout)
         .map_err(|_| PyRuntimeError::new_err("WorkerControl server exited during startup"))?
         .map_err(PyRuntimeError::new_err)?;
     Ok(PyWorkerControlServer {
@@ -477,8 +527,47 @@ fn start_server(
 struct InferenceConfig {
     engine_type: String,
     engine_endpoint: String,
+    model_id: String,
     max_concurrent_requests: u32,
     serving: Arc<AtomicBool>,
+    engine_transport: WorkerEngineTransport,
+    zmq_runtime: Option<RuntimeType>,
+    zmq_handshake_address: Option<String>,
+    engine_count: usize,
+}
+
+async fn connect_inference(
+    config: &InferenceConfig,
+) -> Result<EngineWorkerInference, Box<dyn std::error::Error + Send + Sync>> {
+    match config.engine_transport {
+        WorkerEngineTransport::Grpc => {
+            EngineWorkerInference::connect(
+                &config.engine_type,
+                &config.engine_endpoint,
+                config.max_concurrent_requests,
+            )
+            .await
+        }
+        WorkerEngineTransport::Zmq => {
+            let runtime = config
+                .zmq_runtime
+                .ok_or_else(|| std::io::Error::other("missing Worker ZMQ runtime"))?;
+            let transport = ZmqWorkerTransport::connect(
+                &config.engine_endpoint,
+                config.model_id.clone(),
+                runtime,
+                config.zmq_handshake_address.as_deref(),
+                config.engine_count,
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+            let transport: Arc<dyn EngineTransport> = Arc::new(transport);
+            Ok(EngineWorkerInference::from_transport(
+                transport,
+                config.max_concurrent_requests,
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

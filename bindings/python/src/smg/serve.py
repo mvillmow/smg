@@ -977,19 +977,30 @@ class ServeOrchestrator:
         return getattr(self.args, "router_worker_mode", "engine") == "smg"
 
     def _launch_sidecars(self) -> None:
-        if getattr(self.args, "connection_mode", "grpc") != "grpc":
-            raise ValueError("--router-worker-mode smg requires --connection-mode grpc")
+        engine_transport = getattr(self.args, "connection_mode", "grpc")
+        if engine_transport not in ("grpc", "zmq"):
+            raise ValueError(
+                "--router-worker-mode smg requires a grpc or zmq engine transport"
+            )
         if self.backend not in ("sglang", "vllm", "tokenspeed"):
             raise ValueError(f"two-tier SMG Workers do not support backend {self.backend}")
+        if engine_transport == "zmq" and self.backend == "sglang":
+            raise ValueError("SGLang two-tier Workers do not support ZMQ yet")
 
         control_ports = _find_available_ports(self.args.worker_control_base_port, len(self.workers))
         model_id = getattr(self.args, "model", None) or getattr(self.args, "model_path", None)
         if not model_id:
             raise ValueError("two-tier SMG Workers require a model identifier")
         max_concurrent_requests = _backend_arg_int(self.backend_args, "--max-num-seqs", 0)
+        engine_count = _backend_arg_int(self.backend_args, "--data-parallel-size", 1)
         for dp_rank, ((_, engine_port), control_port) in enumerate(
-            zip(self.workers, control_ports, strict=True)
+            zip(self.workers, control_ports)
         ):
+            engine_endpoint = (
+                _zmq_ipc_url(engine_port)
+                if engine_transport == "zmq"
+                else f"grpc://{self.args.worker_host}:{engine_port}"
+            )
             cmd = [
                 sys.executable,
                 "-m",
@@ -1000,10 +1011,14 @@ class ServeOrchestrator:
                 f"smg-{self.backend}-{dp_rank}",
                 "--engine-type",
                 self.backend,
+                "--engine-transport",
+                engine_transport,
                 "--engine-endpoint",
-                f"grpc://{self.args.worker_host}:{engine_port}",
+                engine_endpoint,
                 "--model-id",
                 model_id,
+                "--engine-count",
+                str(engine_count),
                 "--max-concurrent-requests",
                 str(max_concurrent_requests),
                 "--drain-secs",

@@ -370,7 +370,7 @@ async fn unlink_stale_socket(address: &str) -> Result<(), String> {
 /// is the number of DP engines that will dial this worker's sockets (1 for an
 /// ungrouped worker). Errors are plain reasons; the worker layer wraps them in
 /// its own error type.
-pub(crate) async fn connect_for_worker(
+pub async fn connect_for_worker(
     base_url: &str,
     model_id: String,
     runtime: RuntimeType,

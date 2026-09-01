@@ -1432,11 +1432,13 @@ class TestServeOrchestrator:
         command = popen.call_args.args[0]
         assert "smg.worker_sidecar" in command
         assert command[command.index("--engine-type") + 1] == "tokenspeed"
+        assert command[command.index("--engine-transport") + 1] == "grpc"
         assert command[command.index("--engine-endpoint") + 1] == ("grpc://127.0.0.1:31000")
+        assert command[command.index("--engine-count") + 1] == "1"
         assert command[command.index("--max-concurrent-requests") + 1] == "64"
         assert orch.sidecars == [(proc, 41000, 31000)]
 
-    def test_two_tier_rejects_non_grpc_engine_transport(self):
+    def test_launch_two_tier_sidecar_with_zmq_engine_transport(self):
         args = _make_args(
             backend="tokenspeed",
             model="/tmp/m",
@@ -1444,10 +1446,25 @@ class TestServeOrchestrator:
             connection_mode="zmq",
             router_worker_mode="smg",
         )
-        orch = ServeOrchestrator("tokenspeed", args, [])
+        orch = ServeOrchestrator("tokenspeed", args, ["--data-parallel-size", "2"])
+        orch.workers = [(MagicMock(), 31000)]
+        proc = MagicMock(pid=1234)
+
+        with patch("smg.serve._find_available_ports", return_value=[41000]):
+            with patch("smg.serve.subprocess.Popen", return_value=proc) as popen:
+                orch._launch_sidecars()
+
+        command = popen.call_args.args[0]
+        assert command[command.index("--engine-transport") + 1] == "zmq"
+        assert command[command.index("--engine-endpoint") + 1] == _zmq_ipc_url(31000)
+        assert command[command.index("--engine-count") + 1] == "2"
+
+    def test_two_tier_rejects_sglang_zmq(self):
+        args = _make_args(connection_mode="zmq", router_worker_mode="smg")
+        orch = ServeOrchestrator("sglang", args, [])
         orch.workers = [(MagicMock(), 31000)]
 
-        with pytest.raises(ValueError, match="requires --connection-mode grpc"):
+        with pytest.raises(ValueError, match="SGLang.*do not support ZMQ"):
             orch._launch_sidecars()
 
     def test_build_router_args_zmq_forwards_backend(self):

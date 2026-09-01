@@ -36,6 +36,8 @@ pub mod proto {
     tonic::include_proto!("smg.worker.v1");
 }
 
+use proto::worker_inference_server::WorkerInference as _;
+
 pub type AbortOnDropStream =
     crate::AbortOnDropStream<proto::GenerateResponse, WorkerInferenceClient>;
 
@@ -125,12 +127,27 @@ impl SglangWorkerInference {
     }
 }
 
-type EngineAdapterStream =
+pub type EngineTransportStream =
     Pin<Box<dyn Stream<Item = Result<proto::GenerateResponse, Status>> + Send>>;
+
+/// Worker-local transport to an inference engine.
+///
+/// The Router-facing service remains the stable [`proto::WorkerInference`]
+/// gRPC contract. Implementations of this trait may use engine-native gRPC,
+/// same-host ZMQ IPC, or an in-process channel without changing that wire.
+#[tonic::async_trait]
+pub trait EngineTransport: Send + Sync {
+    async fn generate(
+        &self,
+        request: proto::GenerateRequest,
+    ) -> Result<EngineTransportStream, Status>;
+
+    async fn abort(&self, request: proto::AbortRequest) -> Result<proto::AbortResponse, Status>;
+}
 
 #[tonic::async_trait]
 impl proto::worker_inference_server::WorkerInference for SglangWorkerInference {
-    type GenerateStream = EngineAdapterStream;
+    type GenerateStream = EngineTransportStream;
 
     async fn generate(
         &self,
@@ -195,7 +212,7 @@ impl VllmWorkerInference {
 
 #[tonic::async_trait]
 impl proto::worker_inference_server::WorkerInference for VllmWorkerInference {
-    type GenerateStream = EngineAdapterStream;
+    type GenerateStream = EngineTransportStream;
 
     async fn generate(
         &self,
@@ -255,7 +272,7 @@ impl TokenSpeedWorkerInference {
 
 #[tonic::async_trait]
 impl proto::worker_inference_server::WorkerInference for TokenSpeedWorkerInference {
-    type GenerateStream = EngineAdapterStream;
+    type GenerateStream = EngineTransportStream;
 
     async fn generate(
         &self,
@@ -305,11 +322,37 @@ enum EngineAdapter {
     TokenSpeed(TokenSpeedWorkerInference),
 }
 
+#[tonic::async_trait]
+impl EngineTransport for EngineAdapter {
+    async fn generate(
+        &self,
+        request: proto::GenerateRequest,
+    ) -> Result<EngineTransportStream, Status> {
+        let request = Request::new(request);
+        let response = match self {
+            Self::Sglang(service) => service.generate(request).await,
+            Self::Vllm(service) => service.generate(request).await,
+            Self::TokenSpeed(service) => service.generate(request).await,
+        }?;
+        Ok(response.into_inner())
+    }
+
+    async fn abort(&self, request: proto::AbortRequest) -> Result<proto::AbortResponse, Status> {
+        let request = Request::new(request);
+        let response = match self {
+            Self::Sglang(service) => service.abort(request).await,
+            Self::Vllm(service) => service.abort(request).await,
+            Self::TokenSpeed(service) => service.abort(request).await,
+        }?;
+        Ok(response.into_inner())
+    }
+}
+
 /// One admission-controlled tonic service type for the Python binding
 /// regardless of engine.
 #[derive(Clone)]
 pub struct EngineWorkerInference {
-    adapter: EngineAdapter,
+    transport: Arc<dyn EngineTransport>,
     permits: Option<Arc<Semaphore>>,
     serving: Option<Arc<AtomicBool>>,
 }
@@ -332,13 +375,26 @@ impl EngineWorkerInference {
                 )
             }
         };
+        Ok(Self::from_transport(
+            Arc::new(adapter),
+            max_concurrent_requests,
+        ))
+    }
+
+    /// Wrap an engine-native transport with the common Worker admission and
+    /// lifecycle gates.
+    #[must_use]
+    pub fn from_transport(
+        transport: Arc<dyn EngineTransport>,
+        max_concurrent_requests: u32,
+    ) -> Self {
         let permits = (max_concurrent_requests > 0)
             .then(|| Arc::new(Semaphore::new(max_concurrent_requests as usize)));
-        Ok(Self {
-            adapter,
+        Self {
+            transport,
             permits,
             serving: None,
-        })
+        }
     }
 
     #[must_use]
@@ -366,7 +422,7 @@ fn ensure_worker_serving(serving: Option<&Arc<AtomicBool>>) -> Result<(), Status
 
 #[tonic::async_trait]
 impl proto::worker_inference_server::WorkerInference for EngineWorkerInference {
-    type GenerateStream = EngineAdapterStream;
+    type GenerateStream = EngineTransportStream;
 
     async fn generate(
         &self,
@@ -374,12 +430,8 @@ impl proto::worker_inference_server::WorkerInference for EngineWorkerInference {
     ) -> Result<Response<Self::GenerateStream>, Status> {
         ensure_worker_serving(self.serving.as_ref())?;
         let permit = try_acquire_worker_permit(self.permits.as_ref())?;
-        let response = match &self.adapter {
-            EngineAdapter::Sglang(service) => service.generate(request).await,
-            EngineAdapter::Vllm(service) => service.generate(request).await,
-            EngineAdapter::TokenSpeed(service) => service.generate(request).await,
-        }?;
-        let stream = response.into_inner().map(move |item| {
+        let stream = self.transport.generate(request.into_inner()).await?;
+        let stream = stream.map(move |item| {
             let _permit = &permit;
             item
         });
@@ -390,15 +442,14 @@ impl proto::worker_inference_server::WorkerInference for EngineWorkerInference {
         &self,
         request: Request<proto::AbortRequest>,
     ) -> Result<Response<proto::AbortResponse>, Status> {
-        match &self.adapter {
-            EngineAdapter::Sglang(service) => service.abort(request).await,
-            EngineAdapter::Vllm(service) => service.abort(request).await,
-            EngineAdapter::TokenSpeed(service) => service.abort(request).await,
-        }
+        self.transport
+            .abort(request.into_inner())
+            .await
+            .map(Response::new)
     }
 }
 
-fn into_vllm_request(request: proto::GenerateRequest) -> Result<vllm::GenerateRequest, Status> {
+pub fn into_vllm_request(request: proto::GenerateRequest) -> Result<vllm::GenerateRequest, Status> {
     let tokenized = request.tokenized.unwrap_or_default();
     let sampling_params = request
         .sampling_params
@@ -502,7 +553,7 @@ fn into_vllm_sampling(
     })
 }
 
-fn from_vllm_response(
+pub fn from_vllm_response(
     request_id: &str,
     response: vllm::GenerateResponse,
 ) -> proto::GenerateResponse {
