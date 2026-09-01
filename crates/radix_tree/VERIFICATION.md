@@ -98,18 +98,24 @@ evidence linked/recorded next to it. Status legend: [ ] open,
   CAVEAT: RSS-based memory is INVALID at this footprint on macOS
   (compressed memory) — bytes/block evidence stays at the 12.8M
   scale; large-scale memory needs a Linux/staging box.
-- P2 [~] **Gate cell p99 <= 10 us EXACT** at the normative scale —
-  the R3 chain-native core is BUILT and referee-equal (contents
-  stored contiguously; one entry probe + linear scan + span reads);
-  gate measurement queued (campaign3).
-- P3 [~] **Memory <= 100 B/holder-block absolute** (and <= oracle on
-  the same bench) — R3 stores chain data once per chain and dropped
-  chain-side keys entirely; gate measurement queued (campaign3).
+- P2 [x] **Gate cell p99 <= 10 us EXACT** — R3 measures p50 2.3 us /
+  p99 7.6 us at the normative scale (medians of 3, solo box) and p99
+  8.0 us at 128M blocks — scale-stable, EXACT matching, nearly tying
+  the oracle's unsound-skip 6.0 us. Every other cell beats the
+  oracle outright (H=1 292 ns vs 917; H=8 500 ns vs 1.5 us; miss
+  under timer resolution). Mixed-phase (queries during live writes):
+  p50 ~400 ns, p99 ~5 us.
+- P3 [x] **Memory <= 100 B/holder-block absolute** — R3 measures
+  26.9 B/holder-block at the normative scale (gate 100; oracle+glue
+  166.7; flat core 169-171): 6.2x smaller than the incumbent. At
+  128M blocks: 53.2 B/block (macOS-compression caveat noted, and
+  still under the gate even pessimistically).
 - P4 [~] **Mixed-phase latency + soak** — bench instrumented (probe
   queries inside the live write phase; RADIX_BENCH_SOAK_SECS churn
   with RSS-drift-is-a-leak semantics); runs queued (campaign3/4).
-- P5 [x] **Writes >= 1M blocks/s mixed stream**: 10.58M measured
-  (1.9x oracle). Evidence: SPEC measurement log.
+- P5 [x] **Writes >= 1M blocks/s mixed stream**: flat core 10.58M;
+  R3 4.6M (trie-walk + span surgery cost; 4.6x over the gate, ~par
+  with the oracle's 5.5M). Evidence: SPEC log + campaign3.
 - P6 [x] **Allocation: amortized zero per single-holder block**:
   0.0002 allocs/block via counting allocator. Evidence: alloc_gate.
 
