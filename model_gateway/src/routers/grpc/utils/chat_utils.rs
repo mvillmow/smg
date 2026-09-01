@@ -816,7 +816,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "https://example.com/image.jpg".to_string(),
                         detail: None,
                     },
@@ -853,7 +853,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "https://example.com/image.png".to_string(),
                         detail: None,
                     },
@@ -877,7 +877,7 @@ mod tests {
                 },
                 ContentPart::VideoUrl {
                     video_url: VideoUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "https://example.com/video.mp4".to_string(),
                     },
                 },
@@ -906,7 +906,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "image".to_string(),
                         detail: None,
                     },
@@ -1006,7 +1006,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "https://example.com/image.jpg".to_string(),
                         detail: Some("high".to_string()),
                     },
@@ -1061,7 +1061,7 @@ mod tests {
     fn test_transform_messages_multiple_messages() {
         let messages = vec![
             ChatMessage::System {
-                kimi: Default::default(),
+                ext: Default::default(),
                 content: MessageContent::Text("System prompt".to_string()),
                 name: None,
             },
@@ -1072,7 +1072,7 @@ mod tests {
                     },
                     ContentPart::ImageUrl {
                         image_url: ImageUrl {
-                            minimax: Default::default(),
+                            ext: Default::default(),
                             url: "https://example.com/image.jpg".to_string(),
                             detail: None,
                         },
@@ -1106,7 +1106,7 @@ mod tests {
         let messages = vec![ChatMessage::User {
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
-                    minimax: Default::default(),
+                    ext: Default::default(),
                     url: "https://example.com/image.jpg".to_string(),
                     detail: None,
                 },
@@ -1139,7 +1139,7 @@ mod tests {
                     },
                     ContentPart::ImageUrl {
                         image_url: ImageUrl {
-                            minimax: Default::default(),
+                            ext: Default::default(),
                             url: "https://example.com/image.jpg".to_string(),
                             detail: Some("low".to_string()),
                         },
@@ -1184,7 +1184,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "data:image/jpeg;base64,XXX".to_string(),
                         detail: None,
                     },
@@ -1210,7 +1210,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "data:image/jpeg;base64,XXX".to_string(),
                         detail: None,
                     },
@@ -1239,7 +1239,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "i1".to_string(),
                         detail: None,
                     },
@@ -1249,7 +1249,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "i2".to_string(),
                         detail: None,
                     },
@@ -1276,7 +1276,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "image".to_string(),
                         detail: None,
                     },
@@ -1327,7 +1327,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "image".to_string(),
                         detail: None,
                     },
@@ -1440,7 +1440,7 @@ mod tests {
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl {
-                        minimax: Default::default(),
+                        ext: Default::default(),
                         url: "data:image/jpeg;base64,XXX".to_string(),
                         detail: None,
                     },

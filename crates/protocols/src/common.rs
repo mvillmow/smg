@@ -241,7 +241,7 @@ pub struct ImageUrl {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
     #[serde(flatten)]
-    pub minimax: MinimaxImageExt,
+    pub ext: MinimaxImageExt,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -261,7 +261,7 @@ pub struct InputAudio {
 pub struct VideoUrl {
     pub url: String,
     #[serde(flatten)]
-    pub minimax: MinimaxVideoExt,
+    pub ext: MinimaxVideoExt,
 }
 
 // ============================================================================

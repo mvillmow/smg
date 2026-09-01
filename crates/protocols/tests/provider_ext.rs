@@ -23,7 +23,7 @@ fn image_url_preserves_max_long_side_pixel() {
         "max_long_side_pixel": 448
     }))
     .unwrap();
-    assert_eq!(image.minimax.max_long_side_pixel, Some(448));
+    assert_eq!(image.ext.max_long_side_pixel, Some(448));
 
     let out = serde_json::to_value(&image).unwrap();
     assert_eq!(out["max_long_side_pixel"], json!(448));
@@ -38,8 +38,8 @@ fn video_url_preserves_sizing_and_fps() {
         "fps": 2.5
     }))
     .unwrap();
-    assert_eq!(video.minimax.max_long_side_pixel, Some(896));
-    assert_eq!(video.minimax.fps, Some(2.5));
+    assert_eq!(video.ext.max_long_side_pixel, Some(896));
+    assert_eq!(video.ext.fps, Some(2.5));
 
     let out = serde_json::to_value(&video).unwrap();
     assert_eq!(out["max_long_side_pixel"], json!(896));
@@ -106,8 +106,8 @@ fn parsed_system_message_exposes_dynamic_tools() {
     }))
     .unwrap();
     match msg {
-        ChatMessage::System { kimi, .. } => {
-            let tools = kimi.tools.expect("tools parsed");
+        ChatMessage::System { ext, .. } => {
+            let tools = ext.tools.expect("tools parsed");
             assert_eq!(tools.len(), 1);
             assert_eq!(tools[0].function.name, "get_time");
         }
@@ -179,9 +179,9 @@ fn system_message_without_content_defaults_to_empty() {
     }))
     .expect("tools-only system message deserializes");
     match msg {
-        ChatMessage::System { content, kimi, .. } => {
+        ChatMessage::System { content, ext, .. } => {
             assert_eq!(content.to_simple_string(), "");
-            assert!(kimi.tools.is_some());
+            assert!(ext.tools.is_some());
         }
         other => panic!("expected system message, got {other:?}"),
     }
