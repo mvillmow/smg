@@ -107,9 +107,17 @@ impl Subject {
             Core::Flat(t) => t.overlap(query, &mut self.qscratch, scratch),
             Core::Chain(t) => t.overlap(query, &mut self.qscratch, scratch),
         }
+        // Shape check on the RAW Vec before the BTreeMap collapse: every
+        // holder must appear at most once. The map projection would hide a
+        // merge-loop regression that emitted a holder twice (a downstream
+        // consumer iterating the Vec would then double-count).
         let mut out = BTreeMap::new();
         for o in scratch.iter() {
-            out.insert(o.holder.parts().0 as usize, o.depth);
+            assert!(
+                out.insert(o.holder.parts().0 as usize, o.depth).is_none(),
+                "overlap emitted holder {} twice in the raw Vec",
+                o.holder.parts().0
+            );
         }
         out
     }

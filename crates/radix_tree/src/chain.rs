@@ -613,6 +613,12 @@ impl RadixTree {
         next.clear();
         let mut depth = 0u32;
         let mut first = true;
+        // Data pointer of the interned set the `active` buffer was copied
+        // from, for the O(1) identity run-skip. Comparing against
+        // `active.as_ptr()` (a distinct scratch allocation) can never
+        // match, so the skip only works against the SOURCE set's pointer —
+        // mirrors FlatTree's `active_src`.
+        let mut active_src: Option<*const u32> = None;
         'runs: for &(c, from, to) in &segments {
             let cd = &self.chains[c as usize];
             let mut p = from;
@@ -637,10 +643,16 @@ impl RadixTree {
                     Some(set) => {
                         if first {
                             active.extend_from_slice(set);
+                            active_src = Some(set.as_ptr());
                             first = false;
-                        } else if !std::ptr::eq(set.as_ptr(), active.as_ptr())
-                            && set.as_ref() != active.as_slice()
-                        {
+                        } else if active_src.is_some_and(|src| std::ptr::eq(src, set.as_ptr())) {
+                            // O(1) identity skip: the same interned set, so
+                            // every active holder continues unchanged.
+                        } else if set.as_ref() == active.as_slice() {
+                            // Content-equal after a hand-built subset:
+                            // resync to the interned identity.
+                            active_src = Some(set.as_ptr());
+                        } else {
                             next.clear();
                             let mut ai = 0usize;
                             for &h in set.iter() {
@@ -658,6 +670,8 @@ impl RadixTree {
                                 ai += 1;
                             }
                             std::mem::swap(active, next);
+                            // next ⊆ set; equal lengths ⟹ equal sets.
+                            active_src = (active.len() == set.len()).then(|| set.as_ptr());
                         }
                         if active.is_empty() {
                             break 'runs;
@@ -700,11 +714,23 @@ impl RadixTree {
                     + 16 * c.children.len() as u64
             })
             .sum();
+        // Interned holder sets: the `Arc<[u32]>` data plus per-bucket
+        // bookkeeping. Omitting this hid an interner leak from the
+        // retire-churn memory gate (audit finding).
+        let interner_bytes: u64 = self
+            .interner
+            .table
+            .values()
+            .map(|bucket| bucket.iter().map(|s| 16 + 4 * s.len() as u64).sum::<u64>() + 24)
+            .sum();
         Stats {
             holders,
             holder_blocks: self.holder_blocks_total,
             distinct_entries: self.distinct_entries,
-            bytes_estimate: chain_bytes + self.holder_blocks_total * 24 + holders * 128,
+            bytes_estimate: chain_bytes
+                + interner_bytes
+                + self.holder_blocks_total * 24
+                + holders * 128,
         }
     }
 
@@ -1059,7 +1085,15 @@ impl RadixTree {
         }
         // Chains: shape, spans normalized, children sorted+linked.
         let mut live_chains = HashSet::new();
-        let freed_chains: HashSet<u32> = self.free_chains.iter().copied().collect();
+        // Reject a double-freed chain index (mirrors the `free` list
+        // check above): a duplicate would let two logical chains later
+        // alias one physical `ChainData` -> silently wrong overlaps.
+        let mut freed_chains = HashSet::new();
+        for &fc in &self.free_chains {
+            if !freed_chains.insert(fc) {
+                return Err(format!("free-chains duplicate entry {fc} (double free)"));
+            }
+        }
         for (ci, cd) in self.chains.iter().enumerate() {
             let ci = ci as u32;
             if freed_chains.contains(&ci) {
@@ -1241,6 +1275,20 @@ impl RadixTree {
                 self.distinct_entries
             ));
         }
+        // Interner: no orphaned sets. A set the table still holds but no
+        // live span references (strong_count == 1 — only the table) is a
+        // leak; the release path is meant to drop it once the last
+        // membership reference goes (mirrors FlatTree::audit's detector).
+        for bucket in self.interner.table.values() {
+            for set in bucket {
+                if std::sync::Arc::strong_count(set) == 1 {
+                    return Err(format!(
+                        "interner orphan: set {:?} held only by the table (leak)",
+                        set.as_ref()
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1269,4 +1317,44 @@ fn push_answer3(slots: &[Slot3], holder: u32, depth: u32, out: &mut Vec<Overlap>
         total_blocks: state.keys.len() as u64,
     });
     let _ = &state.name;
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::Config;
+
+    /// The strengthened audit must reject a double-freed chain index — a
+    /// duplicate in `free_chains` would let two logical chains later alias
+    /// one physical `ChainData`, silently corrupting overlap answers.
+    #[test]
+    fn audit_rejects_a_double_freed_chain() {
+        let mut t = RadixTree::new(Config::default());
+        let h = t.create_holder("w1");
+        t.store(h, None, &[(1, 10), (2, 20)]).expect("store");
+        t.clear(h); // frees the chain(s)
+        t.audit().expect("a cleared tree is valid");
+        assert!(!t.free_chains.is_empty(), "clear frees the chain");
+
+        let dup = t.free_chains[0];
+        t.free_chains.push(dup);
+        let err = t.audit().expect_err("a double free must be caught");
+        assert!(err.contains("double free"), "unexpected audit error: {err}");
+    }
+
+    /// The strengthened audit must reject an interner set held only by the
+    /// table (strong_count 1) — the leak class the release path can strand.
+    #[test]
+    fn audit_rejects_an_interner_orphan() {
+        let mut t = RadixTree::new(Config::default());
+        let h = t.create_holder("w1");
+        t.store(h, None, &[(1, 10)]).expect("store");
+        t.audit().expect("a fresh tree is valid");
+
+        // An Arc no live span references — only the table holds it.
+        let orphan: std::sync::Arc<[u32]> = std::sync::Arc::from([99u32].as_slice());
+        t.interner.table.entry(0xDEAD).or_default().push(orphan);
+        let err = t.audit().expect_err("an interner orphan must be caught");
+        assert!(err.contains("orphan"), "unexpected audit error: {err}");
+    }
 }

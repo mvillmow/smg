@@ -186,6 +186,14 @@ impl SetInterner {
 
     /// Intern a sorted holder array (consumes the scratch build).
     fn intern(&mut self, set: &[u32]) -> SetRef {
+        // Empty sets are transient placeholders — a caller shrinking a
+        // span to zero holders immediately converts it to `PosSet::Empty`
+        // and drops this ref without `release`. Tabling it would strand
+        // it there forever (strong_count 1), so keep empties out of the
+        // table; no live span ever holds one.
+        if set.is_empty() {
+            return set.into();
+        }
         let h = Self::hash_of(set);
         let bucket = self.table.entry(h).or_default();
         for existing in bucket.iter() {
