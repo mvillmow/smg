@@ -543,22 +543,36 @@ impl Router {
         let mut remote_overlap: Option<crate::policies::RemoteOverlap> = None;
         let mut index_prediction: Option<crate::policies::remote_index::IndexPrediction> = None;
         if self.policy_registry.remote_index_enabled() {
-            let (owned_tokens, owned_rid) = lease.with_view(|view| {
+            let (owned_tokens, owned_text, owned_rid) = lease.with_view(|view| {
                 (
                     view.tokens.map(<[u32]>::to_vec),
+                    view.text.map(str::to_string),
                     view.rid_key.map(str::to_string),
                 )
             });
-            if let Some((overlap, prediction)) = self
-                .policy_registry
-                .resolve_remote_overlap(
-                    model_id,
-                    owned_tokens.as_deref(),
-                    headers,
-                    owned_rid.as_deref(),
-                )
-                .await
-            {
+            // Prefer the token tree (stronger, token-prefix affinity);
+            // fall back to string mode (raw-byte prefix) only when the
+            // request carries text but no tokens.
+            let resolved = if owned_tokens.is_some() {
+                self.policy_registry
+                    .resolve_remote_overlap(
+                        model_id,
+                        owned_tokens.as_deref(),
+                        headers,
+                        owned_rid.as_deref(),
+                    )
+                    .await
+            } else {
+                self.policy_registry
+                    .resolve_remote_overlap_bytes(
+                        model_id,
+                        owned_text.as_deref(),
+                        headers,
+                        owned_rid.as_deref(),
+                    )
+                    .await
+            };
+            if let Some((overlap, prediction)) = resolved {
                 remote_overlap = Some(overlap);
                 index_prediction = Some(prediction);
             }

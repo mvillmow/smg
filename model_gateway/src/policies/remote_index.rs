@@ -13,6 +13,13 @@ use radix_index::client::{QueryOutcome, RemoteIndex};
 /// to expected-wait for that one decision.
 pub(crate) const QUERY_DEADLINE: Duration = Duration::from_millis(2);
 
+/// String-mode block size, in raw bytes. Fixed for now: string-mode
+/// (`SymbolKind::Bytes`) routing hashes raw request text into blocks of
+/// this many bytes, a separate keyspace from the token tree. Kept a
+/// constant rather than a config knob until the byte-affinity approach
+/// is signed off (see the string-mode notes on the PR).
+pub(crate) const BYTE_BLOCK: usize = 256;
+
 /// The connected remote-index client plus the keyspace block size it was
 /// configured for. One per process, owned by `AppContext` and shared
 /// with the `PolicyRegistry`.
@@ -62,6 +69,11 @@ pub(crate) struct IndexPrediction {
     /// republished as the placement chain after successful dispatch.
     pub content_hashes: Vec<u64>,
     pub model: String,
+    /// `true` when this prediction is string-mode (`SymbolKind::Bytes`):
+    /// the hashes are over raw request bytes and `block_size` is the byte
+    /// block, so the placement must publish under the `Bytes` keyspace.
+    /// `false` is the token keyspace.
+    pub bytes: bool,
 }
 
 impl IndexPrediction {

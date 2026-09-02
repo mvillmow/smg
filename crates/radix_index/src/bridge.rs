@@ -106,9 +106,20 @@ impl DigestCache {
 }
 
 pub fn keyspace(model: &str, block_size: u32) -> proto::Keyspace {
+    keyspace_with_kind(model, block_size, proto::SymbolKind::Tokens)
+}
+
+/// Keyspace for an explicit symbol kind. `Tokens` is the token-tree
+/// keyspace every token-native path uses; `Bytes` is the separate,
+/// server-isolated keyspace for string-mode (raw-byte) placements.
+pub fn keyspace_with_kind(
+    model: &str,
+    block_size: u32,
+    symbol_kind: proto::SymbolKind,
+) -> proto::Keyspace {
     proto::Keyspace {
         model: model.to_string(),
-        symbol_kind: proto::SymbolKind::Tokens as i32,
+        symbol_kind: symbol_kind as i32,
         block_size,
         hash_scheme: crate::wire_hash::HASH_SCHEME_V1,
     }

@@ -8,7 +8,9 @@ use http::{header::HeaderName, HeaderMap};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
-use super::remote_index::{outcome_label, IndexPrediction, RemoteIndexHandle, QUERY_DEADLINE};
+use super::remote_index::{
+    outcome_label, IndexPrediction, RemoteIndexHandle, BYTE_BLOCK, QUERY_DEADLINE,
+};
 /// Policy Registry for managing model-to-policy mappings
 ///
 /// This registry manages the dynamic assignment of load balancing policies to models.
@@ -329,6 +331,65 @@ impl PolicyRegistry {
             block_size: block,
             content_hashes: hashes,
             model: model_id.to_string(),
+            bytes: false,
+        };
+        Some((overlap, prediction))
+    }
+
+    /// String-mode ([`SymbolKind::Bytes`]) analogue of
+    /// [`Self::resolve_remote_overlap`]: for HTTP requests that carry
+    /// text but no tokens, hash the raw request bytes into
+    /// [`BYTE_BLOCK`]-sized blocks and query the `Bytes` keyspace. Same
+    /// skip cases; a distinct, coarser affinity than the token tree
+    /// (a shared byte prefix, not a shared token prefix).
+    pub(crate) async fn resolve_remote_overlap_bytes(
+        &self,
+        model_id: &str,
+        text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
+    ) -> Option<(RemoteOverlap, IndexPrediction)> {
+        let handle = self.remote_index.read().clone()?;
+        if self.get_policy_or_default(model_id).name() != "cache_aware" {
+            return None;
+        }
+        let sticky_wins = self.routing_key_override_enabled()
+            && (rid_key.is_some() || self.resolve_routing_key(headers).is_some());
+        if sticky_wins {
+            return None;
+        }
+        let text = text?;
+        let hashes: Vec<u64> =
+            kv_index::compute_request_byte_content_hashes(text.as_bytes(), BYTE_BLOCK)
+                .iter()
+                .map(|h| h.0)
+                .collect();
+        if hashes.is_empty() {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let outcome = handle
+            .client()
+            .query_bytes(model_id, BYTE_BLOCK as u32, hashes.clone(), QUERY_DEADLINE)
+            .await;
+        let label = outcome_label(&outcome);
+        Metrics::record_remote_index_query(label, started.elapsed());
+        let scores = match outcome {
+            radix_index::client::QueryOutcome::Scores(scores) => scores,
+            _ => Vec::new(),
+        };
+        let overlap = RemoteOverlap {
+            scores: scores.clone(),
+            request_blocks: hashes.len(),
+            block_size: BYTE_BLOCK,
+        };
+        let prediction = IndexPrediction {
+            source: label,
+            scores,
+            block_size: BYTE_BLOCK,
+            content_hashes: hashes,
+            model: model_id.to_string(),
+            bytes: true,
         };
         Some((overlap, prediction))
     }
@@ -348,6 +409,19 @@ impl PolicyRegistry {
         let Some(handle) = self.remote_index.read().clone() else {
             return;
         };
+        // String-mode publishes go to the `Bytes` keyspace and never
+        // refine (HTTP has no output tokens to append); the token path
+        // may re-hash prompt (+) output.
+        if prediction.bytes {
+            handle.client().publish_placement_bytes(
+                &prediction.model,
+                prediction.block_size as u32,
+                worker_url,
+                &prediction.content_hashes,
+            );
+            Metrics::record_remote_index_publish();
+            return;
+        }
         let hashes: Vec<u64> = match refine_tokens {
             Some(tokens) => kv_index::compute_request_content_hashes(tokens, prediction.block_size)
                 .iter()

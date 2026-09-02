@@ -104,12 +104,50 @@ impl RemoteIndex {
 
     /// Overlap query with a hard deadline. Never blocks longer than
     /// `deadline`; every non-Scores outcome is a signal to fall back.
+    /// Token keyspace — the token-native routing paths.
     pub async fn query(
         &self,
         model: &str,
         block_size: u32,
         content_hashes: Vec<u64>,
         deadline: Duration,
+    ) -> QueryOutcome {
+        self.query_kind(
+            model,
+            block_size,
+            content_hashes,
+            deadline,
+            proto::SymbolKind::Tokens,
+        )
+        .await
+    }
+
+    /// Overlap query against the string-mode (`Bytes`) keyspace — for
+    /// HTTP requests routed on raw-text byte chunks rather than tokens.
+    pub async fn query_bytes(
+        &self,
+        model: &str,
+        byte_block: u32,
+        content_hashes: Vec<u64>,
+        deadline: Duration,
+    ) -> QueryOutcome {
+        self.query_kind(
+            model,
+            byte_block,
+            content_hashes,
+            deadline,
+            proto::SymbolKind::Bytes,
+        )
+        .await
+    }
+
+    async fn query_kind(
+        &self,
+        model: &str,
+        block_size: u32,
+        content_hashes: Vec<u64>,
+        deadline: Duration,
+        symbol_kind: proto::SymbolKind,
     ) -> QueryOutcome {
         if !self.is_connected() {
             return QueryOutcome::Disconnected;
@@ -119,7 +157,7 @@ impl RemoteIndex {
         let pending = PendingQuery {
             query: proto::Query {
                 query_id,
-                keyspace: Some(bridge::keyspace(model, block_size)),
+                keyspace: Some(bridge::keyspace_with_kind(model, block_size, symbol_kind)),
                 content_hashes,
             },
             reply: reply_tx,
@@ -147,13 +185,48 @@ impl RemoteIndex {
 
     /// Fire-and-forget placement: the request's block-hash chain now
     /// (probably) resides on `holder`. Never blocks; dropped on overflow
-    /// (the next turn re-places it).
+    /// (the next turn re-places it). Token keyspace.
     pub fn publish_placement(
         &self,
         model: &str,
         block_size: u32,
         holder: &str,
         content_hashes: &[u64],
+    ) {
+        self.publish_placement_kind(
+            model,
+            block_size,
+            holder,
+            content_hashes,
+            proto::SymbolKind::Tokens,
+        );
+    }
+
+    /// String-mode placement against the `Bytes` keyspace — the raw-text
+    /// byte chain now (probably) resides on `holder`.
+    pub fn publish_placement_bytes(
+        &self,
+        model: &str,
+        byte_block: u32,
+        holder: &str,
+        content_hashes: &[u64],
+    ) {
+        self.publish_placement_kind(
+            model,
+            byte_block,
+            holder,
+            content_hashes,
+            proto::SymbolKind::Bytes,
+        );
+    }
+
+    fn publish_placement_kind(
+        &self,
+        model: &str,
+        block_size: u32,
+        holder: &str,
+        content_hashes: &[u64],
+        symbol_kind: proto::SymbolKind,
     ) {
         if content_hashes.is_empty() {
             return;
@@ -169,7 +242,7 @@ impl RemoteIndex {
             })
             .collect();
         let update = proto::Update {
-            keyspace: Some(bridge::keyspace(model, block_size)),
+            keyspace: Some(bridge::keyspace_with_kind(model, block_size, symbol_kind)),
             holder: holder.to_string(),
             // Placements are unsequenced (seq 0) and epoch-constant: an
             // event-fed holder rejects them regardless, and inferred-only
@@ -187,12 +260,15 @@ impl RemoteIndex {
         };
         // With digest enabled, an already-established chain publishes as
         // a tiny {tip, len} digest; the run_publisher ack loop resends
-        // `update` in full on a miss. Otherwise send the full chain.
-        let to_send = match &self.digest {
-            Some(cache) => cache
+        // `update` in full on a miss. The digest cache is keyed by tip
+        // hash alone, with no symbol-kind qualifier, so only the Tokens
+        // path uses it; string-mode (`Bytes`) placements always send the
+        // full chain and never touch the shared cache.
+        let to_send = match (&self.digest, symbol_kind) {
+            (Some(cache), proto::SymbolKind::Tokens) => cache
                 .plan(tip, content_hashes.len() as u32, &update)
                 .unwrap_or(update),
-            None => update,
+            _ => update,
         };
         let _ = self.placements.try_send(to_send);
     }
