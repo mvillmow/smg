@@ -422,6 +422,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      packages: read
     outputs:
       common: ${{ steps.filter.outputs.common }}
       chat-completions: ${{ steps.filter.outputs.chat-completions }}
@@ -431,8 +432,31 @@ jobs:
       realtime: ${{ steps.filter.outputs.realtime }}
       go-bindings: ${{ steps.filter.outputs.go-bindings }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
+      tokenspeed-image: ${{ steps.tokenspeed-image.outputs.image }}
     steps:
       - uses: actions/checkout@v7
+
+      # Resolve the prebuilt TokenSpeed CI image (built by
+      # ci-tokenspeed-image.yml, content-addressed by the pinned ref). Missing
+      # image — e.g. a PR that bumps the ref before the image exists — resolves
+      # to empty, and the tokenspeed lanes fall back to the plain CI container
+      # + source build. Never fails the job.
+      - name: Resolve TokenSpeed CI image
+        id: tokenspeed-image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ref="$(tr -d '[:space:]' < .github/versions/tokenspeed.ref)"
+          image="ghcr.io/${{ github.repository_owner }}/smg:ci-tokenspeed-${ref}"
+          if [ -n "$ref" ] \
+             && docker login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GH_TOKEN" > /dev/null 2>&1 \
+             && docker manifest inspect "$image" > /dev/null 2>&1; then
+            echo "image=${image}" >> "$GITHUB_OUTPUT"
+            echo "TokenSpeed lanes use prebuilt image: ${image}"
+          else
+            echo "image=" >> "$GITHUB_OUTPUT"
+            echo "Prebuilt TokenSpeed image not found (${image}); lanes build from source"
+          fi
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -452,6 +476,7 @@ jobs:
               - 'scripts/ci_install_sglang.sh'
               - 'scripts/ci_install_vllm.sh'
               - 'scripts/ci_install_tokenspeed.sh'
+              - '.github/versions/tokenspeed.ref'
               - 'scripts/ci_install_e2e_deps.sh'
               - 'scripts/ci_killall_sglang.sh'
               - 'scripts/ci_build_wheel.sh'
@@ -479,6 +504,7 @@ jobs:
               - 'scripts/ci_install_vllm.sh'
               - 'scripts/ci_install_trtllm.sh'
               - 'scripts/ci_install_tokenspeed.sh'
+              - '.github/versions/tokenspeed.ref'
             agentic:
               - 'crates/mcp/**'
               - 'crates/data_connector/**'
@@ -571,6 +597,7 @@ jobs:
       test_timeout: ${{ matrix.test_timeout }}
       test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
       min_selected: ${{ matrix.min_selected }}
+      container_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   e2e-1gpu-chat-zmq:
@@ -613,6 +640,7 @@ jobs:
       test_dirs: e2e_test/chat_completions
       connection_mode: zmq
       min_selected: ${{ matrix.min_selected }}
+      container_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   e2e-2gpu-chat-zmq-dp:
@@ -660,6 +688,7 @@ jobs:
       connection_mode: zmq
       zmq_engine_count: "2"
       min_selected: ${{ matrix.min_selected }}
+      container_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
   e2e-1gpu-completions:
@@ -884,7 +913,7 @@ jobs:
 
   e2e-4gpu-epd:
     name: e2e-4gpu-epd (tokenspeed)
-    needs: [e2e-1gpu-chat]
+    needs: [e2e-1gpu-chat, detect-changes]
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: tokenspeed
@@ -895,6 +924,7 @@ jobs:
       test_dirs: e2e_test/chat_completions/test_epd_multimodal.py
       extra_models: "Qwen/Qwen3.5-9B"
       min_selected: 6 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+      container_image: ${{ needs.detect-changes.outputs.tokenspeed-image }}
     secrets: inherit
 
   # --- Vendor E2E: CPU-only cloud backend tests ---
