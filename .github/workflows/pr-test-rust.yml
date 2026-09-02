@@ -41,6 +41,19 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Authenticate git for hook-repo clones
+        # pre-commit clones its hook repos from github.com on every run (there
+        # is no environment cache), and those clones are anonymous. When the
+        # runners' shared egress IP is rate-limited, git gets an auth challenge
+        # instead of the ref list and dies with "could not read Username for
+        # 'https://github.com'", failing the job for reasons unrelated to the
+        # diff. Spending the job's own read-only token on them lifts the
+        # anonymous limit.
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ github.token }}@github.com/".insteadOf \
+            "https://github.com/"
+
       - name: Install pre-commit
         run: pip install pre-commit
 
