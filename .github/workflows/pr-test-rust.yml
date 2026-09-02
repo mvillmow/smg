@@ -329,13 +329,25 @@ jobs:
         # `cargo test` builds a test binary for bindings/python. Unlike the
         # maturin cdylib -- which enables `extension-module` and deliberately
         # leaves the libpython symbols undefined -- that binary must link
-        # libpython. setup-python ships a shared CPython, so just put its lib
-        # dir on the loader path. Fail loudly if it is ever a static build,
-        # rather than surfacing as undefined Py_* symbols at link time.
+        # libpython. setup-python ships a shared CPython but only as
+        # `libpython3.X.so.1.0`; the bare `libpython3.X.so` symlink that
+        # `-lpython3.X` resolves against normally comes from a -dev package.
+        # Create it if missing, and fail loudly rather than letting this
+        # resurface as "unable to find library -lpython3.X" at link time.
         run: |
-          python3 -c 'import sysconfig, sys; sys.exit(0 if sysconfig.get_config_var("Py_ENABLE_SHARED") else 1)' \
-            || { echo "::error::CPython is not a shared build; bindings/python test binary cannot link libpython"; exit 1; }
-          echo "LD_LIBRARY_PATH=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          set -euo pipefail
+          libdir=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+          ldlib=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LDLIBRARY"))')
+          if [ ! -e "$libdir/$ldlib" ]; then
+            real=$(find "$libdir" -maxdepth 1 -name "$ldlib.*" -print -quit)
+            if [ -z "$real" ]; then
+              echo "::error::no libpython shared object in $libdir; the bindings/python test binary cannot link"
+              exit 1
+            fi
+            ln -sf "$real" "$libdir/$ldlib"
+            echo "linked $libdir/$ldlib -> $real"
+          fi
+          echo "LD_LIBRARY_PATH=${libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       - name: Run Rust tests
         timeout-minutes: 30
