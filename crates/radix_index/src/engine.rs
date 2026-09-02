@@ -1622,6 +1622,64 @@ mod tests {
         );
     }
 
+    /// A fresh-seq `Cleared` empties the holder AND relays (`changed`).
+    /// The apply branch had never executed under test — every prior
+    /// `Cleared` was seq-deduped before the events loop, so a cleared
+    /// worker could have kept serving stale blocks to peers unnoticed.
+    #[test]
+    fn cleared_event_empties_the_holder_and_relays() {
+        let engine = Engine::new(EngineConfig::default());
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(9, 4)),
+            }],
+        ));
+        assert_eq!(scores(&engine, 9, 4), vec![("w1".to_string(), 4)]);
+
+        // Fresh seq -> reaches the events loop (not seq-deduped).
+        let (_, _, changed) = engine.apply(&event_batch("w1", 2, vec![WireEvent::Cleared]));
+        assert!(changed, "a clear changes query answers and must relay");
+        assert!(
+            scores(&engine, 9, 4).is_empty(),
+            "the cleared holder no longer matches"
+        );
+    }
+
+    /// A `Removed` event drops the named blocks, shrinking the match, and
+    /// relays. Only the happy Stored path was covered before.
+    #[test]
+    fn removed_event_drops_blocks_and_relays() {
+        let engine = Engine::new(EngineConfig::default());
+        let chain = placement_chain(&prefix_hashes(11, 4));
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain.clone(),
+            }],
+        ));
+        assert_eq!(scores(&engine, 11, 4), vec![("w1".to_string(), 4)]);
+
+        // Remove the tail block -> prefix match shrinks to 3, and relays.
+        let (_, _, changed) = engine.apply(&event_batch(
+            "w1",
+            2,
+            vec![WireEvent::Removed {
+                seq_hashes: vec![chain[3].seq_hash],
+            }],
+        ));
+        assert!(changed, "a removal changes query answers and must relay");
+        assert_eq!(
+            scores(&engine, 11, 4).first().map(|s| s.1),
+            Some(3),
+            "the removed tail no longer counts toward the prefix"
+        );
+    }
+
     /// The split-placement fast path anchors the exclusive suffix store at a
     /// plain-duplicate key found under the shared lock. A concurrent clear
     /// can delete that anchor before the write lock — the fallback then

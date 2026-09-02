@@ -172,6 +172,16 @@ pub fn convert_batch(
     }
 }
 
+/// If the index has acked an epoch `known >= local`, every update we
+/// send at `local` is deduped on arrival; adopt to one past it (a new
+/// generation, replayed from seq 0). `Some(known + 1)` to adopt, `None`
+/// to keep the local epoch. The `>=` (not `>`) is deliberate: at equal
+/// epochs the index's seq cursor is already ahead of our post-restart
+/// zero, so we must still start a fresh generation.
+fn adopt_epoch(local: u64, known: u64) -> Option<u64> {
+    (known >= local).then_some(known + 1)
+}
+
 /// One worker's subscription loop: resume on plain failures, epoch-bump
 /// on loss signals or sequence gaps. Runs until the publish channel
 /// closes or the worker reports Unimplemented.
@@ -189,9 +199,8 @@ pub async fn worker_loop(
         // holder: a lower local epoch means every update we send is
         // dead on arrival. Adoption is a new generation, so replay
         // from zero (the resubscribe below starts at `last_seq`).
-        let known = ledger.known(&worker);
-        if known >= epoch {
-            epoch = known + 1;
+        if let Some(adopted) = adopt_epoch(epoch, ledger.known(&worker)) {
+            epoch = adopted;
             last_seq = 0;
         }
         let Ok(client) = TokenSpeedSchedulerClient::connect(&worker).await else {
@@ -314,5 +323,151 @@ pub async fn run_publisher_with_digest(
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Epoch adoption arithmetic: the `>=` comparison and the `+1` are
+    /// the exact off-by-ones that decide whether a restarted bridge's
+    /// updates are deduped away by a surviving index.
+    #[test]
+    fn adopt_epoch_moves_one_past_a_known_higher_or_equal_epoch() {
+        // Restarted bridge (local 1) vs an index that acked 7 -> adopt 8.
+        assert_eq!(adopt_epoch(1, 7), Some(8));
+        // Equal epochs still adopt: the index's seq cursor is ahead of
+        // our post-restart zero, so a fresh generation is required.
+        assert_eq!(adopt_epoch(5, 5), Some(6));
+        assert_eq!(adopt_epoch(1, 1), Some(2));
+        // We are already ahead: keep our epoch.
+        assert_eq!(adopt_epoch(8, 7), None);
+        // Nothing acked yet (known 0) while we are at 1: keep ours.
+        assert_eq!(adopt_epoch(1, 0), None);
+    }
+
+    /// The ledger tracks the running MAX acked epoch per holder — a later
+    /// lower ack (reordered / from a lagging replica) must not lower it.
+    #[test]
+    fn epoch_ledger_keeps_the_running_max() {
+        let ledger = EpochLedger::default();
+        assert_eq!(ledger.known("w1"), 0, "unknown holder is 0");
+        ledger.observe("w1", 7);
+        ledger.observe("w1", 3); // stale/reordered: must not lower
+        assert_eq!(ledger.known("w1"), 7);
+        ledger.observe("w1", 9);
+        assert_eq!(ledger.known("w1"), 9);
+        assert_eq!(ledger.known("w2"), 0, "holders are independent");
+    }
+
+    fn full_update(tip: u64, holder: &str) -> proto::Update {
+        proto::Update {
+            keyspace: Some(keyspace("m", 4)),
+            holder: holder.to_string(),
+            epoch: 1,
+            seq: 0,
+            events: vec![proto::Event {
+                kind: Some(proto::event::Kind::Stored(proto::Stored {
+                    parent_seq_hash: None,
+                    blocks: vec![proto::Block {
+                        seq_hash: tip,
+                        content_hash: tip,
+                    }],
+                })),
+            }],
+            added: None,
+            dropped: false,
+        }
+    }
+
+    /// Digest lifecycle: first publish of a chain sends full (None) and
+    /// records it; a re-publish sends a `{tip, len}` digest; the recorded
+    /// full is retained for resend-on-miss; and a reset (reconnect) forces
+    /// the next publish to re-establish full — so a digest is never a
+    /// silent under-match.
+    #[test]
+    fn digest_cache_establishes_digests_resends_and_resets() {
+        let cache = DigestCache::default();
+        let tip = 0xABCDu64;
+        let full = full_update(tip, "w1");
+
+        // First time: send full, record it.
+        assert!(cache.plan(tip, 1, &full).is_none(), "first publish is full");
+        // Established: a re-publish is a digest carrying {tip, len}.
+        let digest = cache.plan(tip, 1, &full).expect("re-publish is a digest");
+        match digest.events.as_slice() {
+            [proto::Event {
+                kind: Some(proto::event::Kind::StoredDigest(d)),
+            }] => {
+                assert_eq!(d.tip_seq_hash, tip);
+                assert_eq!(d.len, 1);
+                assert_eq!(d.parent_seq_hash, None);
+            }
+            other => panic!("expected a single StoredDigest event, got {other:?}"),
+        }
+        assert_eq!(digest.seq, 0, "placements/digests are unsequenced");
+
+        // Resend recovers the full chain for a missed tip; unknown -> None.
+        let resent = cache.resend(tip).expect("retained full for resend");
+        assert!(matches!(
+            resent.events.as_slice(),
+            [proto::Event {
+                kind: Some(proto::event::Kind::Stored(_))
+            }]
+        ));
+        assert!(
+            cache.resend(0xDEAD).is_none(),
+            "unknown tip is not resendable"
+        );
+
+        // Reconnect reset: the peer may not hold prior chains, so the
+        // next publish must re-establish full.
+        cache.reset();
+        assert!(
+            cache.plan(tip, 1, &full).is_none(),
+            "after reset the chain re-establishes full"
+        );
+    }
+
+    /// `convert_batch` maps the worker's Removed and Cleared events, not
+    /// just Stored — a removed/cleared holder must be told to the index or
+    /// it keeps scoring gone blocks. Only Stored was exercised before.
+    #[test]
+    fn convert_batch_maps_removed_and_cleared() {
+        let batch = common_proto::KvEventBatch {
+            sequence_number: 5,
+            timestamp: 0.0,
+            events: vec![
+                common_proto::KvCacheEvent {
+                    event_id: 1,
+                    data: Some(common_proto::kv_cache_event::Data::Removed(
+                        common_proto::KvBlocksRemoved {
+                            block_hashes: vec![10, 20],
+                            cache_level: None,
+                        },
+                    )),
+                },
+                common_proto::KvCacheEvent {
+                    event_id: 2,
+                    data: Some(common_proto::kv_cache_event::Data::Cleared(
+                        common_proto::KvCacheCleared {},
+                    )),
+                },
+            ],
+            dp_rank: Some(0),
+        };
+        let update = convert_batch(&batch, "m", 4, "w1", 3);
+        assert_eq!(update.seq, 5);
+        assert_eq!(update.epoch, 3);
+        assert_eq!(update.holder, "w1");
+        match &update.events[0].kind {
+            Some(proto::event::Kind::Removed(r)) => assert_eq!(r.seq_hashes, vec![10u64, 20]),
+            other => panic!("expected Removed, got {other:?}"),
+        }
+        match &update.events[1].kind {
+            Some(proto::event::Kind::Cleared(_)) => {}
+            other => panic!("expected Cleared, got {other:?}"),
+        }
     }
 }
