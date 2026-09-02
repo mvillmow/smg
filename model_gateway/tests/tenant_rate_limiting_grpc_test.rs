@@ -86,8 +86,6 @@ async fn start_mock_grpc_worker(output_tokens: u32) -> u16 {
         output_tokens,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
-        sim: false,
-        sim_params: mock_worker::sim::SimParams::default(),
     });
     tokio::spawn(mock_worker::grpc::serve(cfg, "127.0.0.1".to_string(), port));
     wait_for_port(port).await;
