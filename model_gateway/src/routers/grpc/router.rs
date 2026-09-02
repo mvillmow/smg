@@ -507,6 +507,17 @@ impl GrpcRouter {
             return *response;
         }
 
+        // Fail fast on an unknown model, before canonicalization and before the
+        // pipeline. The gRPC pipeline tokenizes locally, so its preparation
+        // stage runs ahead of worker selection; without this check an unknown
+        // model reaches `resolve_tokenizer` and surfaces as a 500
+        // `tokenizer_not_found` instead of the 404 the client should see.
+        // Mirrors `route_responses_impl`.
+        if let Some(error_response) = validate_worker_availability(&self.worker_registry, model_id)
+        {
+            return error_response;
+        }
+
         // EPD has no Harmony pipeline, so its chat requests all use the single
         // chat/generate pipeline.
         let is_harmony = self.harmony_pipeline.is_some()
@@ -562,6 +573,17 @@ impl GrpcRouter {
         model_id: &str,
     ) -> Response {
         debug!("Processing generate request for model: {}", model_id);
+
+        // Fail fast on an unknown model, before canonicalization and before the
+        // pipeline. The gRPC pipeline tokenizes locally, so its preparation
+        // stage runs ahead of worker selection; without this check an unknown
+        // model reaches `resolve_tokenizer` and surfaces as a 500
+        // `tokenizer_not_found` instead of the 404 the client should see.
+        // Mirrors `route_responses_impl`.
+        if let Some(error_response) = validate_worker_availability(&self.worker_registry, model_id)
+        {
+            return error_response;
+        }
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
@@ -675,6 +697,17 @@ impl GrpcRouter {
         };
         debug!("Processing embedding request for model: {}", model_id);
 
+        // Fail fast on an unknown model, before canonicalization and before the
+        // pipeline. The gRPC pipeline tokenizes locally, so its preparation
+        // stage runs ahead of worker selection; without this check an unknown
+        // model reaches `resolve_tokenizer` and surfaces as a 500
+        // `tokenizer_not_found` instead of the 404 the client should see.
+        // Mirrors `route_responses_impl`.
+        if let Some(error_response) = validate_worker_availability(&self.worker_registry, model_id)
+        {
+            return error_response;
+        }
+
         embedding_pipeline
             .execute_embeddings(
                 Arc::new(body),
@@ -695,6 +728,17 @@ impl GrpcRouter {
         model_id: &str,
     ) -> Response {
         debug!("Processing messages request for model: {}", model_id);
+
+        // Fail fast on an unknown model, before canonicalization and before the
+        // pipeline. The gRPC pipeline tokenizes locally, so its preparation
+        // stage runs ahead of worker selection; without this check an unknown
+        // model reaches `resolve_tokenizer` and surfaces as a 500
+        // `tokenizer_not_found` instead of the 404 the client should see.
+        // Mirrors `route_responses_impl`.
+        if let Some(error_response) = validate_worker_availability(&self.worker_registry, model_id)
+        {
+            return error_response;
+        }
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
@@ -731,6 +775,17 @@ impl GrpcRouter {
         model_id: &str,
     ) -> Response {
         debug!("Processing completion request for model: {}", model_id);
+
+        // Fail fast on an unknown model, before canonicalization and before the
+        // pipeline. The gRPC pipeline tokenizes locally, so its preparation
+        // stage runs ahead of worker selection; without this check an unknown
+        // model reaches `resolve_tokenizer` and surfaces as a 500
+        // `tokenizer_not_found` instead of the 404 the client should see.
+        // Mirrors `route_responses_impl`.
+        if let Some(error_response) = validate_worker_availability(&self.worker_registry, model_id)
+        {
+            return error_response;
+        }
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
@@ -770,6 +825,17 @@ impl GrpcRouter {
             return not_implemented("Classify not implemented");
         };
         debug!("Processing classify request for model: {}", model_id);
+
+        // Fail fast on an unknown model, before canonicalization and before the
+        // pipeline. The gRPC pipeline tokenizes locally, so its preparation
+        // stage runs ahead of worker selection; without this check an unknown
+        // model reaches `resolve_tokenizer` and surfaces as a 500
+        // `tokenizer_not_found` instead of the 404 the client should see.
+        // Mirrors `route_responses_impl`.
+        if let Some(error_response) = validate_worker_availability(&self.worker_registry, model_id)
+        {
+            return error_response;
+        }
 
         classify_pipeline
             .execute_classify(
