@@ -194,44 +194,85 @@ impl RadixIndex for IndexService {
         let apply_stats = Arc::clone(&self.stats);
         let ack_tx = tx.clone();
         tokio::spawn(async move {
-            while let Some((deadline, update)) = delayed_rx.recv().await {
-                tokio::time::sleep_until(deadline).await;
-                let msg = UpdateMsg::from(&update);
-                let (outcome, applied_seq, state_changed) = apply_engine.apply(&msg);
-                apply_stats.applies.fetch_add(1, Ordering::Relaxed);
-                // A digest the index could not confirm: tell the
-                // publisher which tip to resend in full. Never a silent
-                // under-match.
-                let digest_miss_tip = (outcome == ApplyOutcome::DigestMiss)
-                    .then(|| match msg.events.first() {
-                        Some(WireEvent::StoredDigest { tip, .. }) => Some(tip.0),
-                        _ => None,
-                    })
-                    .flatten();
-                // Relay ONLY state-changing applies: a relayed update
-                // echoed back by a symmetric peer is a no-op here and
-                // stops, instead of ping-ponging forever (bounded
-                // O(K^2) fan-out instead of unbounded amplification).
-                if state_changed {
-                    for peer in &apply_relay {
-                        if peer.try_send(update.clone()).is_err() {
-                            apply_stats.relay_dropped.fetch_add(1, Ordering::Relaxed);
+            // Drain whatever is already queued and apply it in one pass:
+            // consecutive SEQUENCED (event-feed) updates go through
+            // apply_batch — one keyspace write-lock per run instead of
+            // per update — so the shared-lock routing queries get real
+            // gaps between write bursts instead of ping-ponging against
+            // a per-event writer (the multi-writer event-path fix).
+            // Placement/control (seq 0) stay on per-update apply to keep
+            // their read-lock fast paths.
+            const MAX_BATCH: usize = 256;
+            while let Some(first) = delayed_rx.recv().await {
+                let mut batch = vec![first];
+                while batch.len() < MAX_BATCH {
+                    match delayed_rx.try_recv() {
+                        Ok(item) => batch.push(item),
+                        Err(_) => break,
+                    }
+                }
+                // Honor the latest injected staleness deadline in the
+                // batch (fault-drill legs); zero-delay batches fall
+                // through immediately.
+                if let Some((deadline, _)) = batch.last() {
+                    tokio::time::sleep_until(*deadline).await;
+                }
+                let msgs: Vec<UpdateMsg> = batch.iter().map(|(_, u)| UpdateMsg::from(u)).collect();
+                let mut results: Vec<(ApplyOutcome, u64, bool)> = Vec::with_capacity(msgs.len());
+                let mut k = 0;
+                while k < msgs.len() {
+                    if msgs[k].seq != 0 {
+                        let mut m = k + 1;
+                        while m < msgs.len() && msgs[m].seq != 0 {
+                            m += 1;
+                        }
+                        results.extend(apply_engine.apply_batch(&msgs[k..m]));
+                        k = m;
+                    } else {
+                        results.push(apply_engine.apply(&msgs[k]));
+                        k += 1;
+                    }
+                }
+                apply_stats
+                    .applies
+                    .fetch_add(msgs.len() as u64, Ordering::Relaxed);
+
+                let mut closed = false;
+                for (idx, msg) in msgs.iter().enumerate() {
+                    let (outcome, applied_seq, state_changed) = results[idx];
+                    let digest_miss_tip = (outcome == ApplyOutcome::DigestMiss)
+                        .then(|| match msg.events.first() {
+                            Some(WireEvent::StoredDigest { tip, .. }) => Some(tip.0),
+                            _ => None,
+                        })
+                        .flatten();
+                    // Relay ONLY state-changing applies (echo dies in one
+                    // hop; bounded O(K^2) fan-out).
+                    if state_changed {
+                        for peer in &apply_relay {
+                            if peer.try_send(batch[idx].1.clone()).is_err() {
+                                apply_stats.relay_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    let ack = proto::PublishAck {
+                        holder: msg.holder.clone(),
+                        epoch: msg.epoch,
+                        applied_seq,
+                        digest_miss_tip,
+                    };
+                    // Acks are advisory: drop when the publisher is not
+                    // reading rather than wedging the applier.
+                    match ack_tx.try_send(Ok(ack)) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            closed = true;
+                            break;
                         }
                     }
                 }
-                let ack = proto::PublishAck {
-                    holder: msg.holder,
-                    epoch: msg.epoch,
-                    applied_seq,
-                    digest_miss_tip,
-                };
-                // Acks are advisory (clients watch for stream death,
-                // not individual acks): drop when the publisher is
-                // not reading rather than wedging the applier behind
-                // its ack window.
-                match ack_tx.try_send(Ok(ack)) {
-                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                if closed {
+                    break;
                 }
             }
         });

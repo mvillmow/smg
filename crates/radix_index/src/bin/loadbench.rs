@@ -152,6 +152,7 @@ async fn run_querier(
     chain_len: usize,
     seed: u64,
     running: Arc<AtomicBool>,
+    assert_hit: bool,
 ) -> Vec<u64> {
     let mut client = RadixIndexClient::connect(url)
         .await
@@ -190,14 +191,121 @@ async fn run_querier(
         .expect("query send");
         let answer = answers.next().await.expect("answer").expect("answer ok");
         assert_eq!(answer.query_id, query_id, "serial stream must correlate");
-        assert!(
-            !answer.scores.is_empty(),
-            "hot query must match (warm fill covered it)"
-        );
+        if assert_hit {
+            assert!(
+                !answer.scores.is_empty(),
+                "hot query must match (warm fill covered it)"
+            );
+        }
         lat.push(started.elapsed().as_nanos() as u64);
         query_id += 1;
     }
     lat
+}
+
+/// A sequenced event-feed Stored batch (real write-lock work at the
+/// DB: seq advances so it applies, and the chain walk runs under the
+/// exclusive lock even when every block is a duplicate).
+fn event_stored_update(holder: &str, seq: u64, contents: &[ContentHash]) -> proto::Update {
+    let blocks = wire_hash::placement_chain(contents)
+        .into_iter()
+        .map(|(seq_hash, content_hash)| proto::Block {
+            seq_hash: seq_hash.0,
+            content_hash: content_hash.0,
+        })
+        .collect();
+    proto::Update {
+        keyspace: Some(proto::Keyspace {
+            model: MODEL.into(),
+            symbol_kind: proto::SymbolKind::Tokens as i32,
+            block_size: BLOCK_SIZE,
+            hash_scheme: wire_hash::HASH_SCHEME_V1,
+        }),
+        holder: holder.into(),
+        epoch: 1,
+        seq,
+        events: vec![proto::Event {
+            kind: Some(proto::event::Kind::Stored(proto::Stored {
+                parent_seq_hash: None,
+                blocks,
+            })),
+        }],
+        added: None,
+        dropped: false,
+    }
+}
+
+/// One event-feed publisher: streams sequenced Stored batches for its
+/// share of workers — the KV-event write load the DB must carry while
+/// serving routing queries.
+async fn run_event_publisher(
+    url: String,
+    workers: usize,
+    hot_per_worker: usize,
+    chain_len: usize,
+    publisher_id: usize,
+    publishers: usize,
+    running: Arc<AtomicBool>,
+    count_from: Instant,
+    sent_blocks: Arc<AtomicU64>,
+    target_ups: u64,
+) {
+    let client = RadixIndexClient::connect(url)
+        .await
+        .expect("event publisher connect");
+    let mut client = client
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
+    let (tx, rx) = mpsc::channel::<proto::Update>(256);
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let mut acks = client
+        .publish(tonic::Request::new(outbound))
+        .await
+        .expect("publish stream")
+        .into_inner();
+    tokio::spawn(async move { while let Some(_ack) = acks.next().await {} });
+
+    // Each publisher owns a DISJOINT worker shard (w % publishers ==
+    // id), so a worker's sequenced stream has a single source — the
+    // sharded-forwarder model. Multiple publisher streams still contend
+    // on the shared keyspace lock; that contention is what the batched
+    // applier must absorb.
+    let shard: Vec<usize> = (0..workers)
+        .filter(|w| w % publishers == publisher_id)
+        .collect();
+    if shard.is_empty() {
+        return;
+    }
+    let mut rng = publisher_id as u64 ^ 0xE7E7;
+    // seq base above any warm-fill seq so every load-phase event advances.
+    let mut seqs: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+    let period = (target_ups > 0).then(|| Duration::from_secs_f64(1.0 / target_ups as f64));
+    let mut next_at = Instant::now();
+    while running.load(Ordering::Relaxed) {
+        if let Some(period) = period {
+            let now = Instant::now();
+            if now < next_at {
+                tokio::time::sleep(next_at - now).await;
+            }
+            next_at += period;
+        }
+        rng = splitmix(rng);
+        let w = shard[(rng as usize) % shard.len()];
+        let slot = ((rng >> 32) % hot_per_worker as u64) as usize;
+        let s = seqs.entry(w).or_insert(1_000_000);
+        *s += 1;
+        let contents = hot_contents(w, slot, chain_len);
+        if tx
+            .send(event_stored_update(&worker_url(w), *s, &contents))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        if Instant::now() >= count_from {
+            sent_blocks.fetch_add(chain_len as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 /// One publisher: a gateway identity pushing the duplicate-dominated
@@ -340,6 +448,10 @@ async fn main() {
     let connect: Option<String> = parse_flag(&args, "--connect");
     // Reference-gateway digest protocol on the duplicate stream.
     let use_digest: bool = args.iter().any(|a| a == "--digest");
+    // --events drives the SEQUENCED event feed (write-lock work) instead
+    // of the idempotent placement feed, to measure the DB's event-path
+    // apply throughput + query isolation.
+    let events_mode: bool = args.iter().any(|a| a == "--events");
 
     let engine = Arc::new(Engine::new(EngineConfig::default()));
     let stats = Arc::new(server::ServiceStats::default());
@@ -389,9 +501,13 @@ async fn main() {
             for w in 0..workers {
                 for slot in 0..hot_per_worker {
                     let contents = hot_contents(w, slot, chain_len);
-                    tx.send(placement_update(&worker_url(w), &contents))
-                        .await
-                        .expect("fill send");
+                    let u = if events_mode {
+                        // establish as event-fed holders (seq 1..hot_per_worker per worker)
+                        event_stored_update(&worker_url(w), (slot + 1) as u64, &contents)
+                    } else {
+                        placement_update(&worker_url(w), &contents)
+                    };
+                    tx.send(u).await.expect("fill send");
                 }
             }
         });
@@ -402,13 +518,13 @@ async fn main() {
             .await
             .expect("fill stream")
             .into_inner();
-        let expected = workers * hot_per_worker;
-        let mut acked = 0usize;
-        while acked < expected {
-            acks.next().await.expect("fill ack").expect("fill ack ok");
-            acked += 1;
-        }
         fill.await.expect("fill task");
+        // Acks are advisory (droppable), so drain until the server closes
+        // the ack stream — which happens only after the whole fill has
+        // been applied — rather than counting a fixed number.
+        while let Some(ack) = acks.next().await {
+            ack.expect("fill ack ok");
+        }
     }
     let hot_blocks = workers * hot_per_worker * chain_len;
     println!(
@@ -428,6 +544,7 @@ async fn main() {
                 chain_len,
                 0xA11CE ^ q as u64,
                 Arc::clone(&running),
+                true,
             )));
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -451,20 +568,35 @@ async fn main() {
     let count_from = Instant::now() + warmup;
     let mut pubs = Vec::new();
     for p in 0..publishers {
-        pubs.push(tokio::spawn(run_publisher(
-            url.clone(),
-            workers,
-            hot_per_worker,
-            chain_len,
-            dup_pct,
-            p as u64,
-            Arc::clone(&running),
-            count_from,
-            Arc::clone(&sent_blocks),
-            target_ups,
-            use_digest,
-            Arc::clone(&resent_blocks),
-        )));
+        if events_mode {
+            pubs.push(tokio::spawn(run_event_publisher(
+                url.clone(),
+                workers,
+                hot_per_worker,
+                chain_len,
+                p,
+                publishers,
+                Arc::clone(&running),
+                count_from,
+                Arc::clone(&sent_blocks),
+                target_ups,
+            )));
+        } else {
+            pubs.push(tokio::spawn(run_publisher(
+                url.clone(),
+                workers,
+                hot_per_worker,
+                chain_len,
+                dup_pct,
+                p as u64,
+                Arc::clone(&running),
+                count_from,
+                Arc::clone(&sent_blocks),
+                target_ups,
+                use_digest,
+                Arc::clone(&resent_blocks),
+            )));
+        }
     }
     tokio::time::sleep(warmup).await;
     let applies_before = stats.applies.load(Ordering::Relaxed);
@@ -478,6 +610,7 @@ async fn main() {
             chain_len,
             0xB0B ^ q as u64,
             Arc::clone(&running),
+            true,
         )));
     }
     tokio::time::sleep(Duration::from_secs(secs)).await;
@@ -495,8 +628,9 @@ async fn main() {
     let blocks = sent_blocks.load(Ordering::Relaxed);
 
     println!(
-        "mode {} digest={} miss_resent_blocks={}",
+        "mode {} feed={} digest={} miss_resent_blocks={}",
         if external { "external" } else { "in-process" },
+        if events_mode { "events" } else { "placements" },
         use_digest,
         resent_blocks.load(Ordering::Relaxed),
     );

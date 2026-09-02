@@ -343,8 +343,51 @@ impl Engine {
         }
 
         let mut space = space.write().expect(LOCK_MSG);
-        let space = &mut *space;
+        self.apply_locked(&mut space, update)
+    }
 
+    /// Apply a run of updates, taking each keyspace's write lock ONCE
+    /// for its whole same-keyspace run instead of once per update.
+    /// Under a heavy event stream this cuts write-lock acquisitions
+    /// ~batch-fold, so the shared-lock queries get real gaps between
+    /// write bursts instead of ping-ponging against a per-event
+    /// writer. The result is IDENTICAL to applying each update
+    /// individually in order (only the lock granularity changes, never
+    /// the semantics — asserted by `apply_batch_equals_sequential`).
+    ///
+    /// This path is for the SEQUENCED event feed; it deliberately does
+    /// not run the read-lock placement/digest fast paths (those updates
+    /// go through `apply`), so a digest reaching here is a miss.
+    pub fn apply_batch(&self, updates: &[UpdateMsg]) -> Vec<(ApplyOutcome, u64, bool)> {
+        let mut out = Vec::with_capacity(updates.len());
+        let mut i = 0;
+        while i < updates.len() {
+            if updates[i].keyspace.block_size == 0 {
+                out.push((ApplyOutcome::KeyspaceMismatch, 0, false));
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < updates.len() && updates[j].keyspace == updates[i].keyspace {
+                j += 1;
+            }
+            let space = self.space_or_create(&updates[i].keyspace);
+            let mut guard = space.write().expect(LOCK_MSG);
+            for u in &updates[i..j] {
+                out.push(self.apply_locked(&mut guard, u));
+            }
+            i = j;
+        }
+        out
+    }
+
+    /// The exclusive-lock write path: apply one update to an
+    /// already-write-locked keyspace.
+    fn apply_locked(
+        &self,
+        space: &mut KeyspaceState,
+        update: &UpdateMsg,
+    ) -> (ApplyOutcome, u64, bool) {
         if !space.holders.contains_key(&update.holder) {
             let id = space.tree.create_holder(&update.holder);
             space.holders.insert(
@@ -1269,6 +1312,66 @@ mod tests {
         engine.sweep_idle();
         assert_eq!(engine.stats().holders, 0, "dropped idle holder must retire");
         assert_eq!(engine.stats().keyspaces, 0);
+    }
+
+    #[test]
+    fn apply_batch_equals_sequential() {
+        // A varied stream of sequenced event batches + placements across
+        // several holders (no digests — those deliberately route through
+        // `apply`). apply_batch over the whole stream must produce the
+        // identical outcome vector AND identical final query answers as
+        // applying each update one at a time.
+        let mut stream: Vec<UpdateMsg> = Vec::new();
+        for h in 0..6u32 {
+            let name = format!("w{h}");
+            // event chain, sequenced
+            for seq in 1..=4u64 {
+                stream.push(event_batch(
+                    &name,
+                    seq,
+                    vec![WireEvent::Stored {
+                        parent: None,
+                        blocks: placement_chain(&prefix_hashes(100 + h, (seq * 2) as usize)),
+                    }],
+                ));
+            }
+            // a remove and a re-store
+            let chain = placement_chain(&prefix_hashes(100 + h, 6));
+            stream.push(event_batch(
+                &name,
+                5,
+                vec![WireEvent::Removed {
+                    seq_hashes: vec![chain[chain.len() - 1].seq_hash],
+                }],
+            ));
+            // a placement for a different (inferred) holder
+            stream.push(placement(&format!("p{h}"), 200 + h, 5));
+        }
+        // interleave holders so runs mix
+        let seq_engine = Engine::new(EngineConfig::default());
+        let mut seq_out = Vec::new();
+        for u in &stream {
+            seq_out.push(seq_engine.apply(u));
+        }
+        let batch_engine = Engine::new(EngineConfig::default());
+        let batch_out = batch_engine.apply_batch(&stream);
+
+        assert_eq!(seq_out, batch_out, "batch outcome vector diverged");
+        for h in 0..6u32 {
+            for depth in [4usize, 6, 8] {
+                assert_eq!(
+                    scores(&seq_engine, 100 + h, depth),
+                    scores(&batch_engine, 100 + h, depth),
+                    "event-holder query diverged at h{h} depth{depth}"
+                );
+            }
+            assert_eq!(
+                scores(&seq_engine, 200 + h, 5),
+                scores(&batch_engine, 200 + h, 5),
+                "placement-holder query diverged at h{h}"
+            );
+        }
+        assert_eq!(seq_engine.entry_count(), batch_engine.entry_count());
     }
 
     #[test]
