@@ -6,8 +6,7 @@
 //! The implementation is deliberately independent of `kv_index` — the
 //! golden-vector tests pin it against values captured from the
 //! production gateway crate, so agreement is proven, not inherited.
-//! (`SPEC.md` §10.2 in `crates/radix_tree` — after R2 this module is
-//! the service's only source of the scheme.)
+//! This module is the service's only source of the scheme.
 //!
 //! Scheme v1 (`HASH_SCHEME_V1`):
 //! - content hash: XXH3-64, seed 1337, over the block's token ids as

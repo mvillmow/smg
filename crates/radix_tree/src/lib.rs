@@ -1,8 +1,8 @@
 //! Generic prefix-membership index.
 //!
-//! The contract lives in `SPEC.md`; the referee lives in
-//! `tests/differential.rs` (every implementation must equal the
-//! reference model there, always). Two cores share the contract:
+//! The referee lives in `tests/differential.rs` (every
+//! implementation must equal the reference model there, always). Two
+//! cores share the contract:
 //! [`RadixTree`] (the chain-native primary, `chain.rs`) and
 //! [`FlatTree`] (below in this file) — a flat positional entry map
 //! keyed by `(position, content)` with lineage-disambiguated

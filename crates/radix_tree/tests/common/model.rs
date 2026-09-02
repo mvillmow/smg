@@ -1,4 +1,4 @@
-//! The trivially-correct model of SPEC.md §4/§6/§7.
+//! The trivially-correct model of the matching/convergence contract.
 //!
 //! Representationally complete: every block carries its OWN literal
 //! lineage (the content prefix it was stored under, including

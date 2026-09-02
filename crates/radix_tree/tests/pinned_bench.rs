@@ -1,4 +1,4 @@
-//! The pinned performance workload (SPEC.md §11), oracle baseline.
+//! The pinned performance workload, oracle baseline.
 //!
 //! Normative constants live HERE; gates pass on this configuration
 //! only. R0 runs it against the oracle plus the engine's replicated

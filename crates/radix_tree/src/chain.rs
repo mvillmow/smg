@@ -1,7 +1,7 @@
 //! The chain-native core: chains as contiguous data, canonical
-//! maximal-run membership spans, one entry probe per query. Same §4
-//! API and §6/§7 contract (see `SPEC.md`) as the flat core; the
-//! differential referee proves equality.
+//! maximal-run membership spans, one entry probe per query. Same
+//! public API and matching/convergence contract as the flat core;
+//! the differential referee proves equality.
 
 use rustc_hash::FxHashMap;
 

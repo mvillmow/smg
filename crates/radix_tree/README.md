@@ -30,8 +30,9 @@ tree.overlap(&chain_hashes, &mut scratch, &mut out);
 tree.enumerate(w);                                 // (pos, key, content) for snapshots
 ```
 
-Contract details (matching semantics, convergence scope, alias
-rules): [`SPEC.md`](SPEC.md).
+The contract — exact matching semantics, convergence scope, and the
+§4 alias rules — is what `tests/differential.rs` enforces: every core
+must equal the reference model on every run.
 
 ## Structure
 
