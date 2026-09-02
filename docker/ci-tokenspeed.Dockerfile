@@ -2,8 +2,9 @@
 # fully-built TokenSpeed (engine + kernel + scheduler) baked into a venv.
 #
 # Built by .github/workflows/ci-tokenspeed-image.yml on every bump of
-# .github/versions/tokenspeed.ref and tagged
-# ghcr.io/<owner>/smg:ci-tokenspeed-<ref>. The build needs nvcc but no GPU
+# .github/versions/tokenspeed.ref or of the image tooling, and tagged
+# ghcr.io/<owner>/smg:<tag> with the content-addressed tag printed by
+# scripts/ci_tokenspeed_image_tag.sh. The build needs nvcc but no GPU
 # (the kernel arch list is pinned in the install script), so it runs on the
 # CPU/docker runner pool.
 #

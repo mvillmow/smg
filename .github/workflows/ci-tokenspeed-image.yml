@@ -1,18 +1,20 @@
 name: CI TokenSpeed Image
 
 # Bakes the pinned TokenSpeed build (engine + kernel + scheduler) on top of
-# the plain GPU CI container and pushes it as
-# ghcr.io/<owner>/smg:ci-tokenspeed-<ref>. The tokenspeed e2e lanes in
-# pr-test-rust.yml pull this image (resolved in detect-changes) instead of
-# spending ~25 GPU-runner-minutes compiling from source in every job.
+# the plain GPU CI container and pushes it under the content-addressed tag
+# printed by scripts/ci_tokenspeed_image_tag.sh (engine ref + a hash of the
+# image tooling). The tokenspeed e2e lanes in pr-test-rust.yml pull this
+# image (resolved in detect-changes) instead of spending ~25
+# GPU-runner-minutes compiling from source in every job.
 #
 # The kernel compile needs nvcc but no GPU (arch list is pinned in
 # scripts/ci_install_tokenspeed.sh), so this runs on the docker runner pool.
 #
-# Lifecycle: a PR bumping .github/versions/tokenspeed.ref falls back to the
-# source build (image for the new ref doesn't exist yet — detect-changes
-# resolves an empty image and the lanes degrade gracefully); this workflow
-# builds the new image on merge, and every subsequent run is fast again.
+# Lifecycle: a PR bumping .github/versions/tokenspeed.ref (or touching the
+# image tooling) falls back to the source build — the image for the new tag
+# doesn't exist yet, detect-changes resolves an empty image, and the lanes
+# degrade gracefully. This workflow builds the new tag on merge, and every
+# subsequent run is fast again.
 
 on:
   push:
@@ -22,6 +24,7 @@ on:
       - 'docker/ci-tokenspeed.Dockerfile'
       - 'scripts/ci_install_tokenspeed.sh'
       - 'scripts/ci_setup_python_venv.sh'
+      - 'scripts/ci_tokenspeed_image_tag.sh'
       - '.github/workflows/ci-tokenspeed-image.yml'
   workflow_dispatch:
     inputs:
@@ -57,18 +60,15 @@ jobs:
           BASE_OVERRIDE: ${{ inputs.base_image }}
           BASE_DEFAULT: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
         run: |
-          ref="$(tr -d '[:space:]' < .github/versions/tokenspeed.ref)"
-          if [ -z "$ref" ]; then
-            echo "ERROR: .github/versions/tokenspeed.ref is empty" >&2
-            exit 1
-          fi
+          # Unlike the tolerant resolution in detect-changes, THIS workflow
+          # must fail loudly on a broken ref — its whole job is the image.
+          tag="$(bash scripts/ci_tokenspeed_image_tag.sh)"
           base="${BASE_OVERRIDE:-$BASE_DEFAULT}"
           if [ -z "$base" ]; then
             echo "ERROR: no base image (vars.SMG_CI_GPU_CONTAINER_IMAGE unset and no override)" >&2
             exit 1
           fi
-          image="ghcr.io/${{ github.repository_owner }}/smg:ci-tokenspeed-${ref}"
-          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          image="ghcr.io/${{ github.repository_owner }}/smg:${tag}"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           echo "base=${base}" >> "$GITHUB_OUTPUT"
           echo "**Image:** \`${image}\`" >> "$GITHUB_STEP_SUMMARY"
@@ -81,8 +81,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tags are content-addressed by the tokenspeed ref, so an existing tag
-      # means the work is already done (unless force is set).
+      # Tags are content-addressed (engine ref + image-tooling hash, see
+      # scripts/ci_tokenspeed_image_tag.sh), so an existing tag means the
+      # work is already done (unless force is set).
       - name: Check for existing image
         id: exists
         env:
