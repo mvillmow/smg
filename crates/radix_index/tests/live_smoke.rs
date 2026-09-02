@@ -70,13 +70,15 @@ async fn worker_events_reach_the_index_over_the_wire() {
     let worker_url = format!("grpc://127.0.0.1:{worker_port}");
     let index_url = format!("http://127.0.0.1:{index_port}");
     let (tx, rx) = mpsc::channel::<proto::Update>(1024);
+    let ledger = bridge::EpochLedger::default();
     tokio::spawn(bridge::worker_loop(
         worker_url.clone(),
         MODEL.to_string(),
         BLOCK,
         tx,
+        ledger.clone(),
     ));
-    tokio::spawn(bridge::run_publisher(rx, index_url.clone()));
+    tokio::spawn(bridge::run_publisher(rx, index_url.clone(), ledger.clone()));
 
     // 4. Drive one generate on the worker (8 tokens = 2 blocks) and wait
     //    for its stream to finish (prefill published at first chunk).

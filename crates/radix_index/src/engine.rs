@@ -108,9 +108,19 @@ pub struct HolderScore {
 pub struct EngineConfig {
     /// Idle TTL for INFERRED holder state; an inferred holder with no
     /// publish inside the window is cleared entirely (coarse but
-    /// prefix-closed). Event-fed holders are never TTL'd — their
-    /// eviction is observed.
+    /// prefix-closed). Event-fed holders' BLOCK eviction is observed,
+    /// never TTL'd; their liveness backstop is `event_ttl`.
     pub inferred_ttl: Duration,
+    /// Liveness BACKSTOP for event-fed holders whose fleet-departure
+    /// signal was lost (the primary signal is the gateway's removal
+    /// workflow publishing `dropped`; a gateway crash mid-workflow
+    /// loses it, and before this backstop such a holder persisted
+    /// FOREVER — liveness review finding). An event-fed holder silent
+    /// for this window is soft-retired (`dropped`), which stops its
+    /// scoring and starts the retire clock; a next observed event
+    /// batch self-heals it. Keep an order of magnitude above
+    /// `inferred_ttl`; zero disables the backstop.
+    pub event_ttl: Duration,
     /// Default capacity (blocks) for inferred holders that never sent
     /// `Added`.
     pub default_capacity_blocks: u64,
@@ -120,6 +130,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             inferred_ttl: Duration::from_secs(180),
+            event_ttl: Duration::from_secs(1800),
             default_capacity_blocks: u64::MAX,
         }
     }
@@ -243,28 +254,23 @@ impl Engine {
 
         let mut changed = false;
 
-        // Epoch gate: higher epoch supersedes (implicit clear), lower is
-        // dropped, equal proceeds.
-        if update.epoch > holder.epoch {
-            tree.clear(holder.id);
-            holder.epoch = update.epoch;
-            holder.last_seq = 0;
-            changed = true;
-        } else if update.epoch < holder.epoch {
-            return (ApplyOutcome::Deduped, holder.last_seq, false);
-        }
-        holder.last_publish = Instant::now();
-
+        // Control payloads (membership lifecycle) apply BEFORE the
+        // epoch gate: the gateway's removal workflow publishes
+        // `dropped` at whatever epoch it last saw, while the bridge
+        // may have bumped the holder past it — a lifecycle signal
+        // silently discarded on epoch mismatch is a holder leak (the
+        // liveness review caught exactly this: `dropped` at epoch 1
+        // vs a bridge on epoch 2 was Deduped).
         if update.added.is_some() || update.dropped {
-            // Control payloads always change holder posture.
             changed = true;
         }
         if let Some(added) = &update.added {
-            holder.capacity_blocks = if added.capacity_blocks == 0 {
-                self.cfg.default_capacity_blocks
-            } else {
-                added.capacity_blocks
-            };
+            // Zero means "no capacity claim" — leave the standing
+            // value: a bare lifecycle re-announce must not clobber a
+            // worker-declared capacity back to the default.
+            if added.capacity_blocks != 0 {
+                holder.capacity_blocks = added.capacity_blocks;
+            }
             if added.event_fed {
                 holder.event_fed = true;
             }
@@ -274,6 +280,22 @@ impl Engine {
             holder.dropped = true;
         }
 
+        // Epoch gate: higher epoch supersedes (implicit clear), lower is
+        // dropped, equal proceeds. A bump is proof of life — a new feed
+        // generation exists, so a standing soft-retire is healed.
+        if update.epoch > holder.epoch {
+            tree.clear(holder.id);
+            holder.epoch = update.epoch;
+            holder.last_seq = 0;
+            if !update.dropped {
+                holder.dropped = false;
+            }
+            changed = true;
+        } else if update.epoch < holder.epoch {
+            return (ApplyOutcome::Deduped, holder.last_seq, changed);
+        }
+        holder.last_publish = Instant::now();
+
         // Sequenced = event feed; unsequenced = placement/control.
         let sequenced = update.seq != 0;
         if sequenced {
@@ -281,6 +303,12 @@ impl Engine {
                 return (ApplyOutcome::Deduped, holder.last_seq, changed);
             }
             holder.last_seq = update.seq;
+            if holder.dropped && !update.dropped {
+                // Observed engine events are proof of life: heal a
+                // stale (or wrongly relayed) soft-retire.
+                holder.dropped = false;
+                changed = true;
+            }
         }
 
         let mut outcome = ApplyOutcome::Applied;
@@ -358,6 +386,7 @@ impl Engine {
     /// timestamps; run from a timer.
     pub fn sweep_idle(&self) {
         let ttl = self.cfg.inferred_ttl;
+        let event_ttl = self.cfg.event_ttl;
         for (key, space_arc) in self.all_spaces() {
             let now_empty = {
                 let mut space = space_arc.lock().expect(LOCK_MSG);
@@ -369,6 +398,18 @@ impl Engine {
                         retire.push(name.clone());
                     } else if !holder.event_fed && idle {
                         space.tree.clear(holder.id);
+                    } else if holder.event_fed
+                        && !holder.dropped
+                        && !event_ttl.is_zero()
+                        && holder.last_publish.elapsed() > event_ttl
+                    {
+                        // Liveness backstop: silence far beyond the
+                        // event feed's cadence means the departure
+                        // signal was lost. Soft-retire; a next event
+                        // batch self-heals. Replicas converge on this
+                        // independently — each observes the same
+                        // silence on its own clock.
+                        holder.dropped = true;
                     }
                 }
                 for name in retire {
@@ -893,6 +934,88 @@ mod tests {
         // the watermark seq travels, so a replayed old batch is dropped.
         let (outcome, _, _) = b.apply(&event_batch("w2", 2, vec![WireEvent::Cleared]));
         assert_eq!(outcome, ApplyOutcome::Deduped);
+    }
+
+    #[test]
+    fn lifecycle_controls_apply_across_the_epoch_gate() {
+        let engine = Engine::new(EngineConfig::default());
+        // Bridge feeds the holder at epoch 3.
+        let mut feed = event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(51, 4)),
+            }],
+        );
+        feed.epoch = 3;
+        engine.apply(&feed);
+        assert_eq!(scores(&engine, 51, 4).len(), 1);
+
+        // The gateway's removal workflow publishes `dropped` at the
+        // stale epoch it last saw. It must apply anyway (a lifecycle
+        // signal silently discarded on epoch mismatch is a holder
+        // leak) — and it must RELAY (changed=true) so replicas learn.
+        let drop_msg = UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: Vec::new(),
+            added: None,
+            dropped: true,
+        };
+        let (_, _, changed) = engine.apply(&drop_msg);
+        assert!(changed, "stale-epoch drop must still relay");
+        assert!(scores(&engine, 51, 4).is_empty(), "dropped holder scored");
+
+        // Observed event traffic is proof of life: the next sequenced
+        // batch heals the soft-retire.
+        let mut alive = event_batch(
+            "w1",
+            2,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(52, 2)),
+            }],
+        );
+        alive.epoch = 3;
+        engine.apply(&alive);
+        assert_eq!(
+            scores(&engine, 52, 2).len(),
+            1,
+            "event batch must heal drop"
+        );
+    }
+
+    #[test]
+    fn silent_event_holders_are_soft_retired_by_the_backstop() {
+        let engine = Engine::new(EngineConfig {
+            inferred_ttl: Duration::ZERO,
+            event_ttl: Duration::from_nanos(1),
+            ..EngineConfig::default()
+        });
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(53, 4)),
+            }],
+        ));
+        assert_eq!(scores(&engine, 53, 4).len(), 1);
+        std::thread::sleep(Duration::from_millis(2));
+        // First sweep: silence past event_ttl soft-retires (stops
+        // scoring); second sweep: dropped + idle retires entirely and
+        // the emptied keyspace unlinks.
+        engine.sweep_idle();
+        assert!(
+            scores(&engine, 53, 4).is_empty(),
+            "backstop must stop scoring"
+        );
+        engine.sweep_idle();
+        assert_eq!(engine.stats().holders, 0, "dropped idle holder must retire");
+        assert_eq!(engine.stats().keyspaces, 0);
     }
 
     #[test]

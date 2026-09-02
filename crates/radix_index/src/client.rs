@@ -67,7 +67,11 @@ impl RemoteIndex {
             query_rx,
             Arc::clone(&connected),
         ));
-        tokio::spawn(bridge::run_publisher(placement_rx, url));
+        tokio::spawn(bridge::run_publisher(
+            placement_rx,
+            url,
+            bridge::EpochLedger::default(),
+        ));
         Arc::new(Self {
             queries: query_tx,
             placements: placement_tx,
@@ -160,6 +164,45 @@ impl RemoteIndex {
             dropped: false,
         };
         let _ = self.placements.try_send(update);
+    }
+
+    /// Fleet-membership lifecycle: soft-retire `holder` (stop scoring
+    /// it; state expires by TTL). Published by the gateway's
+    /// worker-removal workflow — the same signal that purges the
+    /// local indexer. AWAITED (unlike placements): a lifecycle signal
+    /// must not be droppable on queue overflow.
+    pub async fn publish_dropped(&self, model: &str, block_size: u32, holder: &str) {
+        let _ = self
+            .placements
+            .send(lifecycle(model, block_size, holder, true))
+            .await;
+    }
+
+    /// Fleet-membership lifecycle: (re)announce `holder` — heals a
+    /// same-URL rejoin out of a standing soft-retire.
+    pub async fn publish_added(&self, model: &str, block_size: u32, holder: &str) {
+        let _ = self
+            .placements
+            .send(lifecycle(model, block_size, holder, false))
+            .await;
+    }
+}
+
+fn lifecycle(model: &str, block_size: u32, holder: &str, dropped: bool) -> proto::Update {
+    proto::Update {
+        keyspace: Some(bridge::keyspace(model, block_size)),
+        holder: holder.to_string(),
+        // Control payloads apply independent of the epoch gate, so the
+        // constant epoch is safe even against a bridge-advanced holder.
+        epoch: 1,
+        seq: 0,
+        events: Vec::new(),
+        added: (!dropped).then_some(proto::Added {
+            capacity_blocks: 0,
+            event_fed: false,
+            metadata: Vec::new(),
+        }),
+        dropped,
     }
 }
 

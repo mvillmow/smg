@@ -41,16 +41,18 @@ async fn main() -> std::process::ExitCode {
     }
 
     let (tx, rx) = mpsc::channel::<proto::Update>(65_536);
+    let ledger = bridge::EpochLedger::default();
     for worker in &workers {
         tokio::spawn(bridge::worker_loop(
             worker.clone(),
             model.clone(),
             block_size,
             tx.clone(),
+            ledger.clone(),
         ));
     }
     drop(tx);
     tracing::info!(workers = workers.len(), %index, "bridge running");
-    bridge::run_publisher(rx, index).await;
+    bridge::run_publisher(rx, index, ledger).await;
     std::process::ExitCode::SUCCESS
 }

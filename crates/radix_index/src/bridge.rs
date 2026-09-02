@@ -8,13 +8,44 @@
 //! OutOfRange) bumps the holder's EPOCH and restarts from zero — the
 //! epoch bump is what makes the restart safe to relay.
 
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures::StreamExt;
 use smg_grpc_client::{common_proto, tokenspeed_scheduler::TokenSpeedSchedulerClient};
 use tokio::sync::mpsc;
 
 use crate::proto::{self, radix_index_client::RadixIndexClient};
+
+/// Cross-task view of each holder's highest epoch the INDEX has acked.
+/// `run_publisher` writes it from acks; worker loops consult it, so a
+/// restarted bridge (local epoch back at 1) adopts PAST a surviving
+/// index's higher epoch instead of having every update silently
+/// deduped until the next worker-side cursor loss happens to bump it
+/// (liveness review's latent-bug finding — `PublishAck.epoch` exists
+/// on the wire precisely for this and was ignored).
+#[derive(Clone, Default)]
+pub struct EpochLedger(Arc<Mutex<HashMap<String, u64>>>);
+
+impl EpochLedger {
+    pub fn observe(&self, holder: &str, epoch: u64) {
+        let mut map = self.0.lock().expect("epoch ledger lock");
+        let entry = map.entry(holder.to_string()).or_insert(0);
+        *entry = (*entry).max(epoch);
+    }
+
+    pub fn known(&self, holder: &str) -> u64 {
+        self.0
+            .lock()
+            .expect("epoch ledger lock")
+            .get(holder)
+            .copied()
+            .unwrap_or(0)
+    }
+}
 
 pub fn keyspace(model: &str, block_size: u32) -> proto::Keyspace {
     proto::Keyspace {
@@ -80,10 +111,20 @@ pub async fn worker_loop(
     model: String,
     block_size: u32,
     out: mpsc::Sender<proto::Update>,
+    ledger: EpochLedger,
 ) {
     let mut epoch: u64 = 1;
     let mut last_seq: u64 = 0;
     loop {
+        // Adopt past whatever epoch the index has acked for this
+        // holder: a lower local epoch means every update we send is
+        // dead on arrival. Adoption is a new generation, so replay
+        // from zero (the resubscribe below starts at `last_seq`).
+        let known = ledger.known(&worker);
+        if known >= epoch {
+            epoch = known + 1;
+            last_seq = 0;
+        }
         let Ok(client) = TokenSpeedSchedulerClient::connect(&worker).await else {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
@@ -124,6 +165,13 @@ pub async fn worker_loop(
             if out.send(update).await.is_err() {
                 return; // publisher gone; process exiting
             }
+            // Mid-stream adoption: acks arrive async, and a healthy
+            // stream never reconnects on its own — without this check
+            // a stale-epoch bridge would keep feeding deduped updates
+            // forever.
+            if ledger.known(&worker) >= epoch {
+                break; // outer loop adopts and resubscribes from zero
+            }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -132,7 +180,11 @@ pub async fn worker_loop(
 /// The publish pump: drain `rx` into one (re)connected Publish stream to
 /// `index`. The receiver persists across reconnects, so no update is
 /// lost inside the bridge. Returns when all worker loops have ended.
-pub async fn run_publisher(mut rx: mpsc::Receiver<proto::Update>, index: String) {
+pub async fn run_publisher(
+    mut rx: mpsc::Receiver<proto::Update>,
+    index: String,
+    ledger: EpochLedger,
+) {
     loop {
         let Ok(client) = RadixIndexClient::connect(index.clone()).await else {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -162,10 +214,9 @@ pub async fn run_publisher(mut rx: mpsc::Receiver<proto::Update>, index: String)
                     // All worker loops ended (fleet torn down).
                     None => return,
                 },
-                ack = acks.next() => {
-                    if ack.is_none() {
-                        break;
-                    }
+                ack = acks.next() => match ack {
+                    Some(Ok(ack)) => ledger.observe(&ack.holder, ack.epoch),
+                    Some(Err(_)) | None => break,
                 }
             }
         }

@@ -31,6 +31,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--peers",
     "--bootstrap-from",
     "--inferred-ttl-secs",
+    "--event-ttl-secs",
     "--default-capacity-blocks",
     "--sweep-interval-secs",
     "--apply-delay-stored-ms",
@@ -106,6 +107,10 @@ async fn main() {
     let bootstrap: Option<String> = parse_flag(&args, "--bootstrap-from");
     let cfg = EngineConfig {
         inferred_ttl: Duration::from_secs(parse_flag(&args, "--inferred-ttl-secs").unwrap_or(180)),
+        // Liveness backstop for event-fed holders whose gateway-published
+        // departure signal was lost; 0 disables. Keep well above the
+        // event feed's idle cadence.
+        event_ttl: Duration::from_secs(parse_flag(&args, "--event-ttl-secs").unwrap_or(1800)),
         default_capacity_blocks: parse_flag(&args, "--default-capacity-blocks").unwrap_or(u64::MAX),
     };
     let sweep_secs: u64 = parse_flag(&args, "--sweep-interval-secs").unwrap_or(5);
@@ -118,6 +123,7 @@ async fn main() {
 
     tracing::info!(
         inferred_ttl_secs = cfg.inferred_ttl.as_secs(),
+        event_ttl_secs = cfg.event_ttl.as_secs(),
         default_capacity_blocks = cfg.default_capacity_blocks,
         "engine config"
     );
