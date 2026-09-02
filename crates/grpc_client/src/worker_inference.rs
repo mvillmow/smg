@@ -16,27 +16,20 @@ use std::{
 };
 
 use futures::{Stream, StreamExt};
+use proto::worker_inference_server::WorkerInference as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{transport::Channel, Request, Response, Status};
 use tracing::{debug, warn};
 
+// `worker_inference.proto` shares the `smg.worker.v1` package with
+// `worker_control.proto` and lands in the same generated file. Re-export the
+// single include from [`crate::worker_control`] so `worker_proto::GenerateRequest`
+// and `worker_inference_proto::GenerateRequest` stay one type.
+pub use crate::worker_control::proto;
 use crate::{
     sglang_runtime as sglang, tokenspeed_proto as ts, vllm_proto as vllm, AbortOnDropClient,
     BoxedTraceInjector, NoopTraceInjector, TokenSpeedSchedulerClient, VllmEngineClient,
 };
-
-#[expect(clippy::allow_attributes)]
-pub mod proto {
-    #![allow(
-        clippy::all,
-        clippy::absolute_paths,
-        clippy::trivially_copy_pass_by_ref,
-        unused_qualifications
-    )]
-    tonic::include_proto!("smg.worker.v1");
-}
-
-use proto::worker_inference_server::WorkerInference as _;
 
 pub type AbortOnDropStream =
     crate::AbortOnDropStream<proto::GenerateResponse, WorkerInferenceClient>;
@@ -498,7 +491,15 @@ fn into_vllm_sampling(
         ));
     }
     let logprobs = return_logprob.then_some(top_logprobs_num.max(0));
-    let prompt_logprobs = logprob_start_len.map(|_| top_logprobs_num.max(0));
+    // SGLang/TokenSpeed semantics: `logprob_start_len` defaults to -1, meaning
+    // "output logprobs only". Only a non-negative offset asks the engine for
+    // input logprobs. The Router populates this field on every request, so
+    // gating on `is_some()` alone made vLLM compute (and V1 skip prefix
+    // caching for) prompt logprobs on every prefill, with the result then
+    // dropped -- `GenerateComplete` has no input-logprobs field.
+    let prompt_logprobs = logprob_start_len
+        .filter(|start| return_logprob && *start >= 0)
+        .map(|_| top_logprobs_num.max(0));
     let logit_bias = params
         .logit_bias
         .into_iter()
@@ -508,10 +509,13 @@ fn into_vllm_sampling(
                 .map_err(|_| Status::invalid_argument("vLLM logit_bias keys must be token IDs"))
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
+    // vLLM's proto seed is i32 while the request seed is u64. Saturate rather
+    // than reject so a large seed keeps working here exactly as it does on the
+    // direct vLLM path (`vllm_engine.rs`), preserving the "set" vs "unset"
+    // distinction.
     let seed = params
         .sampling_seed
-        .map(|value| i32::try_from(value).map_err(|_| numeric_range_error("sampling_seed")))
-        .transpose()?;
+        .map(|value| i32::try_from(value).unwrap_or(i32::MAX));
     let constraint = params.constraint.map(|constraint| match constraint {
         proto::sampling_params::Constraint::Regex(value) => {
             vllm::sampling_params::Constraint::Regex(value)
@@ -654,6 +658,17 @@ fn into_sglang_sampling(params: proto::SamplingParams) -> Result<sglang::Samplin
     if !params.logit_bias.is_empty() || params.engine_parameters.is_some() {
         return Err(Status::invalid_argument(
             "SGLang native gRPC does not support WorkerInference engine parameters or logit bias",
+        ));
+    }
+    // `sglang_runtime.proto` has no field for these, and SGLang's own defaults
+    // are `skip_special_tokens=true`, `spaces_between_special_tokens=true`,
+    // `no_stop_trim=false`. Silently dropping a non-default value would flip
+    // detokenization behind the caller's back -- the Harmony path relies on
+    // `skip_special_tokens=false`. Fail closed, matching the checks above.
+    if !params.skip_special_tokens || !params.spaces_between_special_tokens || params.no_stop_trim {
+        return Err(Status::unimplemented(
+            "SGLang native gRPC cannot express skip_special_tokens, \
+             spaces_between_special_tokens, or no_stop_trim overrides",
         ));
     }
     Ok(sglang::SamplingParams {
@@ -1145,6 +1160,10 @@ mod tests {
                 max_new_tokens: Some(16),
                 stop_token_ids: vec![99],
                 sampling_seed: Some(7),
+                // The Router always sets these explicitly; SGLang's native
+                // proto has no field for them, so only its own defaults pass.
+                skip_special_tokens: true,
+                spaces_between_special_tokens: true,
                 ..Default::default()
             }),
             stream: true,
@@ -1161,6 +1180,40 @@ mod tests {
         assert_eq!(sampling.max_new_tokens, Some(16));
         assert_eq!(sampling.stop_token_ids, vec![99]);
         assert_eq!(sampling.seed, Some(7));
+    }
+
+    #[test]
+    fn sglang_native_rejects_inexpressible_detokenization_flags() {
+        // `sglang_runtime.proto` cannot carry these, and SGLang's defaults are
+        // the opposite of what is being asked for. Dropping them silently would
+        // flip detokenization behind the caller's back (the Harmony path relies
+        // on `skip_special_tokens: false`), so the adapter must fail closed.
+        for params in [
+            proto::SamplingParams {
+                skip_special_tokens: false,
+                spaces_between_special_tokens: true,
+                ..Default::default()
+            },
+            proto::SamplingParams {
+                skip_special_tokens: true,
+                spaces_between_special_tokens: false,
+                ..Default::default()
+            },
+            proto::SamplingParams {
+                skip_special_tokens: true,
+                spaces_between_special_tokens: true,
+                no_stop_trim: true,
+                ..Default::default()
+            },
+        ] {
+            let request = proto::GenerateRequest {
+                request_id: "native-flags".to_string(),
+                sampling_params: Some(params),
+                ..Default::default()
+            };
+            let status = into_sglang_request(request).expect_err("unsupported flag");
+            assert_eq!(status.code(), tonic::Code::Unimplemented);
+        }
     }
 
     #[test]
@@ -1200,6 +1253,63 @@ mod tests {
         assert_eq!(sampling.seed, Some(7));
         assert_eq!(sampling.logprobs, Some(3));
         assert_eq!(sampling.n, 2);
+    }
+
+    fn vllm_sampling_for(
+        return_logprob: bool,
+        logprob_start_len: Option<i32>,
+    ) -> vllm::SamplingParams {
+        into_vllm_request(proto::GenerateRequest {
+            request_id: "vllm-logprobs".to_string(),
+            sampling_params: Some(proto::SamplingParams::default()),
+            return_logprob,
+            logprob_start_len,
+            top_logprobs_num: 3,
+            ..Default::default()
+        })
+        .expect("vLLM request")
+        .sampling_params
+        .expect("sampling params")
+    }
+
+    #[test]
+    fn vllm_prompt_logprobs_need_a_non_negative_start() {
+        // The Router populates `logprob_start_len` on every request (-1 means
+        // "output logprobs only"), so keying off its presence alone made vLLM
+        // compute prompt logprobs for all traffic and then discard them --
+        // `GenerateComplete` has no input-logprobs field.
+        assert_eq!(vllm_sampling_for(true, Some(-1)).prompt_logprobs, None);
+        assert_eq!(vllm_sampling_for(false, Some(-1)).prompt_logprobs, None);
+        assert_eq!(vllm_sampling_for(false, Some(0)).prompt_logprobs, None);
+        assert_eq!(vllm_sampling_for(true, None).prompt_logprobs, None);
+        assert_eq!(vllm_sampling_for(true, Some(0)).prompt_logprobs, Some(3));
+        assert_eq!(vllm_sampling_for(true, Some(4)).prompt_logprobs, Some(3));
+    }
+
+    #[test]
+    fn vllm_saturates_seeds_beyond_the_proto_range() {
+        // vLLM's proto seed is i32 while the request seed is u64. The direct
+        // vLLM path saturates; rejecting here would 400 a request that works
+        // today, and unset must stay unset so vLLM picks its own seed.
+        let request = |seed: Option<u64>| proto::GenerateRequest {
+            request_id: "vllm-seed".to_string(),
+            sampling_params: Some(proto::SamplingParams {
+                sampling_seed: seed,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let seed_of = |seed| {
+            into_vllm_request(request(seed))
+                .expect("vLLM request")
+                .sampling_params
+                .expect("sampling params")
+                .seed
+        };
+        assert_eq!(seed_of(Some(7)), Some(7));
+        assert_eq!(seed_of(Some(3_000_000_000)), Some(i32::MAX));
+        assert_eq!(seed_of(Some(u64::MAX)), Some(i32::MAX));
+        assert_eq!(seed_of(None), None);
     }
 
     #[test]

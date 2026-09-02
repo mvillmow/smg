@@ -1762,13 +1762,22 @@ impl CliArgs {
         // additionally pins the startup workers' runtime: the shared EngineCore
         // handshake carries no engine identity, so the wire protocol cannot be
         // probed and must be declared. HTTP/gRPC keep auto-detection (None).
-        let startup_worker_runtime_type = if connection_mode == ConnectionMode::Zmq
-            || self.worker_mode == StartupWorkerMode::Smg
-        {
+        // The two branches stay separate because ZMQ only admits vLLM and
+        // TokenSpeed (`zmq_client::connect_for_worker`) -- folding them
+        // together would pin an unsupported runtime for `--connection-mode zmq
+        // --backend sglang|trtllm`, which auto-detection handles today. Mirrors
+        // `to_router_config` in bindings/python/src/lib.rs.
+        let startup_worker_runtime_type = if self.worker_mode == StartupWorkerMode::Smg {
             match self.backend {
                 Some(Backend::Sglang) => Some(RuntimeType::Sglang),
                 Some(Backend::Vllm) => Some(RuntimeType::Vllm),
                 Some(Backend::Trtllm) => Some(RuntimeType::Trtllm),
+                Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
+                _ => None,
+            }
+        } else if connection_mode == ConnectionMode::Zmq {
+            match self.backend {
+                Some(Backend::Vllm) => Some(RuntimeType::Vllm),
                 Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
                 _ => None,
             }

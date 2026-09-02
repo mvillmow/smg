@@ -158,8 +158,13 @@ pub(crate) async fn try_smg_worker_reachable(
 
     let grpc_url = grpc_reachable_url(url)?;
     let timeout = Duration::from_secs(timeout_secs);
+    // `timeout` below bounds the whole handshake -- connect plus four sequential
+    // RPCs. Handing the connect that same full budget leaves nothing for the
+    // RPCs, so a Worker that is merely slow to accept fails with a spurious
+    // "handshake timeout" while it is serving fine. Reserve half for the RPCs.
+    let connect_timeout = (timeout / 2).max(Duration::from_millis(500)).min(timeout);
     let handshake = async {
-        let channel = connect_channel_with_timeout(&grpc_url, timeout)
+        let channel = connect_channel_with_timeout(&grpc_url, connect_timeout)
             .await
             .map_err(|error| format!("SMG Worker gRPC connection failed: {error}"))?;
         let mut client = WorkerControlClient::new(channel);

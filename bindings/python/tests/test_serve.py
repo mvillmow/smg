@@ -1457,12 +1457,15 @@ class TestServeOrchestrator:
         assert command[command.index("--engine-endpoint") + 1] == _zmq_ipc_url(31000)
         assert command[command.index("--engine-count") + 1] == "2"
 
-    def test_two_tier_rejects_sglang_zmq(self):
-        args = _make_args(connection_mode="zmq", router_worker_mode="smg")
+    @pytest.mark.parametrize("connection_mode", ["grpc", "zmq"])
+    def test_two_tier_rejects_sglang(self, connection_mode):
+        """`--grpc-mode` serves SglangScheduler, but the sidecar adapter dials
+        SglangService. Reject at startup instead of failing the first request."""
+        args = _make_args(connection_mode=connection_mode, router_worker_mode="smg")
         orch = ServeOrchestrator("sglang", args, [])
         orch.workers = [(MagicMock(), 31000)]
 
-        with pytest.raises(ValueError, match="SGLang.*do not support ZMQ"):
+        with pytest.raises(ValueError, match="do not support backend sglang"):
             orch._launch_sidecars()
 
     def test_build_router_args_zmq_forwards_backend(self):

@@ -368,6 +368,7 @@ impl BasicWorkerBuilder {
             metadata,
             backend_client,
             worker_control_client: Arc::new(OnceCell::new()),
+            smg_instance_id: Arc::new(ArcSwapOption::empty()),
             zmq_connect_started: Arc::new(AtomicBool::new(false)),
             zmq_connect_abort: Arc::new(ArcSwapOption::empty()),
             connect_signal_tx: self.connect_signal_tx,

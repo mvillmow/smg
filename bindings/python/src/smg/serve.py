@@ -66,6 +66,12 @@ def _backend_arg_int(backend_args: list[str], flag: str, default: int) -> int:
 # collide with SOME worker's handshake listener for the right ipc path.
 _ZMQ_HANDSHAKE_PORT_BASE = 20000
 _ZMQ_HANDSHAKE_PORT_SPAN = 10000
+# Over ZMQ the sidecar binds its control listener only after
+# `ZmqWorkerTransport::connect` completes the engine handshake, and
+# `bindings/python/src/worker_control.rs` deliberately allows 610s for that
+# (model load). Keep the two budgets in sync so a slow-loading model is not
+# torn down by the shorter `--worker-startup-timeout`.
+_ZMQ_SIDECAR_STARTUP_TIMEOUT_SECS = 610
 
 
 def _zmq_handshake_port(ipc_url: str) -> int:
@@ -965,10 +971,15 @@ class ServeOrchestrator:
         engine_transport = getattr(self.args, "connection_mode", "grpc")
         if engine_transport not in ("grpc", "zmq"):
             raise ValueError("--router-worker-mode smg requires a grpc or zmq engine transport")
-        if self.backend not in ("sglang", "vllm", "tokenspeed"):
+        if self.backend not in ("vllm", "tokenspeed"):
+            # SGLang is deliberately excluded: `SglangWorkerLauncher` launches
+            # `--grpc-mode`, which serves `sglang.grpc.scheduler.SglangScheduler`
+            # (what SMG's existing direct client speaks), while the sidecar's
+            # adapter dials `sglang.runtime.v1.SglangService`. Because
+            # `EngineWorkerInference::connect` only opens a channel, a mismatched
+            # pair would come up SERVING and then `Unimplemented` on the first
+            # request. Fail at startup instead until the launch side is wired up.
             raise ValueError(f"two-tier SMG Workers do not support backend {self.backend}")
-        if engine_transport == "zmq" and self.backend == "sglang":
-            raise ValueError("SGLang two-tier Workers do not support ZMQ yet")
 
         control_ports = _find_available_ports(self.args.worker_control_base_port, len(self.workers))
         model_id = getattr(self.args, "model", None) or getattr(self.args, "model_path", None)
@@ -1021,8 +1032,11 @@ class ServeOrchestrator:
 
     def _wait_sidecars_healthy(self) -> None:
         host = self.args.worker_host
+        startup_timeout = self.args.worker_startup_timeout
+        if getattr(self.args, "connection_mode", "grpc") == "zmq":
+            startup_timeout = max(startup_timeout, _ZMQ_SIDECAR_STARTUP_TIMEOUT_SECS)
         for proc, control_port, _ in self.sidecars:
-            deadline = time.monotonic() + self.args.worker_startup_timeout
+            deadline = time.monotonic() + startup_timeout
             while time.monotonic() < deadline:
                 if proc.poll() is not None:
                     raise RuntimeError(
@@ -1042,7 +1056,7 @@ class ServeOrchestrator:
             else:
                 raise TimeoutError(
                     f"SMG Worker sidecar on port {control_port} not healthy within "
-                    f"{self.args.worker_startup_timeout}s"
+                    f"{startup_timeout}s"
                 )
 
     def _build_router_args(self) -> RouterArgs:

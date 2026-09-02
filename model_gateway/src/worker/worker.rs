@@ -1235,6 +1235,12 @@ pub struct BasicWorker {
     /// deliberately separate from `backend_client`, which always targets the
     /// inference endpoint.
     pub worker_control_client: Arc<OnceCell<WorkerControlClient<Channel>>>,
+    /// Last SMG Worker instance ID this router accepted, seeded lazily from the
+    /// `smg.instance_id` label. Mutable because the label is frozen at
+    /// registration: without a way to adopt the new ID, a Worker that restarts
+    /// would fail every subsequent health probe forever. `None` until the first
+    /// successful identity probe.
+    pub smg_instance_id: Arc<ArcSwapOption<String>>,
     /// Guards the one-shot background ZMQ handshake driver so the health probe
     /// never cancels a long (model-load) handshake. Self-clears on failure to
     /// allow a retry. Unused for HTTP/gRPC.
@@ -1267,6 +1273,7 @@ impl Clone for BasicWorker {
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             backend_client: Arc::clone(&self.backend_client),
             worker_control_client: Arc::clone(&self.worker_control_client),
+            smg_instance_id: Arc::clone(&self.smg_instance_id),
             zmq_connect_started: Arc::clone(&self.zmq_connect_started),
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
@@ -1813,8 +1820,16 @@ impl Worker for BasicWorker {
                     return Ok(false);
                 }
 
-                let Some(expected_instance_id) = self.metadata.spec.labels.get("smg.instance_id")
-                else {
+                let adopted = self.smg_instance_id.load_full();
+                let expected_instance_id = adopted.clone().or_else(|| {
+                    self.metadata
+                        .spec
+                        .labels
+                        .get("smg.instance_id")
+                        .cloned()
+                        .map(Arc::new)
+                });
+                let Some(expected_instance_id) = expected_instance_id else {
                     return Ok(true);
                 };
                 match time::timeout(timeout, client.get_identity(GetIdentityRequest {})).await {
@@ -1827,11 +1842,25 @@ impl Worker for BasicWorker {
                         if observed != *expected_instance_id {
                             tracing::warn!(
                                 control_url,
-                                expected_instance_id,
-                                observed_instance_id = observed,
-                                "SMG Worker instance changed; forcing re-registration"
+                                expected_instance_id = %expected_instance_id,
+                                observed_instance_id = %observed,
+                                "SMG Worker instance changed; failing this probe and adopting the \
+                                 new instance"
                             );
+                            // Adopt the new ID so the next probe can pass. The
+                            // registration label is frozen, so leaving the old
+                            // value in place would pin this worker unhealthy
+                            // forever -- static `--worker-urls` deployments have
+                            // no re-registration path at all. Reporting a single
+                            // unhealthy probe is enough to drain in-flight work
+                            // and trip the circuit breaker.
+                            self.smg_instance_id.store(Some(Arc::new(observed)));
                             return Ok(false);
+                        }
+                        if adopted.is_none() {
+                            // Seed from the label on the first successful probe
+                            // so later comparisons no longer read it.
+                            self.smg_instance_id.store(Some(expected_instance_id));
                         }
                         Ok(true)
                     }
@@ -2276,6 +2305,10 @@ mod tests {
             })
             .build();
         assert!(worker.check_health_async().await.is_err());
+
+        // The registration label is frozen, so the probe must adopt the observed
+        // instance ID; otherwise a restarted Worker stays unhealthy forever.
+        assert!(worker.check_health_async().await.is_ok());
 
         server.abort();
     }

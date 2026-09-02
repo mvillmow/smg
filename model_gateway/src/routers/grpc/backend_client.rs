@@ -526,33 +526,6 @@ fn fold_smg_vllm_eos_backstop(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
-
-    use super::*;
-
-    #[test]
-    fn smg_vllm_eos_backstop_updates_portable_request() {
-        let mut request =
-            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
-                sampling_params: Some(tokenspeed_proto::SamplingParams::default()),
-                ..Default::default()
-            }));
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
-
-        fold_smg_vllm_eos_backstop(&mut request, Some(&tokenizer));
-
-        let ProtoGenerateRequest::TokenSpeed(request) = request else {
-            panic!("expected TokenSpeed request");
-        };
-        assert_eq!(
-            request.sampling_params.unwrap().stop_token_ids,
-            tokenizer.eos_token_ids()
-        );
-    }
-}
-
 /// Build a multimodal-carrying request (chat, messages) for a ZMQ backend: one
 /// dispatch over the closed [`ZmqDialect`], converting the assembled multimodal
 /// data to the dialect's proto and finishing through its SHM-cleanup wrapper.
@@ -655,4 +628,31 @@ fn mm_variant_mismatch(expected: &str, got: &MultimodalData) -> String {
         MultimodalData::TokenSpeed(_) => "TokenSpeed",
     };
     format!("multimodal data variant mismatch: {expected} ZMQ backend got {got} data")
+}
+
+#[cfg(test)]
+mod tests {
+    use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
+
+    use super::*;
+
+    #[test]
+    fn smg_vllm_eos_backstop_updates_portable_request() {
+        let mut request =
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                sampling_params: Some(tokenspeed_proto::SamplingParams::default()),
+                ..Default::default()
+            }));
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+        fold_smg_vllm_eos_backstop(&mut request, Some(&tokenizer));
+
+        let ProtoGenerateRequest::TokenSpeed(request) = request else {
+            panic!("expected TokenSpeed request");
+        };
+        assert_eq!(
+            request.sampling_params.unwrap().stop_token_ids,
+            tokenizer.eos_token_ids()
+        );
+    }
 }
