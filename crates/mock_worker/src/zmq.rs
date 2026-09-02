@@ -291,9 +291,7 @@ mod tests {
             gen_delay: Duration::ZERO,
             output_tokens: 4,
             realistic: false,
-            sim: false,
             engine: EngineParams::default(),
-            sim_params: crate::sim::SimParams::default(),
         }
     }
 
