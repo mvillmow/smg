@@ -46,11 +46,11 @@ fn parse_flag<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
     Some(
         value
             .parse()
-            .unwrap_or_else(|_| panic!("flag {flag} has an unparseable value: {value:?}")),
+            .unwrap_or_else(|_| panic!("flag {flag} has an unparsable value: {value:?}")),
     )
 }
 
-/// Unknown flags and unparseable values are startup errors, never
+/// Unknown flags and unparsable values are startup errors, never
 /// silent fallbacks to defaults (audit finding: a typo'd
 /// --bootstrap-from meant silently-cold restarts forever).
 fn validate_flags(args: &[String]) {
