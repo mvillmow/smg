@@ -1507,4 +1507,221 @@ mod tests {
         assert_eq!(stats.holders, 2);
         assert_eq!(scores(&engine, 40, 6).len(), 1);
     }
+
+    fn ks_with_block(block_size: u32) -> KeyspaceKey {
+        KeyspaceKey {
+            model: "m".into(),
+            symbol_kind: SymbolKind::Tokens,
+            block_size,
+        }
+    }
+
+    /// A degenerate `block_size == 0` keyspace is rejected, never minted —
+    /// on both the single `apply` and the `apply_batch` run-boundary path,
+    /// where the reject must also not mis-group a following valid update.
+    #[test]
+    fn zero_block_size_keyspace_is_rejected_not_minted() {
+        let engine = Engine::new(EngineConfig::default());
+        let bad = UpdateMsg {
+            keyspace: ks_with_block(0),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(1, 2)),
+            }],
+            added: None,
+            dropped: false,
+        };
+        let (outcome, _, _) = engine.apply(&bad);
+        assert_eq!(outcome, ApplyOutcome::KeyspaceMismatch);
+        assert!(
+            engine.space(&ks_with_block(0)).is_none(),
+            "no keyspace minted"
+        );
+
+        // apply_batch: [zero-size, valid, valid] — the zero one is rejected
+        // while the two valid updates still group and apply.
+        let v1 = placement("w2", 5, 3);
+        let v2 = placement("w3", 6, 3);
+        let out = engine.apply_batch(&[bad, v1, v2]);
+        assert_eq!(out[0].0, ApplyOutcome::KeyspaceMismatch);
+        assert_eq!(out[1].0, ApplyOutcome::Applied);
+        assert_eq!(out[2].0, ApplyOutcome::Applied);
+        assert_eq!(scores(&engine, 5, 3), vec![("w2".to_string(), 3)]);
+        assert_eq!(scores(&engine, 6, 3), vec![("w3".to_string(), 3)]);
+    }
+
+    /// A bare lifecycle re-announce (`AddedControl.capacity_blocks == 0`)
+    /// must NOT clobber a worker-declared capacity back to the default: if
+    /// it did, the `capacity * 2` runaway bound would collapse to 0 and the
+    /// next placement would truncate the holder to empty — silent cache loss.
+    #[test]
+    fn bare_readvertise_preserves_declared_capacity() {
+        let engine = Engine::new(EngineConfig::default());
+        let announce = |cap: u64| UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![],
+            added: Some(AddedControl {
+                capacity_blocks: cap,
+                event_fed: false,
+            }),
+            dropped: false,
+        };
+        engine.apply(&announce(100));
+        engine.apply(&placement("w1", 7, 60));
+        assert_eq!(scores(&engine, 7, 60), vec![("w1".to_string(), 60)]);
+
+        // Bare re-announce with capacity 0, then a placement that extends
+        // the chain (so it takes the store+truncate path, not the pure
+        // duplicate fast path). Capacity 0 clobbered -> bound 0 -> truncate
+        // to empty. Preserved (100) -> bound 200 -> full 61 retained.
+        engine.apply(&announce(0));
+        engine.apply(&placement("w1", 7, 61));
+        assert_eq!(
+            scores(&engine, 7, 61).first().map(|s| s.1),
+            Some(61),
+            "capacity must survive a zero re-announce (no truncation to empty)"
+        );
+    }
+
+    /// The digest fast path's prefix-contiguity soundness rests on a holder
+    /// with no mid-chain holes. A hole can only arrive via `Removed`, which
+    /// pins the holder as event-fed — and event-fed holders reject every
+    /// digest. So a digest can never falsely confirm a chain with a hole.
+    #[test]
+    fn event_fed_holder_with_a_hole_never_confirms_a_digest() {
+        let engine = Engine::new(EngineConfig::default());
+        let chain = placement_chain(&prefix_hashes(3, 3));
+        engine.apply(&event_batch(
+            "w1",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain.clone(),
+            }],
+        ));
+        // Remove the middle block -> holder is now event-fed with a hole.
+        engine.apply(&event_batch(
+            "w1",
+            2,
+            vec![WireEvent::Removed {
+                seq_hashes: vec![chain[1].seq_hash],
+            }],
+        ));
+        // A digest that would "confirm" tip at len 3 must MISS, not confirm.
+        let (outcome, _, _) = engine.apply(&digest("w1", 3, 3));
+        assert_eq!(
+            outcome,
+            ApplyOutcome::DigestMiss,
+            "an event-fed holder must never confirm a digest against a holed chain"
+        );
+    }
+
+    /// The split-placement fast path anchors the exclusive suffix store at a
+    /// plain-duplicate key found under the shared lock. A concurrent clear
+    /// can delete that anchor before the write lock — the fallback then
+    /// reconstructs the full chain from the original parent. This races the
+    /// two ops hard and asserts the holder is never left corrupted (the
+    /// "linearizable, never lossy" contract).
+    #[test]
+    fn placement_split_races_clear_without_corruption() {
+        use std::thread;
+        for seed in 0..8u32 {
+            let engine = Arc::new(Engine::new(EngineConfig::default()));
+            engine.apply(&placement("w1", seed, 256));
+
+            let extender = {
+                let e = Arc::clone(&engine);
+                thread::spawn(move || {
+                    // Extend the hot 256-prefix -> exercises the split path.
+                    for _ in 0..2000 {
+                        let _ = e.apply(&placement("w1", seed, 288));
+                    }
+                })
+            };
+            let clearer = {
+                let e = Arc::clone(&engine);
+                thread::spawn(move || {
+                    for _ in 0..2000 {
+                        let _ = e.apply(&event_batch("w1", 0, vec![WireEvent::Cleared]));
+                        let _ = e.apply(&placement("w1", seed, 256));
+                    }
+                })
+            };
+            // A panic in either thread (e.g. a corrupt chain) fails the test.
+            extender.join().unwrap();
+            clearer.join().unwrap();
+
+            // Settle: a full placement must land the whole chain — proof the
+            // race never wedged the holder into a suffix-only orphan state.
+            engine.apply(&event_batch("w1", 0, vec![WireEvent::Cleared]));
+            engine.apply(&placement("w1", seed, 288));
+            assert_eq!(
+                scores(&engine, seed, 288).first().map(|s| s.1),
+                Some(288),
+                "after racing split vs clear, a settling full placement must reconstruct the chain"
+            );
+        }
+    }
+
+    /// Keyspace GC unlinks an emptied keyspace only when nothing else holds
+    /// its `Arc` (strong_count guard). This races `sweep_idle` (retiring a
+    /// dropped holder and GC-ing the keyspace) against placements that
+    /// re-create holders in the same keyspace, and asserts no panic/deadlock
+    /// and that a placement issued after the race stays queryable — the
+    /// keyspace was never orphaned out from under a concurrent apply.
+    #[test]
+    fn keyspace_gc_races_placement_without_orphaning() {
+        use std::thread;
+        for seed in 0..8u32 {
+            let engine = Arc::new(Engine::new(EngineConfig {
+                inferred_ttl: Duration::ZERO,
+                ..Default::default()
+            }));
+            // A dropped holder the sweep will retire, emptying the keyspace.
+            engine.apply(&placement("seed", seed, 4));
+            engine.apply(&UpdateMsg {
+                keyspace: keyspace(),
+                holder: "seed".into(),
+                epoch: 1,
+                seq: 0,
+                events: vec![],
+                added: None,
+                dropped: true,
+            });
+
+            let sweeper = {
+                let e = Arc::clone(&engine);
+                thread::spawn(move || {
+                    for _ in 0..3000 {
+                        e.sweep_idle();
+                    }
+                })
+            };
+            let placer = {
+                let e = Arc::clone(&engine);
+                thread::spawn(move || {
+                    for _ in 0..3000 {
+                        let _ = e.apply(&placement("live", seed, 4));
+                    }
+                })
+            };
+            sweeper.join().unwrap();
+            placer.join().unwrap();
+
+            // A fresh placement (no sweep between apply and query) must be
+            // visible: if GC had orphaned the keyspace under a concurrent
+            // apply, the map lookup here would miss it.
+            engine.apply(&placement("final", seed, 4));
+            assert!(
+                scores(&engine, seed, 4).iter().any(|(h, _)| h == "final"),
+                "a placement after the GC race must be queryable (keyspace not orphaned)"
+            );
+        }
+    }
 }
