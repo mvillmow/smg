@@ -1,6 +1,6 @@
-//! The chain-native core (R3-DESIGN.md): chains as contiguous
-//! data, canonical maximal-run membership spans, one entry probe per
-//! query. Same §4 API and §6/§7 contract as the flat core; the
+//! The chain-native core: chains as contiguous data, canonical
+//! maximal-run membership spans, one entry probe per query. Same §4
+//! API and §6/§7 contract (see `SPEC.md`) as the flat core; the
 //! differential referee proves equality.
 
 use rustc_hash::FxHashMap;

@@ -31,8 +31,7 @@ tree.enumerate(w);                                 // (pos, key, content) for sn
 ```
 
 Contract details (matching semantics, convergence scope, alias
-rules): [`SPEC.md`](SPEC.md). Layout rationale:
-[`R3-DESIGN.md`](R3-DESIGN.md).
+rules): [`SPEC.md`](SPEC.md).
 
 ## Structure
 
@@ -51,8 +50,7 @@ cores equal the reference model on every run.
 
 ## Verification
 
-The crate was built harness-first (see
-[`VERIFICATION.md`](VERIFICATION.md) for the campaign record):
+The crate was built harness-first:
 
 - `tests/differential.rs` — both cores vs a representationally
   complete reference model AND the production `kv_index` oracle
