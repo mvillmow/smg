@@ -266,6 +266,35 @@ impl RequestPipeline {
             .await;
     }
 
+    /// Dispatch-time placement for endpoints whose success path exits
+    /// through a stage-produced (streaming) response: the selected
+    /// worker is prefilling this prompt NOW, so publish the
+    /// routing-time prompt chain. The generated tail lands one turn
+    /// later inside the follow-up prompt's chain. (Before this,
+    /// streaming and chat traffic queried the index but never fed it,
+    /// so cache-aware routing was blind to the dominant traffic
+    /// shape — only non-streaming generate published.)
+    fn publish_dispatch_placement(
+        &self,
+        prediction: Option<&remote_index::IndexPrediction>,
+        workers: Option<&WorkerSelection>,
+    ) {
+        let Some(prediction) = prediction else {
+            return;
+        };
+        if let (Some(handle), Some(WorkerSelection::Single { worker })) =
+            (self.remote_index.as_ref(), workers)
+        {
+            handle.client().publish_placement(
+                &prediction.model,
+                prediction.block_size as u32,
+                worker.url(),
+                &prediction.content_hashes,
+            );
+            Metrics::record_remote_index_publish();
+        }
+    }
+
     fn no_response_produced(
         &self,
         function: &'static str,
@@ -504,6 +533,10 @@ impl RequestPipeline {
                         metrics_labels::ENDPOINT_CHAT,
                         start.elapsed(),
                     );
+                    self.publish_dispatch_placement(
+                        ctx.state.index_prediction.as_ref(),
+                        ctx.state.workers.as_ref(),
+                    );
                     return response;
                 }
                 Ok(None) => continue,
@@ -542,6 +575,10 @@ impl RequestPipeline {
                     &model,
                     metrics_labels::ENDPOINT_CHAT,
                     start.elapsed(),
+                );
+                self.publish_dispatch_placement(
+                    ctx.state.index_prediction.as_ref(),
+                    ctx.state.workers.as_ref(),
                 );
                 axum::Json(response).into_response()
             }
@@ -601,6 +638,10 @@ impl RequestPipeline {
                         &model_id,
                         metrics_labels::ENDPOINT_GENERATE,
                         start.elapsed(),
+                    );
+                    self.publish_dispatch_placement(
+                        ctx.state.index_prediction.as_ref(),
+                        ctx.state.workers.as_ref(),
                     );
                     return response;
                 }
@@ -756,6 +797,10 @@ impl RequestPipeline {
                         metrics_labels::ENDPOINT_COMPLETIONS,
                         start.elapsed(),
                     );
+                    self.publish_dispatch_placement(
+                        ctx.state.index_prediction.as_ref(),
+                        ctx.state.workers.as_ref(),
+                    );
                     return response;
                 }
                 Ok(None) => continue,
@@ -794,6 +839,10 @@ impl RequestPipeline {
                     &model,
                     metrics_labels::ENDPOINT_COMPLETIONS,
                     start.elapsed(),
+                );
+                self.publish_dispatch_placement(
+                    ctx.state.index_prediction.as_ref(),
+                    ctx.state.workers.as_ref(),
                 );
                 axum::Json(response).into_response()
             }
@@ -1061,6 +1110,10 @@ impl RequestPipeline {
                         metrics_labels::ENDPOINT_MESSAGES,
                         start.elapsed(),
                     );
+                    self.publish_dispatch_placement(
+                        ctx.state.index_prediction.as_ref(),
+                        ctx.state.workers.as_ref(),
+                    );
                     return response;
                 }
                 Ok(None) => continue,
@@ -1098,6 +1151,10 @@ impl RequestPipeline {
                     &model,
                     metrics_labels::ENDPOINT_MESSAGES,
                     start.elapsed(),
+                );
+                self.publish_dispatch_placement(
+                    ctx.state.index_prediction.as_ref(),
+                    ctx.state.workers.as_ref(),
                 );
                 axum::Json(response).into_response()
             }

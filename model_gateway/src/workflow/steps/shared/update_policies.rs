@@ -166,6 +166,19 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                 }
             }
 
+            // With a remote index, a (re)registering worker may sit under a
+            // standing soft-retire from a previous same-URL life; announce
+            // it so scoring resumes immediately instead of waiting for its
+            // first event batch.
+            if cache_aware {
+                if let Some(ref handle) = app_context.remote_index {
+                    handle
+                        .client()
+                        .publish_added(&model_id, handle.block_size() as u32, worker.url())
+                        .await;
+                }
+            }
+
             Self::warn_on_cache_aware_without_kv_events(&model_id, worker, cache_aware);
 
             if !updated_models.contains(&model_id) {
