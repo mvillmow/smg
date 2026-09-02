@@ -42,6 +42,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MOCK_BASE_PORT = 9000
 SMG_BASE_PORT = 30000
 PROM_BASE_PORT = 39000
+INDEX_BASE_PORT = 40000
+INDEX_METRICS_BASE = 40100
 
 # Cache-aware decision branches are DEBUG logs only (no branch metric), scoped
 # so the rest of the gateway stays at warn.
@@ -242,7 +244,9 @@ def ensure_local_tokenizer():
 
 
 def build_binaries(target_dir, build_gateway):
-    packages = ["mock-worker", "sim-loadgen"] + (["smg"] if build_gateway else [])
+    packages = ["mock-worker", "sim-loadgen", "radix-index"] + (
+        ["smg"] if build_gateway else []
+    )
     cmd = ["cargo", "build", "--release"]
     for pkg in packages:
         cmd += ["-p", pkg]
@@ -289,6 +293,57 @@ def launch_mocks(profile, logs_dir, mock_bin):
         wait_tcp(MOCK_BASE_PORT, 30, "mock fleet")
     else:
         wait_health("http://127.0.0.1:%d/health" % MOCK_BASE_PORT, 30, "mock fleet")
+    return children
+
+
+def launch_index_service(profile, logs_dir, index_bin, bridge_bin):
+    """Optional radix index service (+ event bridge) from the profile's
+    `index_service` block, e.g.
+      {"replicas": 2, "bridge": true, "inferred_ttl_secs": 18,
+       "sweep_interval_secs": 1, "default_capacity_blocks": N}
+    Replicas relay to each other; the bridge (when enabled) subscribes to
+    every gRPC worker and publishes to replica 0. Fault-injection
+    (partition proxies) is intentionally not ported here."""
+    cfg = profile.get("index_service")
+    if not cfg:
+        return []
+    env = dict(os.environ)
+    env["RUST_LOG"] = "info"
+    replicas = int(cfg.get("replicas", 1))
+    urls = ["http://127.0.0.1:%d" % (INDEX_BASE_PORT + i) for i in range(replicas)]
+    children = []
+    for i in range(replicas):
+        cmd = [str(index_bin), "--port", str(INDEX_BASE_PORT + i),
+               "--metrics-port", str(INDEX_METRICS_BASE + i)]
+        peers = ",".join(u for j, u in enumerate(urls) if j != i)
+        if peers:
+            cmd += ["--peers", peers]
+        for key in ("inferred_ttl_secs", "default_capacity_blocks",
+                    "sweep_interval_secs", "event_ttl_secs"):
+            if key in cfg:
+                cmd += ["--" + key.replace("_", "-"), str(cfg[key])]
+        children.append(spawn("index-%d" % i, cmd, logs_dir / ("index-%d.log" % i), env=env))
+    for i in range(replicas):
+        wait_tcp(INDEX_BASE_PORT + i, 30, "index-%d" % i)
+    bridged = 0
+    if cfg.get("bridge", True):
+        total = int(profile["workers_total"])
+        grpc = profile.get("worker_mode", "http") == "grpc"
+        grpc_workers = (
+            ["grpc://127.0.0.1:%d" % port
+             for port in range(MOCK_BASE_PORT, MOCK_BASE_PORT + total)]
+            if grpc else []
+        )
+        if grpc_workers:
+            cmd = [str(bridge_bin), "--workers", ",".join(grpc_workers),
+                   "--index", urls[0],
+                   "--model", profile.get("model_id", "mock-model"),
+                   "--block-size",
+                   str(profile.get("mock", {}).get("block_size", 128))]
+            children.append(spawn("bridge", cmd, logs_dir / "bridge.log", env=env))
+            bridged = len(grpc_workers)
+    log("index service: %d replicas on ports %d.. (bridging %d grpc workers)"
+        % (replicas, INDEX_BASE_PORT, bridged))
     return children
 
 
@@ -539,6 +594,8 @@ def analyze_requests(path, workers_total):
     per_turn_worker = {}
     turn_stats = {}
     session_turn_worker = {}
+    index_sources = Counter()
+    prediction_errors = []
     if not path.exists():
         return {"error": "requests.jsonl missing"}
     with open(path, errors="replace") as f:
@@ -569,6 +626,12 @@ def analyze_requests(path, workers_total):
                 session = rec.get("session")
                 if session is not None:
                     session_turn_worker.setdefault(session, {})[turn] = port
+            src = rec.get("index_source")
+            if src:
+                index_sources[src] += 1
+                pred = rec.get("index_predicted_tokens")
+                if pred is not None and cached is not None:
+                    prediction_errors.append(int(pred) - int(cached))
     both = [s for s in session_turn_worker.values() if 1 in s and 2 in s]
     same = sum(1 for s in both if s[1] == s[2])
     turns = {}
@@ -587,6 +650,13 @@ def analyze_requests(path, workers_total):
         "turns": turns,
         "t2_sessions": len(both),
         "t2_same_worker_rate": round(same / len(both), 4) if both else None,
+        "index_sources": dict(index_sources),
+        "index_prediction_error_tokens": {
+            "mean": round(statistics.fmean(prediction_errors), 2),
+            "p95_abs": sorted(abs(e) for e in prediction_errors)[
+                int(0.95 * (len(prediction_errors) - 1))
+            ],
+        } if prediction_errors else None,
     }
 
 
@@ -913,6 +983,8 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
     smg_bin = Path(smg_bin) if smg_bin else target_dir / "release" / "smg"
     mock_bin = target_dir / "release" / "mock-worker"
     loadgen_bin = target_dir / "release" / "sim-loadgen"
+    index_bin = target_dir / "release" / "radix-index-service"
+    bridge_bin = target_dir / "release" / "radix-index-bridge"
     for path in (smg_bin, mock_bin, loadgen_bin):
         if not os.access(str(path), os.X_OK):
             raise SystemExit("binary missing: %s (drop --skip-build?)" % path)
@@ -940,6 +1012,8 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
             "smg": _sha256(smg_bin),
             "mock-worker": _sha256(mock_bin),
             "sim-loadgen": _sha256(loadgen_bin),
+            "radix-index-service": _sha256(index_bin) if index_bin.exists() else None,
+            "radix-index-bridge": _sha256(bridge_bin) if bridge_bin.exists() else None,
         },
         "profile_sha256": hashlib.sha256(
             json.dumps(profile, sort_keys=True).encode()
@@ -951,6 +1025,7 @@ def run_profile(profile, run_dir, smg_bin=None, skip_build=False):
     sampler = None
     try:
         children += launch_mocks(profile, logs_dir, mock_bin)
+        children += launch_index_service(profile, logs_dir, index_bin, bridge_bin)
         children += launch_smgs(profile, logs_dir, smg_bin)
         meta["registered"] = register_workers(profile)
         meta["ready"] = wait_ready(profile)

@@ -104,6 +104,11 @@ pub struct Args {
     pub routing_key_reuse: f64,
     /// Shared warm prefix length; 0 = per-session unique prefix (cold).
     pub system_prefix_tokens: u32,
+    /// Number of distinct shared system prefixes ("agents"): each session
+    /// picks one, so the population reuses `system_prefix_pool` large
+    /// prefixes. 1 = a single global shared prefix (byte-identical to the
+    /// pre-pool behavior).
+    pub system_prefix_pool: u32,
     /// Images per session.
     pub image_count: u32,
     /// Base64 characters per image payload.
@@ -159,6 +164,7 @@ impl Args {
             turn2_ingress: Turn2Ingress::Same,
             routing_key_reuse: 0.0,
             system_prefix_tokens: 2048,
+            system_prefix_pool: 1,
             image_count: 1,
             image_bytes: 620_000,
             image_placeholder_id: 151_655,
@@ -230,6 +236,9 @@ impl Args {
                 }
                 "--system-prefix-tokens" => {
                     cfg.system_prefix_tokens = parse(value(&mut args, &flag)?, &flag)?;
+                }
+                "--system-prefix-pool" => {
+                    cfg.system_prefix_pool = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--image-count" => cfg.image_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--image-bytes" => cfg.image_bytes = parse(value(&mut args, &flag)?, &flag)?,

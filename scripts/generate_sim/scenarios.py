@@ -616,6 +616,71 @@ SCENARIOS = {
 }
 
 
+# Gateway scale-out sweep: the DB thesis. Sessions spray across gateways
+# (ingress + turn2 random), so a follow-up frequently lands on a gateway
+# that did NOT route turn 1. Compare per-gateway LOCAL event indexers
+# vs one SHARED remote index (placement-only feed, bridge off) as the
+# gateway count grows. cache-hit row: "AGG cached (request mean)".
+# local-event converges per gateway (full worker view) so it should hold
+# roughly flat; the question is whether the eventless shared DB MATCHES
+# it as gateways scale — and, once Mode 1 lands, the string case where
+# per-gateway state genuinely fragments.
+def _scaleout_legs(counts=(1, 2, 4, 8)):
+    """Scale-out sweep: four index regimes x gateway count. Sessions spray
+    across gateways (ingress + turn2 random), so a follow-up often lands on
+    a gateway that did not route turn 1 — the shared state's value shows
+    there. Cache-hit rows: "AGG cached (request mean)", "followup cached
+    (request mean)", "followup same-worker"; validity rows: "index
+    remote_hit share" (must be populated on the remote legs)."""
+    spray = {"loadgen.ingress": "random", "loadgen.turn2_ingress": "random"}
+    idx_flags = {
+        "--kv-indexer-url": "http://127.0.0.1:40000",
+        "--kv-indexer-block-size": "256",
+    }
+    db = lambda bridge: {
+        "replicas": 1, "bridge": bridge, "inferred_ttl_secs": 18,
+        "sweep_interval_secs": 1, "default_capacity_blocks": 4688,
+    }
+    legs = []
+    for count in counts:
+        # per-gateway event indexers: each gateway sees ALL worker events
+        # (full view, N x fan-in) — the well-informed local upper reference.
+        legs.append(("local-event-smg%d" % count, {
+            **KV_EVENT_OVERRIDES, "smg_count": count, **spray,
+            "smg_flag_overrides": {**RADIX_TREE_FLAGS, "--enable-igw": None,
+                                   **COMPRESSED_CLOCK_FLAGS},
+        }, None))
+        # shared DB fed by the event bridge — the real "DB replaces
+        # per-gateway indexing" leg (shared view, no per-gateway fan-in).
+        legs.append(("remote-event-smg%d" % count, {
+            **KV_EVENT_OVERRIDES, "smg_count": count, **spray,
+            "index_service": db(True),
+            "smg_flag_overrides": {**RADIX_TREE_FLAGS, "--enable-igw": None,
+                                   **COMPRESSED_CLOCK_FLAGS, **idx_flags},
+        }, None))
+        # shared DB fed ONLY by gateway placements (eventless engine).
+        legs.append(("remote-placement-smg%d" % count, {
+            **KV_EVENT_OVERRIDES, "smg_count": count, **spray,
+            "index_service": db(False),
+            "smg_flag_overrides": {**RADIX_TREE_FLAGS, "--enable-igw": None,
+                                   **COMPRESSED_CLOCK_FLAGS, **idx_flags},
+        }, None))
+        # fragmenting floor: HTTP workers, per-gateway tree, no events, no
+        # shared DB — a gateway knows only what it itself routed.
+        legs.append(("local-nosharing-smg%d" % count, {
+            "smg_count": count, **spray, "loadgen.image_count": 0,
+            "smg_flag_overrides": {**RADIX_TREE_FLAGS, **COMPRESSED_CLOCK_FLAGS},
+        }, None))
+    return legs
+
+
+SCENARIOS["gw-scaleout"] = _scaleout_legs()
+# One short remote leg to VALIDATE the port: DB launches, bridge feeds it,
+# and index_sources populates (run with --override duration_secs=30).
+SCENARIOS["idx-smoke"] = [_scaleout_legs(counts=(1,))[1]]  # remote-event-smg1
+
+
+
 def _get(mapping, *keys):
     node = mapping
     for key in keys:

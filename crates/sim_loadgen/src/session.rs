@@ -95,7 +95,18 @@ pub async fn run(ctx: Arc<Ctx>, sid: u64) {
     // Warm runs share one prefix stream; cold runs give each session its own,
     // so no cross-session prefix ever matches.
     let prefix_seed = if args.system_prefix_tokens > 0 {
-        dist::sub_seed(args.seed, dist::SALT_PREFIX)
+        // A population of shared system prompts ("agents"): each session
+        // picks one of `system_prefix_pool`, so a small set of large
+        // prefixes is reused across many sessions — the agentic/chat
+        // sharing shape. pool <= 1 keeps the single-global-prefix
+        // behavior byte-identical.
+        let base = dist::sub_seed(args.seed, dist::SALT_PREFIX);
+        if args.system_prefix_pool > 1 {
+            let agent = session_seed % args.system_prefix_pool as u64;
+            dist::sub_seed(base, agent)
+        } else {
+            base
+        }
     } else {
         dist::sub_seed(session_seed, dist::SALT_PREFIX)
     };
@@ -251,8 +262,22 @@ async fn send_turn(ctx: &Ctx, req: &TurnRequest<'_>) -> Option<Vec<u32>> {
     let mut status: u16 = 0;
     let mut ttft_ms: Option<f64> = None;
     let mut response: Option<Value> = None;
+    let mut index_source: Option<String> = None;
+    let mut index_predicted_tokens: Option<u64> = None;
     if let Ok(resp) = request.body(body).send().await {
         status = resp.status().as_u16();
+        // Remote-index echo headers (absent unless the gateway runs with
+        // --kv-indexer-url); captured before the body consumes `resp`.
+        index_source = resp
+            .headers()
+            .get("x-smg-index-source")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        index_predicted_tokens = resp
+            .headers()
+            .get("x-smg-index-predicted-tokens")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
         if resp.status().is_success() {
             if args.stream {
                 match consume_sse(resp, started).await {
@@ -333,6 +358,8 @@ async fn send_turn(ctx: &Ctx, req: &TurnRequest<'_>) -> Option<Vec<u32>> {
         e2e_ms,
         status,
         start_ms,
+        index_source,
+        index_predicted_tokens,
     };
     // A send error means the collector is gone (shutdown); nothing to do.
     let _ = ctx.records.send(record);
