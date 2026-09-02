@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use futures::{stream, Stream, StreamExt as _};
+use futures::{stream, Stream};
 use smg_grpc_client::{common_proto as common, tokenspeed_scheduler::tokenspeed_proto as ts};
 use tokio::sync::mpsc;
 use tonic::{transport::Server, Request, Response, Status};
@@ -19,7 +19,6 @@ use ts::{
 use crate::{
     config::Config,
     engine::{self, Engine, NewRequest},
-    sim::{SimKvEvent, SimWorker},
 };
 
 /// Serve the mock TokenSpeed gRPC service on `port` until the process exits.
@@ -34,11 +33,7 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
     let addr = SocketAddr::new(ip, port);
     // One simulated engine per listener (i.e. per virtual worker).
     let engine = cfg.realistic.then(|| Engine::spawn(cfg.engine.clone()));
-    // Sim engine with KV-event emission on: gRPC subscribers exist.
-    let sim = cfg
-        .sim
-        .then(|| SimWorker::new_with_events(cfg.sim_params.clone(), port));
-    let service = MockScheduler { cfg, engine, sim };
+    let service = MockScheduler { cfg, engine };
     if let Err(e) = Server::builder()
         .add_service(TokenSpeedSchedulerServer::new(service))
         .serve(addr)
@@ -53,8 +48,6 @@ struct MockScheduler {
     cfg: Arc<Config>,
     /// Present iff the worker runs the realistic engine simulator.
     engine: Option<Engine>,
-    /// Present iff the worker runs the scale-sim engine (`--engine sim`).
-    sim: Option<Arc<SimWorker>>,
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
@@ -72,84 +65,6 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        // Sim mode: analytic timeline — one sleep to first token, one to
-        // completion — mirroring the HTTP sim handler. The gateway
-        // tokenizes upstream, so the request carries token ids and never
-        // image payloads; the effective sequence is the ids as sent. The
-        // timeline is driven by the response stream itself, so a dropped
-        // stream (gateway abort) cancels mid-sleep and the admission guard
-        // releases immediately.
-        if let Some(sim) = &self.sim {
-            let sim = Arc::clone(sim);
-            let req = request.into_inner();
-            let request_id = req.request_id;
-            let input_ids = req.tokenized.map(|t| t.input_ids).unwrap_or_default();
-            let max_new = req
-                .sampling_params
-                .and_then(|s| s.max_new_tokens)
-                .unwrap_or(self.cfg.output_tokens);
-            let init = SimGen::Admit {
-                sim,
-                request_id,
-                input_ids,
-                max_new,
-            };
-            let stream = stream::unfold(init, |state| async move {
-                match state {
-                    SimGen::Admit {
-                        sim,
-                        request_id,
-                        input_ids,
-                        max_new,
-                    } => {
-                        let mut adm = sim.admit(input_ids, max_new).await;
-                        tokio::time::sleep(adm.ttft).await;
-                        adm.finish_prefill();
-                        let first = ts::GenerateResponse {
-                            request_id: request_id.clone(),
-                            response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
-                                token_ids: adm.output_ids.first().copied().into_iter().collect(),
-                                prompt_tokens: adm.prompt_tokens as u32,
-                                completion_tokens: 1,
-                                cached_tokens: adm.cached_tokens as u32,
-                                output_logprobs: None,
-                                index: 0,
-                            })),
-                        };
-                        let next = SimGen::Decode {
-                            request_id,
-                            max_new,
-                            adm: Box::new(adm),
-                        };
-                        Some((Ok(first), next))
-                    }
-                    SimGen::Decode {
-                        request_id,
-                        max_new,
-                        mut adm,
-                    } => {
-                        tokio::time::sleep(adm.decode).await;
-                        let done = ts::GenerateResponse {
-                            request_id,
-                            response: Some(GenResp::Complete(ts::GenerateComplete {
-                                output_ids: std::mem::take(&mut adm.output_ids),
-                                finish_reason: "stop".to_string(),
-                                prompt_tokens: adm.prompt_tokens as u32,
-                                completion_tokens: max_new,
-                                cached_tokens: adm.cached_tokens as u32,
-                                output_logprobs: None,
-                                matched_stop: None,
-                                index: 0,
-                            })),
-                        };
-                        Some((Ok(done), SimGen::Done))
-                    }
-                    SimGen::Done => None,
-                }
-            });
-            return Ok(Response::new(Box::pin(stream)));
-        }
-
         // Realistic mode: submit to the engine simulator and stream its output.
         if let Some(engine) = &self.engine {
             let req = request.into_inner();
@@ -278,10 +193,9 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::GetLoadsRequest>,
     ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        let load = match (&self.sim, &self.engine) {
-            (Some(sim), _) => sim_to_scheduler_load(&sim.load()),
-            (None, Some(engine)) => snapshot_to_scheduler_load(&engine.load()),
-            (None, None) => ts::SchedulerLoad {
+        let load = match &self.engine {
+            Some(engine) => snapshot_to_scheduler_load(&engine.load()),
+            None => ts::SchedulerLoad {
                 dp_rank: 0,
                 num_running_reqs: 0,
                 num_waiting_reqs: 0,
@@ -311,32 +225,6 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        // Sim mode: replay the ring past the cursor, then the live stream.
-        if let Some(sim) = &self.sim {
-            let start = request.into_inner().start_sequence_number;
-            let Some((replay, live)) = sim.subscribe_kv_events(start) else {
-                return Err(Status::unimplemented("mock-worker (sim KV events off)"));
-            };
-            let block_size = sim.block_size() as i32;
-            let replayed = stream::iter(
-                replay
-                    .into_iter()
-                    .map(move |b| Ok::<_, Status>(sim_batch_to_proto(&b, block_size))),
-            );
-            // A lagged receiver skips ahead; the gateway sees the sequence
-            // gap and reconnects with its cursor, replaying from the ring.
-            let live = stream::unfold(live, move |mut rx| async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(batch) => return Some((Ok(sim_batch_to_proto(&batch, block_size)), rx)),
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-                    }
-                }
-            });
-            return Ok(Response::new(Box::pin(replayed.chain(live))));
-        }
-
         match &self.engine {
             // Realistic mode with prefix caching: stream the engine's KV events.
             Some(engine) if engine.kv_enabled() => {
@@ -446,89 +334,6 @@ fn generate_stream(
             }
         },
     ))
-}
-
-/// Sim generate timeline as stream states: admission + prefill sleep yields
-/// the first chunk; the decode sleep yields the completion. Dropping the
-/// stream mid-state drops the admission guard immediately.
-enum SimGen {
-    Admit {
-        sim: Arc<SimWorker>,
-        request_id: String,
-        input_ids: Vec<u32>,
-        max_new: u32,
-    },
-    Decode {
-        request_id: String,
-        max_new: u32,
-        adm: Box<crate::sim::Admitted>,
-    },
-    Done,
-}
-
-/// Map one sim KV batch to the wire type. The sim's chained block hash is
-/// the wire `block_hash` (parent/removal key); token ids are what the
-/// gateway hashes for matching.
-fn sim_batch_to_proto(batch: &crate::sim::SimKvBatch, block_size: i32) -> common::KvEventBatch {
-    let events = batch
-        .events
-        .iter()
-        .map(|event| {
-            let data = match event {
-                SimKvEvent::Stored { parent, blocks } => {
-                    common::kv_cache_event::Data::Stored(common::KvBlocksStored {
-                        blocks: blocks
-                            .iter()
-                            .map(|b| common::KvBlock {
-                                block_hash: b.hash as i64,
-                                token_ids: b.token_ids.clone(),
-                                block_size,
-                                lora_id: None,
-                                cache_level: None,
-                            })
-                            .collect(),
-                        parent_block_hash: parent.map(|h| h as i64),
-                    })
-                }
-                SimKvEvent::Removed { hashes } => {
-                    common::kv_cache_event::Data::Removed(common::KvBlocksRemoved {
-                        block_hashes: hashes.iter().map(|&h| h as i64).collect(),
-                        cache_level: None,
-                    })
-                }
-            };
-            common::KvCacheEvent {
-                event_id: batch.seq,
-                data: Some(data),
-            }
-        })
-        .collect();
-    common::KvEventBatch {
-        sequence_number: batch.seq,
-        timestamp: 0.0,
-        events,
-        dp_rank: None,
-    }
-}
-
-/// Map a sim load view to the TokenSpeed `SchedulerLoad` wire type.
-fn sim_to_scheduler_load(s: &crate::sim::SimLoad) -> ts::SchedulerLoad {
-    ts::SchedulerLoad {
-        dp_rank: 0,
-        num_running_reqs: s.num_running_reqs as i32,
-        num_waiting_reqs: s.num_waiting_reqs as i32,
-        num_waiting_uncached_tokens: s.num_waiting_uncached_tokens as i32,
-        num_total_reqs: (s.num_running_reqs + s.num_waiting_reqs) as i32,
-        num_used_tokens: s.num_used_tokens as i32,
-        max_total_num_tokens: s.max_total_num_tokens as i32,
-        max_running_requests: s.max_running_requests as i32,
-        token_usage: s.token_usage,
-        gen_throughput: s.gen_throughput,
-        cache_hit_rate: s.cache_hit_rate,
-        utilization: s.token_usage,
-        memory: None,
-        queues: None,
-    }
 }
 
 /// Map an engine load snapshot to the TokenSpeed `SchedulerLoad` wire type.

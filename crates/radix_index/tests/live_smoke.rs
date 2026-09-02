@@ -38,15 +38,12 @@ async fn worker_events_reach_the_index_over_the_wire() {
         tokenizer_path: MODEL.to_string(),
         gen_delay: Duration::ZERO,
         output_tokens: 4,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-        sim: true,
-        sim_params: mock_worker::sim::SimParams {
-            block_size: BLOCK as usize,
-            itl_ms: 1.0,
-            ttft_base_ms: 1.0,
+        realistic: true,
+        engine: mock_worker::engine::EngineParams {
+            block_size: BLOCK,
             prefill_tps: 1_000_000.0,
-            ..mock_worker::sim::SimParams::default()
+            prefix_cache: true,
+            ..mock_worker::engine::EngineParams::default()
         },
     });
     tokio::spawn(mock_worker::grpc::serve(
