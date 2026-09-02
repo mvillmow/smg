@@ -122,21 +122,22 @@ impl PipelineStage for WorkerSelectionStage {
 
         let model_id = ctx.input.model_id.as_str();
 
-        // Remote-index prefetch (--kv-indexer-url, Regular mode only): the
-        // policy layer owns the overlap query so every router gets it from
-        // one call. It returns `None` (plain select) whenever the index
-        // could not matter — flag off, non-cache_aware policy, no tokens,
-        // no hashes, or a sticky override key that will win anyway.
+        // Remote-index prefetch (--kv-indexer-url): the policy layer owns
+        // the overlap query so every routing mode shares one call. It
+        // returns `None` (plain select) whenever the index could not
+        // matter — flag off, non-cache_aware policy, no tokens, no hashes,
+        // or a sticky override key that will win anyway. The overlap steers
+        // the leg that holds the prompt prefix — the sole worker in Regular
+        // mode, the PREFILL worker in disaggregated PD/EPD (decode and
+        // encode never hold the prompt KV).
         let mut remote_overlap: Option<crate::policies::RemoteOverlap> = None;
-        if matches!(self.mode, WorkerSelectionMode::Regular) {
-            if let Some((overlap, prediction)) = self
-                .policy_registry
-                .resolve_remote_overlap(model_id, tokens, headers, rid_key)
-                .await
-            {
-                remote_overlap = Some(overlap);
-                ctx.state.index_prediction = Some(prediction);
-            }
+        if let Some((overlap, prediction)) = self
+            .policy_registry
+            .resolve_remote_overlap(model_id, tokens, headers, rid_key)
+            .await
+        {
+            remote_overlap = Some(overlap);
+            ctx.state.index_prediction = Some(prediction);
         }
 
         let workers = match self.mode {
@@ -157,7 +158,15 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(model_id, text, tokens, headers, rid_key, None) {
+                match self.select_pd_pair(
+                    model_id,
+                    text,
+                    tokens,
+                    headers,
+                    rid_key,
+                    None,
+                    remote_overlap.as_ref(),
+                ) {
                     Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
@@ -195,6 +204,7 @@ impl PipelineStage for WorkerSelectionStage {
                     headers,
                     rid_key,
                     &encode_item_hashes,
+                    remote_overlap.as_ref(),
                 ) {
                     Some((encode_assignments, prefill, decode, runtime_type)) => {
                         WorkerSelection::Disaggregated {
@@ -285,7 +295,10 @@ impl WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
-                match self.select_pd_pair(model_id, text, tokens, headers, rid_key, wire) {
+                // Retry re-selection does not re-query the index (the prompt
+                // is unchanged; the query already ran on the first attempt),
+                // so the prefill leg falls back to the plain policy here.
+                match self.select_pd_pair(model_id, text, tokens, headers, rid_key, wire, None) {
                     Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
@@ -487,6 +500,10 @@ impl WorkerSelectionStage {
             .collect()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "retry wire pinning and the remote-overlap prefetch are both per-call inputs"
+    )]
     fn select_pd_pair(
         &self,
         model_id: &str,
@@ -495,6 +512,7 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
         wire: Option<WireConstraint>,
+        remote_overlap: Option<&crate::policies::RemoteOverlap>,
     ) -> Option<PdWorkerPair> {
         // Both legs derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
@@ -579,6 +597,9 @@ impl WorkerSelectionStage {
 
         // Prefill and decode are separate pools; tag each leg so the routing-key
         // override keys its sticky map per leg (a key sticks independently).
+        // The prefill worker holds the prompt-prefix KV, so the remote
+        // overlap steers this leg (via `select_worker_with_remote`); decode
+        // never holds the prompt prefix, so it stays on the plain policy.
         let mut info = SelectWorkerInfo {
             request_text: text,
             tokens,
@@ -588,9 +609,12 @@ impl WorkerSelectionStage {
             hash_ring,
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
+        let prefill_idx = self.policy_registry.select_worker_with_remote(
+            &prefill_policy,
+            &available_prefill,
+            &info,
+            remote_overlap,
+        )?;
         info.leg = WorkerLeg::Decode;
         let decode_idx =
             self.policy_registry
@@ -629,6 +653,10 @@ impl WorkerSelectionStage {
     /// encode worker. prefill+decode are selected as a normal PD pair. All pools
     /// are filtered to a runtime shared by the selected encode/prefill/decode
     /// legs.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encode item hashes and the remote-overlap prefetch are both per-call inputs"
+    )]
     fn select_encode_prefill_decode_workers(
         &self,
         model_id: &str,
@@ -637,6 +665,7 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
+        remote_overlap: Option<&crate::policies::RemoteOverlap>,
     ) -> Option<EncodePrefillDecodeWorkerSelection> {
         // All three legs derive from ONE membership snapshot (see
         // select_pd_pair). The pools are strictly gRPC — encode dispatch is
@@ -737,6 +766,9 @@ impl WorkerSelectionStage {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
+        // As in `select_pd_pair`, only the prefill leg holds the prompt
+        // prefix, so the remote overlap steers prefill; encode (keyed by
+        // media-content hash) and decode stay on their plain policies.
         let mut info = SelectWorkerInfo {
             request_text: text,
             tokens,
@@ -746,9 +778,12 @@ impl WorkerSelectionStage {
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
+        let prefill_idx = self.policy_registry.select_worker_with_remote(
+            &prefill_policy,
+            &available_prefill,
+            &info,
+            remote_overlap,
+        )?;
         info.leg = WorkerLeg::Decode;
         let decode_idx =
             self.policy_registry
@@ -959,7 +994,7 @@ mod tests {
         let mut decode_hits = HashMap::new();
         for _ in 0..iterations {
             let (prefill, decode, _) = stage
-                .select_pd_pair(model_id, None, None, None, None, None)
+                .select_pd_pair(model_id, None, None, None, None, None, None)
                 .expect("select_pd_pair should return a pair");
             *prefill_hits.entry(prefill.url().to_string()).or_default() += 1;
             *decode_hits.entry(decode.url().to_string()).or_default() += 1;
@@ -985,7 +1020,7 @@ mod tests {
             WorkerSelectionMode::PrefillDecode,
         );
         assert!(stage
-            .select_pd_pair(model_id, None, None, None, None, None)
+            .select_pd_pair(model_id, None, None, None, None, None, None)
             .is_some());
 
         for url in &prefill_urls {
@@ -995,7 +1030,7 @@ mod tests {
 
         assert!(
             stage
-                .select_pd_pair(model_id, None, None, None, None, None)
+                .select_pd_pair(model_id, None, None, None, None, None, None)
                 .is_none(),
             "the veto empties the prefill pool"
         );
@@ -1165,7 +1200,7 @@ mod tests {
 
         assert!(
             stage
-                .select_pd_pair(model_id, None, None, None, None, None)
+                .select_pd_pair(model_id, None, None, None, None, None, None)
                 .is_none(),
             "ZMQ-only PD pools must not yield a pair"
         );
@@ -1173,7 +1208,7 @@ mod tests {
         // Adding gRPC legs makes selection succeed, and it never picks the ZMQ ones.
         let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
         let (prefill, decode, _) = stage
-            .select_pd_pair(model_id, None, None, None, None, None)
+            .select_pd_pair(model_id, None, None, None, None, None, None)
             .expect("gRPC PD pair should be selected");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
         assert!(decode_urls.contains(&decode.url().to_string()));

@@ -709,10 +709,16 @@ impl RequestPipeline {
         let Some(prediction) = &dctx.index_prediction else {
             return;
         };
-        if let Some(WorkerSelection::Single { worker }) = &dctx.workers {
-            self.policy_registry
-                .publish_placement(prediction, worker.url(), None);
-        }
+        // Publish the prompt chain under the worker that holds the prompt
+        // prefix: the sole worker in Regular mode, the prefill worker in
+        // disaggregated PD/EPD (decode/encode never hold the prompt KV).
+        let holder = match &dctx.workers {
+            Some(WorkerSelection::Single { worker }) => worker,
+            Some(WorkerSelection::Disaggregated { prefill, .. }) => prefill,
+            None => return,
+        };
+        self.policy_registry
+            .publish_placement(prediction, holder.url(), None);
     }
 
     fn no_response_produced(
@@ -835,7 +841,10 @@ impl RequestPipeline {
                     // prompt placement with the generated tail (the worker's
                     // KV spans prompt ⊕ output; stores dedupe on the shared
                     // prefix), and echoes the prediction so the harness can
-                    // separate index error from policy spill.
+                    // separate index error from policy spill. Regular mode
+                    // only: in disaggregated PD/EPD the prefill worker holds
+                    // the prompt but not the generated output, so its
+                    // prompt-only placement (published in run()) is final.
                     if let Some(prediction) = &dctx.index_prediction {
                         if let Some(WorkerSelection::Single { worker }) = &dctx.workers {
                             // Prompt ⊕ output re-hash when both are present;
