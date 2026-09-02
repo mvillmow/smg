@@ -24,11 +24,48 @@ use radix_index::{
     Engine, EngineConfig,
 };
 
+const KNOWN_FLAGS: &[&str] = &[
+    "--bind",
+    "--port",
+    "--metrics-port",
+    "--peers",
+    "--bootstrap-from",
+    "--inferred-ttl-secs",
+    "--default-capacity-blocks",
+    "--sweep-interval-secs",
+    "--apply-delay-stored-ms",
+    "--apply-delay-removed-ms",
+];
+
 fn parse_flag<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse().ok())
+    let i = args.iter().position(|a| a == flag)?;
+    let value = args
+        .get(i + 1)
+        .unwrap_or_else(|| panic!("flag {flag} is missing its value"));
+    Some(
+        value
+            .parse()
+            .unwrap_or_else(|_| panic!("flag {flag} has an unparseable value: {value:?}")),
+    )
+}
+
+/// Unknown flags and unparseable values are startup errors, never
+/// silent fallbacks to defaults (audit finding: a typo'd
+/// --bootstrap-from meant silently-cold restarts forever).
+fn validate_flags(args: &[String]) {
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg.starts_with("--") {
+            assert!(
+                KNOWN_FLAGS.contains(&arg.as_str()),
+                "unknown flag {arg}; known flags: {KNOWN_FLAGS:?}"
+            );
+            i += 2;
+        } else {
+            panic!("unexpected argument {arg}");
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -53,6 +90,7 @@ async fn shutdown_signal() {
 async fn main() {
     tracing_subscriber::fmt::init();
     let args: Vec<String> = std::env::args().collect();
+    validate_flags(&args);
     let bind: String = parse_flag(&args, "--bind").unwrap_or_else(|| "127.0.0.1".to_string());
     let port: u16 = parse_flag(&args, "--port").unwrap_or(40000);
     let metrics_port: u16 = parse_flag(&args, "--metrics-port").unwrap_or(0);
@@ -70,12 +108,19 @@ async fn main() {
         inferred_ttl: Duration::from_secs(parse_flag(&args, "--inferred-ttl-secs").unwrap_or(180)),
         default_capacity_blocks: parse_flag(&args, "--default-capacity-blocks").unwrap_or(u64::MAX),
     };
-    let sweep = Duration::from_secs(parse_flag(&args, "--sweep-interval-secs").unwrap_or(5));
+    let sweep_secs: u64 = parse_flag(&args, "--sweep-interval-secs").unwrap_or(5);
+    assert!(sweep_secs > 0, "--sweep-interval-secs must be > 0 (a zero interval panics tokio's timer inside a detached task and silently disables TTL/retire)");
+    let sweep = Duration::from_secs(sweep_secs);
     let delay_stored =
         Duration::from_millis(parse_flag(&args, "--apply-delay-stored-ms").unwrap_or(0));
     let delay_removed =
         Duration::from_millis(parse_flag(&args, "--apply-delay-removed-ms").unwrap_or(0));
 
+    tracing::info!(
+        inferred_ttl_secs = cfg.inferred_ttl.as_secs(),
+        default_capacity_blocks = cfg.default_capacity_blocks,
+        "engine config"
+    );
     let engine = Arc::new(Engine::new(cfg));
     let stats = Arc::new(ServiceStats::default());
 
@@ -106,7 +151,13 @@ async fn main() {
     stats.ready.store(true, Ordering::Relaxed);
 
     let addr = format!("{bind}:{port}").parse().expect("bind addr");
-    tracing::info!(%addr, peers = peers.len(), "radix index serving");
+    tracing::info!(
+        %addr,
+        peers = peers.len(),
+        metrics_port,
+        sweep_secs,
+        "radix index serving (effective config logged at engine construction)"
+    );
     if let Err(error) = server::serve_until(
         engine,
         addr,

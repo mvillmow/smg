@@ -165,7 +165,7 @@ impl Engine {
     /// forever (the metrics timeline caught ~190x apply amplification
     /// from exactly that loop).
     pub fn apply(&self, update: &UpdateMsg) -> (ApplyOutcome, u64, bool) {
-        let mut spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
+        let mut spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
 
         // A keyspace is created on first contact; a later publisher whose
         // key differs only in block_size is a DIFFERENT keyspace by key
@@ -205,7 +205,6 @@ impl Engine {
             .expect("holder inserted above");
 
         let mut changed = false;
-        let len_before = tree.holder_blocks(holder.id);
 
         // Epoch gate: higher epoch supersedes (implicit clear), lower is
         // dropped, equal proceeds.
@@ -273,6 +272,15 @@ impl Engine {
                             StoreError::ParentNotFound => tree.store(holder.id, None, &pairs),
                             other => Err(other),
                         });
+                    // `changed` comes from the OUTCOME, never a
+                    // length delta: a MOVE (the re-anchor path above
+                    // produces them) changes query answers while
+                    // netting zero blocks, and a length-delta
+                    // heuristic would suppress its relay — replica
+                    // divergence (audit finding).
+                    if let Ok(outcome) = &stored {
+                        changed |= outcome.applied > 0;
+                    }
                     if stored.is_ok() && !holder.event_fed {
                         // Capacity is RUNAWAY PROTECTION, not an
                         // eviction mirror: the placement feed carries
@@ -296,7 +304,7 @@ impl Engine {
                         holder.event_fed = true;
                     }
                     let keys: Vec<u64> = seq_hashes.iter().map(|h| h.0).collect();
-                    tree.remove(holder.id, &keys);
+                    changed |= tree.remove(holder.id, &keys) > 0;
                 }
                 WireEvent::Cleared => {
                     tree.clear(holder.id);
@@ -304,10 +312,6 @@ impl Engine {
                 }
             }
         }
-        // Registry-length delta covers stores and removes; mixed
-        // batches that net to zero blocks still flip `changed` via
-        // the Cleared/control arms above or are true no-ops.
-        changed |= tree.holder_blocks(holder.id) != len_before;
         (outcome, holder.last_seq, changed)
     }
 
@@ -317,7 +321,7 @@ impl Engine {
     /// timestamps; run from a timer.
     pub fn sweep_idle(&self) {
         let ttl = self.cfg.inferred_ttl;
-        let mut spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
+        let mut spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
         for space in spaces.values_mut() {
             let mut retire: Vec<String> = Vec::new();
             for (name, holder) in space.holders.iter_mut() {
@@ -339,7 +343,7 @@ impl Engine {
     /// Overlap query: per-holder matched prefix depth, dropped holders
     /// excluded. Missing keyspace = empty answer (advisory semantics).
     pub fn find_matches(&self, keyspace: &KeyspaceKey, hashes: &[ContentHash]) -> Vec<HolderScore> {
-        let mut spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
+        let mut spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
         let Some(space) = spaces.get_mut(keyspace) else {
             return Vec::new();
         };
@@ -381,7 +385,7 @@ impl Engine {
     /// as before: bootstrap equivalence is scoped to gap-free
     /// holders; gapped ones converge through the feeds.)
     pub fn snapshot(&self) -> Vec<UpdateMsg> {
-        let spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
+        let spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
         let mut out = Vec::new();
         for (key, space) in spaces.iter() {
             for (holder_key, holder) in &space.holders {
@@ -393,25 +397,49 @@ impl Engine {
                         content_hash: ContentHash(content),
                     })
                     .collect();
-                out.push(UpdateMsg {
-                    keyspace: key.clone(),
-                    holder: holder_key.clone(),
-                    epoch: holder.epoch,
-                    seq: if holder.event_fed { holder.last_seq } else { 0 },
-                    events: if blocks.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![WireEvent::Stored {
-                            parent: None,
-                            blocks,
-                        }]
-                    },
-                    added: Some(AddedControl {
-                        capacity_blocks: holder.capacity_blocks,
-                        event_fed: holder.event_fed,
-                    }),
-                    dropped: holder.dropped,
-                });
+                // CHUNKED: one giant Stored per holder blows through
+                // gRPC message limits at production block counts
+                // (audit finding: >4MiB past ~210k blocks). Chunks
+                // are parent-linked so the puller reassembles the
+                // exact chain; the control payload rides only the
+                // first chunk.
+                const SNAPSHOT_CHUNK: usize = 16_384;
+                let mut first = true;
+                let mut parent: Option<SequenceHash> = None;
+                let mut chunks = blocks.chunks(SNAPSHOT_CHUNK).peekable();
+                if chunks.peek().is_none() {
+                    out.push(UpdateMsg {
+                        keyspace: key.clone(),
+                        holder: holder_key.clone(),
+                        epoch: holder.epoch,
+                        seq: if holder.event_fed { holder.last_seq } else { 0 },
+                        events: Vec::new(),
+                        added: Some(AddedControl {
+                            capacity_blocks: holder.capacity_blocks,
+                            event_fed: holder.event_fed,
+                        }),
+                        dropped: holder.dropped,
+                    });
+                }
+                for chunk in chunks {
+                    out.push(UpdateMsg {
+                        keyspace: key.clone(),
+                        holder: holder_key.clone(),
+                        epoch: holder.epoch,
+                        seq: if holder.event_fed { holder.last_seq } else { 0 },
+                        events: vec![WireEvent::Stored {
+                            parent,
+                            blocks: chunk.to_vec(),
+                        }],
+                        added: first.then(|| AddedControl {
+                            capacity_blocks: holder.capacity_blocks,
+                            event_fed: holder.event_fed,
+                        }),
+                        dropped: holder.dropped,
+                    });
+                    parent = chunk.last().map(|b| b.seq_hash);
+                    first = false;
+                }
             }
         }
         out
@@ -419,7 +447,7 @@ impl Engine {
 
     /// Total indexed blocks across keyspaces (stats/tests).
     pub fn entry_count(&self) -> usize {
-        let spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
+        let spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
         spaces
             .values()
             .map(|s| s.tree.stats().distinct_entries as usize)
@@ -429,7 +457,7 @@ impl Engine {
     /// Point-in-time gauges for the metrics endpoint. One pass under the
     /// engine lock; cheap relative to apply/query traffic.
     pub fn stats(&self) -> EngineStats {
-        let spaces = self.keyspaces.lock().unwrap_or_else(|p| p.into_inner());
+        let spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
         let mut stats = EngineStats {
             keyspaces: spaces.len(),
             ..EngineStats::default()
@@ -475,6 +503,46 @@ pub fn placement_chain(content_hashes: &[ContentHash]) -> Vec<WireBlock> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn move_only_apply_reports_changed_for_relay() {
+        // A re-anchor MOVE changes query answers while netting zero
+        // blocks; the relay gate must still forward it (audit
+        // finding: a length-delta heuristic suppressed it and let
+        // replicas diverge).
+        let engine = Engine::new(EngineConfig::default());
+        let (_, _, changed) = engine.apply(&placement("w1", 21, 4));
+        assert!(changed);
+        // Same blocks re-anchored under a DIFFERENT prefix: every
+        // key moves, block count unchanged.
+        let chain = placement_chain(&prefix_hashes(21, 4));
+        let other_parent = placement_chain(&prefix_hashes(22, 2));
+        let mut setup = UpdateMsg {
+            keyspace: keyspace(),
+            holder: "w1".into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![WireEvent::Stored {
+                parent: None,
+                blocks: other_parent.clone(),
+            }],
+            added: None,
+            dropped: false,
+        };
+        engine.apply(&setup);
+        setup.events = vec![WireEvent::Stored {
+            parent: Some(other_parent[1].seq_hash),
+            blocks: chain.clone(),
+        }];
+        let before = engine.entry_count();
+        let (_, _, changed) = engine.apply(&setup);
+        assert!(changed, "move-only apply must relay");
+        // Re-applying the identical update is a true no-op and must
+        // NOT relay (echo suppression).
+        let (_, _, changed) = engine.apply(&setup);
+        assert!(!changed, "idempotent echo must not relay");
+        let _ = before;
+    }
+
     use rand::{rngs::StdRng, seq::SliceRandom, RngExt, SeedableRng};
 
     use super::*;

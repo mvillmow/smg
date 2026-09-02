@@ -117,7 +117,10 @@ fn spawn_relay(peer: String) -> mpsc::Sender<proto::Update> {
     tokio::spawn(async move {
         loop {
             match RadixIndexClient::connect(peer.clone()).await {
-                Ok(mut client) => {
+                Ok(client) => {
+                    let mut client = client
+                        .max_decoding_message_size(64 * 1024 * 1024)
+                        .max_encoding_message_size(64 * 1024 * 1024);
                     let (fwd_tx, fwd_rx) = mpsc::channel::<proto::Update>(1024);
                     let outbound = tokio_stream::wrappers::ReceiverStream::new(fwd_rx);
                     let mut acks = match client.publish(Request::new(outbound)).await {
@@ -180,8 +183,12 @@ impl RadixIndex for IndexService {
         // apply deadline, and a drainer applies each at its deadline —
         // per-stream order (and so per-holder seq order) is preserved,
         // and throughput is unaffected. Zero-delay legs skip the queue.
+        // BOUNDED: when the applier lags, this fills, the inbound
+        // task blocks on send, tonic stops reading, and HTTP/2 flow
+        // control pushes back on the publisher — instead of an
+        // unbounded queue quietly absorbing an OOM (audit finding).
         let (delayed_tx, mut delayed_rx) =
-            mpsc::unbounded_channel::<(tokio::time::Instant, proto::Update)>();
+            mpsc::channel::<(tokio::time::Instant, proto::Update)>(65_536);
         let apply_engine = Arc::clone(&engine);
         let apply_relay = relay.clone();
         let apply_stats = Arc::clone(&self.stats);
@@ -208,8 +215,13 @@ impl RadixIndex for IndexService {
                     epoch: msg.epoch,
                     applied_seq,
                 };
-                if ack_tx.send(Ok(ack)).await.is_err() {
-                    break;
+                // Acks are advisory (clients watch for stream death,
+                // not individual acks): drop when the publisher is
+                // not reading rather than wedging the applier behind
+                // its ack window.
+                match ack_tx.try_send(Ok(ack)) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         });
@@ -233,7 +245,7 @@ impl RadixIndex for IndexService {
                     }
                 }
                 let deadline = tokio::time::Instant::now() + delay;
-                if delayed_tx.send((deadline, update)).is_err() {
+                if delayed_tx.send((deadline, update)).await.is_err() {
                     break;
                 }
             }
@@ -281,6 +293,17 @@ impl RadixIndex for IndexService {
                     },
                     block_size: keyspace.map(|k| k.block_size).unwrap_or_default(),
                 };
+                // Cap query length: callers send request-sized
+                // chains; anything longer is an abuse/DoS shape that
+                // would run under the engine lock (audit finding).
+                const MAX_QUERY_BLOCKS: usize = 16_384;
+                if query.content_hashes.len() > MAX_QUERY_BLOCKS {
+                    let _ = tx.try_send(Ok(proto::Match {
+                        query_id: query.query_id,
+                        scores: Vec::new(),
+                    }));
+                    continue;
+                }
                 let hashes: Vec<ContentHash> = query
                     .content_hashes
                     .iter()
@@ -300,8 +323,13 @@ impl RadixIndex for IndexService {
                         })
                         .collect(),
                 };
-                if tx.send(Ok(answer)).await.is_err() {
-                    break;
+                // Answers are deadline-bound on the caller: when the
+                // gateway stops reading, drop answers rather than
+                // blocking this task off the inbound stream
+                // (head-of-line deadlock shape, audit finding).
+                match tx.try_send(Ok(answer)) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         });
@@ -327,9 +355,12 @@ impl RadixIndex for IndexService {
 /// serving. Returns Ok(applied_count); a connect failure is Ok(0) so a
 /// lone first replica can boot cold.
 pub async fn bootstrap_from(engine: &Engine, peer: &str) -> Result<usize, tonic::Status> {
-    let Ok(mut client) = RadixIndexClient::connect(peer.to_string()).await else {
+    let Ok(client) = RadixIndexClient::connect(peer.to_string()).await else {
         return Ok(0);
     };
+    let mut client = client
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
     let mut stream = client
         .pull(Request::new(proto::PullRequest {}))
         .await?
@@ -413,13 +444,20 @@ pub async fn serve_until(
         }
     });
     Server::builder()
-        .add_service(RadixIndexServer::new(IndexService::with_stats(
-            engine,
-            stats,
-            peers,
-            delay_stored,
-            delay_removed,
-        )))
+        // Explicit, generous decode cap (chunked snapshots keep real
+        // messages far below it; the default 4MiB was a silent
+        // bootstrap killer at scale — audit finding).
+        .add_service(
+            RadixIndexServer::new(IndexService::with_stats(
+                engine,
+                stats,
+                peers,
+                delay_stored,
+                delay_removed,
+            ))
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024),
+        )
         .serve_with_shutdown(addr, shutdown)
         .await
 }
@@ -441,8 +479,14 @@ pub async fn serve_admin(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind(addr).await?;
     loop {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            continue;
+        let (mut socket, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(_) => {
+                // Back off instead of busy-spinning on accept errors
+                // (fd exhaustion would otherwise pin a core).
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
         };
         let engine = Arc::clone(&engine);
         let stats = Arc::clone(&stats);

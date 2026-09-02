@@ -173,11 +173,14 @@ async fn subscribe_driver(
     connected: Arc<AtomicBool>,
 ) {
     loop {
-        let Ok(mut client) = RadixIndexClient::connect(url.clone()).await else {
+        let Ok(client) = RadixIndexClient::connect(url.clone()).await else {
             drain_disconnected(&mut queries);
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         };
+        let mut client = client
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024);
         let (fwd_tx, fwd_rx) = mpsc::channel::<proto::Query>(1024);
         let outbound = tokio_stream::wrappers::ReceiverStream::new(fwd_rx);
         let mut answers = match client.subscribe(tonic::Request::new(outbound)).await {

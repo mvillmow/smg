@@ -134,10 +134,13 @@ pub async fn worker_loop(
 /// lost inside the bridge. Returns when all worker loops have ended.
 pub async fn run_publisher(mut rx: mpsc::Receiver<proto::Update>, index: String) {
     loop {
-        let Ok(mut client) = RadixIndexClient::connect(index.clone()).await else {
+        let Ok(client) = RadixIndexClient::connect(index.clone()).await else {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         };
+        let mut client = client
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024);
         let (fwd_tx, fwd_rx) = mpsc::channel::<proto::Update>(1024);
         let outbound = tokio_stream::wrappers::ReceiverStream::new(fwd_rx);
         let mut acks = match client.publish(tonic::Request::new(outbound)).await {
