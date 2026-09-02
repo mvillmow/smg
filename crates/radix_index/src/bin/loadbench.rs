@@ -180,6 +180,8 @@ async fn run_publisher(
     running: Arc<AtomicBool>,
     count_from: Instant,
     sent_blocks: Arc<AtomicU64>,
+    // Per-publisher target updates/sec; 0 = unthrottled (max hammer).
+    target_ups: u64,
 ) {
     let client = RadixIndexClient::connect(url)
         .await
@@ -199,7 +201,16 @@ async fn run_publisher(
 
     let mut rng = seed ^ 0xF00D;
     let mut nonce = 0u64;
+    let period = (target_ups > 0).then(|| Duration::from_secs_f64(1.0 / target_ups as f64));
+    let mut next_at = Instant::now();
     while running.load(Ordering::Relaxed) {
+        if let Some(period) = period {
+            let now = Instant::now();
+            if now < next_at {
+                tokio::time::sleep(next_at - now).await;
+            }
+            next_at += period;
+        }
         rng = splitmix(rng);
         let w = (rng % workers as u64) as usize;
         let slot = ((rng >> 32) % hot_per_worker as u64) as usize;
@@ -244,6 +255,9 @@ async fn main() {
     let hot_per_worker: usize = parse_flag(&args, "--hot-per-worker").unwrap_or(8);
     let dup_pct: u64 = parse_flag(&args, "--dup-pct").unwrap_or(90);
     let secs: u64 = parse_flag(&args, "--secs").unwrap_or(15);
+    // Per-publisher target updates/sec (0 = max hammer). Model a
+    // realistic gateway: 200 req/s each => --target-ups 200.
+    let target_ups: u64 = parse_flag(&args, "--target-ups").unwrap_or(0);
 
     let engine = Arc::new(Engine::new(EngineConfig::default()));
     let stats = Arc::new(server::ServiceStats::default());
@@ -359,6 +373,7 @@ async fn main() {
             Arc::clone(&running),
             count_from,
             Arc::clone(&sent_blocks),
+            target_ups,
         )));
     }
     tokio::time::sleep(warmup).await;
