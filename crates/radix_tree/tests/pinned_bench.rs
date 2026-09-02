@@ -256,7 +256,8 @@ impl Sider {
                     parent,
                     blocks,
                 } => {
-                    let _ = tree.store(ids[*holder], *parent, blocks);
+                    tree.store(ids[*holder], *parent, blocks)
+                        .expect("bench stores are in-contract");
                 }
                 Op::Remove { holder, keys } => {
                     tree.remove(ids[*holder], keys);
@@ -269,7 +270,8 @@ impl Sider {
                     parent,
                     blocks,
                 } => {
-                    let _ = tree.store(ids[*holder], *parent, blocks);
+                    tree.store(ids[*holder], *parent, blocks)
+                        .expect("bench stores are in-contract");
                 }
                 Op::Remove { holder, keys } => {
                     tree.remove(ids[*holder], keys);
@@ -377,6 +379,19 @@ fn pinned_workload() {
         }
     }
     let fill = fill_start.elapsed();
+    // Cross-check the memory-gate denominator against the structure
+    // itself: a silent drop would otherwise flatter every number at
+    // once (audit finding). Gap removes make resident slightly less
+    // than generated.
+    let resident = match &sider {
+        Sider::Oracle(_, _) => holder_blocks, // oracle side has no cheap recount
+        Sider::R1(tree, _, _, _) => tree.stats().holder_blocks,
+        Sider::R3(tree, _, _, _) => tree.stats().holder_blocks,
+    };
+    assert!(
+        resident * 100 >= holder_blocks * 97,
+        "structure holds {resident} of {holder_blocks} generated holder-blocks — silent loss"
+    );
     let rss_after = rss_kib();
     println!(
         "fill: {:.2}s -> {:.2}M stream blocks/s",

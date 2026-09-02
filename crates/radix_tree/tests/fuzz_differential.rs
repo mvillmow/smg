@@ -30,8 +30,14 @@ use common::{
 };
 use radix_tree::{Config, FlatTree, HolderId, OverlapScratch, RadixTree, StoreError};
 
-fn random_config(rng: &mut Rng) -> WlConfig {
+/// `wide` raises the sharing cap to the bench's H=64 width — model
+/// scans at that width are too slow for the always-on debug quick
+/// suite, so wide configs belong to the release campaign entry point
+/// (audit finding: correctness past ~27 holders/block was previously
+/// never model-gated ANYWHERE).
+fn random_config(rng: &mut Rng, wide: bool) -> WlConfig {
     let holders = 2 + rng.below(255);
+    let share_cap = if wide { 64 } else { 24 };
     WlConfig {
         holders,
         families: 1 + rng.below(64),
@@ -41,7 +47,7 @@ fn random_config(rng: &mut Rng) -> WlConfig {
         },
         holders_per_family: {
             let lo = 1 + rng.below(4);
-            (lo, lo + rng.below(holders.min(24)))
+            (lo, lo + rng.below(holders.min(share_cap)))
         },
         tail_len: (1 + rng.below(8), 9 + rng.below(56)),
         store_batch: 1 + rng.below(16),
@@ -89,7 +95,7 @@ impl Subject {
             qscratch: OverlapScratch::default(),
         }
     }
-    fn apply(&mut self, op: &Op) -> bool {
+    fn apply(&mut self, op: &Op) -> Option<(u32, u32)> {
         match op {
             Op::Store {
                 holder,
@@ -101,8 +107,8 @@ impl Subject {
                     Core::Chain(t) => t.store(self.ids[*holder], *parent, blocks),
                 };
                 match r {
-                    Ok(_) => true,
-                    Err(StoreError::ParentNotFound) => false,
+                    Ok(o) => Some((o.applied, o.duplicates)),
+                    Err(StoreError::ParentNotFound) => None,
                     Err(e) => panic!("unexpected store error {e:?}"),
                 }
             }
@@ -111,14 +117,14 @@ impl Subject {
                     Core::Flat(t) => t.remove(self.ids[*holder], keys),
                     Core::Chain(t) => t.remove(self.ids[*holder], keys),
                 };
-                true
+                Some((0, 0))
             }
             Op::Clear { holder } => {
                 match &mut self.core {
                     Core::Flat(t) => t.clear(self.ids[*holder]),
                     Core::Chain(t) => t.clear(self.ids[*holder]),
                 }
-                true
+                Some((0, 0))
             }
         }
     }
@@ -140,6 +146,18 @@ impl Subject {
             Core::Chain(t) => t.holder_blocks(self.ids[h]),
         }
     }
+    fn enumerate(&self, h: usize) -> Vec<(u32, u64, u64)> {
+        match &self.core {
+            Core::Flat(t) => t.enumerate(self.ids[h]).collect(),
+            Core::Chain(t) => t.enumerate(self.ids[h]).collect(),
+        }
+    }
+    fn distinct_entries(&self) -> u64 {
+        match &self.core {
+            Core::Flat(t) => t.stats().distinct_entries,
+            Core::Chain(t) => t.stats().distinct_entries,
+        }
+    }
     fn audit(&self) -> Result<(), String> {
         match &self.core {
             Core::Flat(t) => t.audit(),
@@ -148,9 +166,9 @@ impl Subject {
     }
 }
 
-fn run_one_in_contract(seed: u64) {
+fn run_one_in_contract(seed: u64, wide: bool) {
     let mut rng = Rng::new(seed ^ 0xF00D);
-    let cfg = random_config(&mut rng);
+    let cfg = random_config(&mut rng, wide);
     let wl = workload::generate(seed, &cfg);
     let audit_every_op = wl.ops.len() < 4000;
     let mut model = Model::new(wl.holders);
@@ -162,13 +180,28 @@ fn run_one_in_contract(seed: u64) {
     for (i, op) in wl.ops.iter().enumerate() {
         let model_outcome = model.apply(op);
         for (ci, subject) in subjects.iter_mut().enumerate() {
-            let subject_ok = subject.apply(op);
+            let subject_out = subject.apply(op);
             if let Op::Store { .. } = op {
-                let model_ok = !matches!(model_outcome, Some(StoreResult::ParentNotFound));
-                assert_eq!(
-                    model_ok, subject_ok,
-                    "core{ci} acceptance diverged: seed {seed} op {i}"
-                );
+                // StoreOutcome PARITY, not just acceptance: the relay
+                // gate depends on applied counts (audit finding — the
+                // payload was discarded everywhere).
+                match (&model_outcome, &subject_out) {
+                    (Some(StoreResult::ParentNotFound), None) => {}
+                    (
+                        Some(StoreResult::Applied {
+                            applied,
+                            duplicates,
+                        }),
+                        Some((a, d)),
+                    ) => {
+                        assert_eq!(
+                            (*applied, *duplicates),
+                            (*a, *d),
+                            "core{ci} StoreOutcome diverged: seed {seed} op {i}"
+                        );
+                    }
+                    other => panic!("core{ci} acceptance diverged: seed {seed} op {i}: {other:?}"),
+                }
             }
             if audit_every_op {
                 subject
@@ -200,7 +233,20 @@ fn run_one_in_contract(seed: u64) {
                 model.holder_blocks(h),
                 "core{ci} holder_blocks diverged: seed {seed} holder {h}"
             );
+            // Terminal ENUMERATE parity: per-block position/key/
+            // content — off-query-path corruption was invisible to
+            // the whole campaign without this (audit finding).
+            assert_eq!(
+                subject.enumerate(h),
+                model.enumerate(h),
+                "core{ci} enumerate diverged: seed {seed} holder {h}"
+            );
         }
+        assert_eq!(
+            subject.distinct_entries(),
+            model.distinct_entries(),
+            "core{ci} distinct_entries diverged: seed {seed}"
+        );
     }
 }
 
@@ -525,7 +571,7 @@ fn run_one_chaos(seed: u64) {
 #[test]
 fn fuzz_quick() {
     for seed in 1..=32u64 {
-        run_one_in_contract(seed);
+        run_one_in_contract(seed, false);
     }
     for seed in 1..=8u64 {
         run_one_chaos(seed);
@@ -544,7 +590,9 @@ fn fuzz_campaign() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1000);
     for seed in start..start + seeds {
-        run_one_in_contract(seed);
+        // Every 4th campaign seed runs the wide-sharing (H<=64)
+        // distribution under the full model gate.
+        run_one_in_contract(seed, seed % 4 == 0);
         if seed % 3 == 0 {
             run_one_chaos(seed);
         }

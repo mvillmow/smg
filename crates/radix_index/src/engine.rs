@@ -431,7 +431,7 @@ impl Engine {
                             parent,
                             blocks: chunk.to_vec(),
                         }],
-                        added: first.then(|| AddedControl {
+                        added: first.then_some(AddedControl {
                             capacity_blocks: holder.capacity_blocks,
                             event_fed: holder.event_fed,
                         }),

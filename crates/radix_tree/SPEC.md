@@ -246,7 +246,10 @@ no two distinct keys map to the same (chain, position) for the holder.
 - each holder's own operation order is preserved whenever that
   holder's sequence contains `remove` or `clear`,
 - remove-free, clear-free per-holder store multisets may additionally
-  be reordered arbitrarily,
+  be reordered in any DEPENDENCY-RESPECTING order (a parent-anchored
+  batch after the batch that registers its parent — a reorder that
+  changes which stores get ACCEPTED changes the applied multiset
+  itself and is outside this clause),
 - cross-holder interleaving is arbitrary, and individual operations
   may be duplicated (re-applied) arbitrarily,
 - all stores are chain-consistent,

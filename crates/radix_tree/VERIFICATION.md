@@ -183,6 +183,69 @@ observe (p95 error 0 -> 9216 tokens); capacity is now runaway
 protection at 2x declared, documented, and the attribution leg
 proves the fix exact. What remains is the section below.
 
+## Audit triage (the "too good to be true" pass)
+
+Four skeptical reviewers attacked the harness's validity, production
+scale, operations/trust, and service-layer coverage; their findings
+merged with the author's own pre-registered list. Dispositions:
+
+**Fixed immediately (each with a regression lock):**
+- Move-only relay suppression (replica divergence via the length-
+  delta `changed` heuristic; outcome-based now).
+- Pull bootstrap message sizes (chunked parent-linked snapshots;
+  explicit 64MiB limits everywhere).
+- Unbounded publish ingest (bounded channel restoring HTTP/2
+  backpressure; acks advisory).
+- Subscribe head-of-line deadlock shapes (try_send both sides;
+  query length cap).
+- Poisoned-lock behavior (abort into clean sibling bootstrap instead
+  of serving corrupt state).
+- Admin plane slowloris/accept-spin; silent flag fallbacks; zero
+  sweep interval.
+- HARNESS GAPS the campaign's own claims rested on: queries now
+  enter divergent tails and diverge mid-match; membership decays
+  with depth (prefix-only members, mid-chain forks); within-holder
+  dependency-respecting reordering exercises §7's stronger clause
+  (and sharpened §7's wording — literal arbitrary order changes the
+  accepted multiset and was never the contract); StoreOutcome parity
+  and terminal enumerate/distinct parity in every fuzz seed; the
+  bench no longer swallows store errors and cross-checks its memory
+  denominator against the structure; model-gated sharing widened to
+  the bench's H=64.
+
+**Scheduled (real work, tracked):**
+- Per-keyspace locking (snapshot/sweep currently hold the one engine
+  lock O(everything) — the audit's strongest scale finding).
+- Holder liveness: nothing produces dropped/Added on the wire, so
+  event-fed holders of decommissioned workers persist; plan is
+  bridge heartbeats + an event-holder TTL + fleet integration.
+- Streaming/chat placement publishing (today only non-streaming
+  generate feeds the index; streaming traffic queries but never
+  publishes — the sim's non-streaming legs masked this).
+- Relay/bridge in-flight loss on reconnect (ack-tracked resend;
+  today bounded by placement idempotence and epoch bumps, unbounded
+  for a lost event-feed Removed).
+- Per-outcome/per-keyspace observability; snapshot double-
+  materialization in Pull.
+
+**Deployment requirements, documented not code:**
+- NO AUTH/TLS: all three RPCs are open — a spoofed epoch=MAX Cleared
+  poisons routing fleet-wide and Pull leaks fleet topology. mTLS or
+  a token interceptor plus NetworkPolicy is REQUIRED before any
+  non-lab deployment.
+- Reference manifest needs anti-affinity/PDB and per-ordinal
+  bootstrap sources.
+- Keyspaces are never garbage-collected (any publisher can mint
+  them): bound the accepted keyspace set at the auth layer.
+
+**Accepted with eyes open:**
+- The reference model shares an author with both cores (mitigated by
+  the kv_index oracle, the API suite, and now-stronger observables;
+  an independent reader of SPEC.md reviewing model.rs is the
+  remaining step).
+- Fault-drill evidence lives on the local simrig branch; the drills'
+  harness is committed on the sim PR, results summarized here.
+
 ## What a single machine cannot prove (standing honesty)
 
 Connection fan-in from hundreds of real gateways; real network

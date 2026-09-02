@@ -123,16 +123,27 @@ pub fn generate(seed: u64, cfg: &Config) -> Workload {
     // enumerate parity check).
     let mut per_holder: Vec<Vec<Op>> = vec![Vec::new(); cfg.holders];
     let mut tailed: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    let mut tails: Vec<(usize, u32, Vec<(u64, u64)>)> = Vec::new();
     for (fi, family) in families.iter().enumerate() {
         let count = cfg.holders_per_family.0
             + rng.below(cfg.holders_per_family.1 - cfg.holders_per_family.0 + 1);
         for _ in 0..count {
             let holder = rng.below(cfg.holders);
             let first_assignment = tailed.insert((holder, fi));
-            // Base chain in parent-linked batches.
+            // A third of members store only a PREFIX of the family,
+            // so membership decays with depth (the run-boundary
+            // structure real fleets produce; audit finding: constant
+            // membership along every spine left split/merge
+            // maintenance under-exercised).
+            let span = if rng.chance(33) && family.len() > 2 {
+                1 + rng.below(family.len() - 1)
+            } else {
+                family.len()
+            };
+            let stored_spine = &family[..span];
             let mut parent = None;
             let mut batches = Vec::new();
-            for batch in family.chunks(cfg.store_batch) {
+            for batch in stored_spine.chunks(cfg.store_batch) {
                 batches.push(Op::Store {
                     holder,
                     parent,
@@ -142,11 +153,19 @@ pub fn generate(seed: u64, cfg: &Config) -> Workload {
             }
             // Divergent tail (first assignment only): unique
             // contents, keys mixed with holder and family so tails
-            // never collide.
+            // never collide. A third of tails fork MID-CHAIN (audit
+            // finding: tip-only forks left interior branch handling
+            // untested in-contract).
             if first_assignment {
+                let fork_at = if rng.chance(33) && span > 2 {
+                    1 + rng.below(span - 1)
+                } else {
+                    span
+                };
+                let fork_parent = stored_spine[fork_at - 1].0;
                 let tail_len = cfg.tail_len.0 + rng.below(cfg.tail_len.1 - cfg.tail_len.0 + 1);
                 let mut tail = Vec::with_capacity(tail_len);
-                let mut prev_key = parent.expect("family non-empty");
+                let mut prev_key = fork_parent;
                 for _ in 0..tail_len {
                     let content = fresh_content(&mut rng, &mut content_pool, 0);
                     let key = (prev_key ^ content.rotate_left(29))
@@ -156,14 +175,17 @@ pub fn generate(seed: u64, cfg: &Config) -> Workload {
                     tail.push((key, content));
                     prev_key = key;
                 }
+                let mut tail_parent = Some(fork_parent);
                 for batch in tail.chunks(cfg.store_batch) {
                     batches.push(Op::Store {
                         holder,
-                        parent,
+                        parent: tail_parent,
                         blocks: batch.to_vec(),
                     });
-                    parent = Some(batch.last().expect("non-empty").0);
+                    tail_parent = Some(batch.last().expect("non-empty").0);
                 }
+                // Record the tail for query generation.
+                tails.push((fi, fork_at as u32, tail));
             }
             // Duplicates: re-send some batches verbatim (later in the
             // holder's script — legal §7 duplication).
@@ -217,13 +239,32 @@ pub fn generate(seed: u64, cfg: &Config) -> Workload {
     // both sides must reject those identically (ParentNotFound), so
     // they stay in the stream on purpose.
 
-    // Queries: family prefixes at random depths (+tails), plus misses.
+    // Queries: spine prefixes, TAIL-EXTENDING (into one holder's
+    // divergent tail — distinguishes that holder's deeper answer),
+    // MID-DIVERGING (match d blocks then differ in content), and
+    // pure misses. The first shape set alone let off-query-path
+    // corruption hide (audit finding).
     let mut queries = Vec::new();
     for family in &families {
-        for _ in 0..4 {
+        for _ in 0..3 {
             let d = 1 + rng.below(family.len());
-            queries.push(family[..d].iter().map(|&(_, c)| c).collect());
+            queries.push(family[..d].iter().map(|&(_, c)| c).collect::<Vec<u64>>());
         }
+        // Mid-diverging: real prefix then foreign content.
+        let d = 1 + rng.below(family.len());
+        let mut q: Vec<u64> = family[..d].iter().map(|&(_, c)| c).collect();
+        q.extend((0..1 + rng.below(8)).map(|_| rng.next() | 1));
+        queries.push(q);
+    }
+    for (fi, fork_at, tail) in &tails {
+        if queries.len() > families.len() * 8 {
+            break;
+        }
+        let spine = &families[*fi];
+        let mut q: Vec<u64> = spine[..*fork_at as usize].iter().map(|&(_, c)| c).collect();
+        let take = 1 + rng.below(tail.len());
+        q.extend(tail[..take].iter().map(|&(_, c)| c));
+        queries.push(q);
     }
     for _ in 0..families.len() {
         let miss: Vec<u64> = (0..1 + rng.below(24)).map(|_| rng.next() | 1).collect();
@@ -236,14 +277,101 @@ pub fn generate(seed: u64, cfg: &Config) -> Workload {
     }
 }
 
-/// Reorder a stream within §7 scope: per-holder order preserved for
-/// order-bearing scripts, arbitrary cross-holder interleaving, using
-/// a different seed. (Store-only holders could legally reorder
-/// further; keeping their order too stays within scope.)
+/// Reorder a stream within the FULL §7 scope: arbitrary cross-holder
+/// interleaving always; and for holders whose scripts carry no
+/// remove/clear, their OWN store order is also shuffled arbitrarily
+/// (the stronger half of the guarantee — audit finding: it was never
+/// exercised). Order-bearing holders keep their sequence.
 pub fn reinterleave(seed: u64, ops: &[Op], holders: usize) -> Vec<Op> {
     let mut per_holder: Vec<Vec<Op>> = vec![Vec::new(); holders];
     for op in ops {
         per_holder[op.holder()].push(op.clone());
+    }
+    let mut rng0 = Rng::new(seed ^ 0x5EED);
+    for script in per_holder.iter_mut() {
+        if !script.iter().any(|op| op.orders_holder()) && script.len() > 1 {
+            // Fisher-Yates over the store-only script. Parent links
+            // may now arrive before their anchor: §7 excludes
+            // ParentNotFound compensation from the guarantee, so the
+            // comparison target must apply the SAME order — callers
+            // compare two subjects on one order, or model-vs-subject
+            // on the same order, never across orders with rejects.
+            // We keep it in-contract instead: shuffle only WHOLE
+            // parent-linked chains (contiguous runs where each op's
+            // parent is the previous op's last key).
+            let mut runs: Vec<Vec<Op>> = Vec::new();
+            let mut current: Vec<Op> = Vec::new();
+            let mut last_key: Option<u64> = None;
+            for op in script.drain(..) {
+                let anchors_prev = matches!(
+                    (&op, last_key),
+                    (Op::Store { parent: Some(p), .. }, Some(k)) if *p == k
+                );
+                if !anchors_prev && !current.is_empty() {
+                    runs.push(std::mem::take(&mut current));
+                }
+                last_key = match &op {
+                    Op::Store { blocks, .. } => blocks.last().map(|&(k, _)| k),
+                    _ => None,
+                };
+                current.push(op);
+            }
+            if !current.is_empty() {
+                runs.push(current);
+            }
+            // Random TOPOLOGICAL order: a run whose anchor parent
+            // key is produced by another run must stay after it —
+            // literal arbitrary order would change which stores get
+            // ACCEPTED (ParentNotFound), which is outside §7's
+            // chain-consistent scope (rejected stores leave the
+            // multiset). Within the dependency partial order, the
+            // shuffle is free.
+            let produced: Vec<std::collections::HashSet<u64>> = runs
+                .iter()
+                .map(|run| {
+                    run.iter()
+                        .flat_map(|op| match op {
+                            Op::Store { blocks, .. } => {
+                                blocks.iter().map(|&(k, _)| k).collect::<Vec<_>>()
+                            }
+                            _ => Vec::new(),
+                        })
+                        .collect()
+                })
+                .collect();
+            let needs: Vec<Option<u64>> = runs
+                .iter()
+                .map(|run| match run.first() {
+                    Some(Op::Store { parent, .. }) => *parent,
+                    _ => None,
+                })
+                .collect();
+            let n = runs.len();
+            let mut placed = vec![false; n];
+            let mut ordered: Vec<Vec<Op>> = Vec::with_capacity(n);
+            let mut produced_so_far: std::collections::HashSet<u64> =
+                std::collections::HashSet::new();
+            while ordered.len() < n {
+                let ready: Vec<usize> = (0..n)
+                    .filter(|&i| {
+                        !placed[i] && needs[i].is_none_or(|k| produced_so_far.contains(&k))
+                    })
+                    .collect();
+                // Runs whose parent was never produced in this script
+                // (anchored on another assignment's spine already
+                // present) are always ready.
+                let ready = if ready.is_empty() {
+                    (0..n).filter(|&i| !placed[i]).collect()
+                } else {
+                    ready
+                };
+                let pick = ready[rng0.below(ready.len())];
+                placed[pick] = true;
+                produced_so_far.extend(produced[pick].iter().copied());
+                ordered.push(std::mem::take(&mut runs[pick]));
+            }
+            *script = ordered.into_iter().flatten().collect();
+        }
     }
     let mut rng = Rng::new(seed);
     let mut cursors = vec![0usize; holders];
