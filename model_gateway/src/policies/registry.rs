@@ -208,6 +208,13 @@ impl PolicyRegistry {
         })
     }
 
+    /// Whether sticky routing may derive its preferred key from the request
+    /// body's `rid`, requiring automatic body-path selection to keep the body
+    /// readable.
+    pub(crate) fn routing_key_override_enabled(&self) -> bool {
+        self.routing_key_sticky.is_some()
+    }
+
     /// Resolve the effective sticky key: the rid-derived key wins, the
     /// configured routing-key headers are the fallback when no rid is
     /// present. Header keys get the same lineage stripping as rid keys, so a
@@ -269,13 +276,6 @@ impl PolicyRegistry {
             }
             _ => policy.select_worker(workers, info),
         }
-    }
-
-    /// Whether the sticky routing-key override is configured at all (used
-    /// by the selection stage to skip a wasted remote-index prefetch when
-    /// the override will win anyway).
-    pub fn routing_key_override_enabled(&self) -> bool {
-        self.routing_key_sticky.is_some()
     }
 
     /// Keyed selection: honor an existing pin under the in-flight cap;

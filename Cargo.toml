@@ -66,7 +66,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 webpki-roots = "1.0"
 multer = "3"
-str0m = { version = "0.21", default-features = false, features = ["openssl"] }
+str0m = { version = "0.23", default-features = false, features = ["openssl"] }
 scopeguard = "1.2"
 bitflags = "2.13.0"
 schemars = "1.2"
@@ -139,6 +139,16 @@ opt-level = "z"     # Optimize for size
 lto = "fat"         # Full LTO for smaller binaries
 codegen-units = 1   # Better optimization, slower compile
 strip = false       # Keep symbols so production CPU profiles/flamegraphs are readable (#1575)
+
+# Optimize hot dependencies in the tiktoken encode path.
+[profile.release.package.tiktoken-rs]
+opt-level = 2
+
+[profile.release.package.fancy-regex]
+opt-level = 2
+
+[profile.release.package.regex-automata]
+opt-level = 2
 
 [profile.ci]
 inherits = "release"
