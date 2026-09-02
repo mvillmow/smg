@@ -257,6 +257,27 @@ merged with the author's own pre-registered list. Dispositions:
 - Fault-drill evidence lives on the local simrig branch; the drills'
   harness is committed on the sim PR, results summarized here.
 
+## Workload-profile matrix (2026-09-01, release, this Mac, single run each)
+
+Four stream shapes x both sides; RADIX_BENCH_PROFILE selects. All
+percentiles ns; fill in M stream-blocks/s; memory in B/holder-block.
+`pinned` is the normative §11 gate config; the others answer "does
+the win hold off the pinned distribution?" — it does, on every axis,
+except write throughput on deep chains (agentic), which stays >2x
+above the 1M/s gate but is the clear next optimization target.
+
+| profile | fill old/new | B/blk old/new | H=1 p50 old/new | gate-cell p99 old/new |
+|---|---|---|---|---|
+| pinned  | 5.44 / 4.38 | 167.5 / 26.7 | 1000 / 292 | 9.7µs / 7.9µs |
+| agentic (deep chains, heavy sharing) | 5.77 / 2.16 | 143.2 / 26.5 | 1041 / 750 | 7.8µs / 6.5µs |
+| churn (short chains, 20% dups, 10% gaps) | 5.99 / 7.12 | 146.9 / 29.4 | 917 / 292 | n=1 cell |
+| fleet (1024 holders) | 5.39 / 3.48 | 144.4 / 33.6 | 2041 / 375 | 11.2µs / 7.5µs |
+
+(The churn profile's first run tripped the resident cross-check —
+the check was calibrated for pinned's 2% gaps and refused to report
+memory over a wrong denominator, exactly its job; the bench now
+subtracts workload-removed blocks exactly.)
+
 ## What a single machine cannot prove (standing honesty)
 
 Connection fan-in from hundreds of real gateways; real network

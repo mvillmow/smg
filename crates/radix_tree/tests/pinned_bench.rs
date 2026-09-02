@@ -36,19 +36,87 @@ fn target_blocks() -> u64 {
 fn holders() -> usize {
     match std::env::var("RADIX_BENCH_SCALE").as_deref() {
         Ok("large") => 2048,
-        _ => 256,
+        _ => profile().holders_default,
     }
 }
-/// (sharing factor H, share of total holder-blocks in percent).
-const SHARING_MIX: [(usize, u64); 3] = [(1, 50), (8, 35), (64, 15)];
-const SHARED_DEPTH: (u32, u32) = (8, 512); // log-uniform
-const TAIL_LEN: (u32, u32) = (4, 64); // uniform
 const BATCH: usize = 8;
-const DUPLICATE_PCT: u64 = 5;
-const GAP_PCT: u64 = 2;
 const MISS_QUERY_PCT: u64 = 20;
 /// The gate cell: depth 78 with 64 candidate holders.
 const GATE_DEPTH: u32 = 78;
+
+/// One workload stream shape. `pinned` is the §11 NORMATIVE config —
+/// gates are quoted on it and its parameters must never drift. The
+/// other profiles answer "does the win hold on different input
+/// distributions?" (audit follow-up: one stream shape proves one
+/// point on the workload space): RADIX_BENCH_PROFILE=agentic|churn|
+/// fleet selects them; they are diagnostics, not gates.
+struct Profile {
+    name: &'static str,
+    holders_default: usize,
+    /// (sharing factor H, share of total holder-blocks in percent).
+    sharing_mix: [(usize, u64); 3],
+    /// Log-uniform shared-prefix length range.
+    shared_depth: (u32, u32),
+    /// Uniform divergent-tail length range.
+    tail_len: (u32, u32),
+    duplicate_pct: u64,
+    gap_pct: u64,
+}
+
+/// The §11 constants, verbatim.
+const PINNED: Profile = Profile {
+    name: "pinned",
+    holders_default: 256,
+    sharing_mix: [(1, 50), (8, 35), (64, 15)],
+    shared_depth: (8, 512),
+    tail_len: (4, 64),
+    duplicate_pct: 5,
+    gap_pct: 2,
+};
+/// Long-context / agentic traffic: deep shared prefixes (system
+/// prompts, long conversations), heavy cross-worker sharing.
+const AGENTIC: Profile = Profile {
+    name: "agentic",
+    holders_default: 256,
+    sharing_mix: [(1, 20), (8, 40), (64, 40)],
+    shared_depth: (64, 2048),
+    tail_len: (16, 256),
+    duplicate_pct: 5,
+    gap_pct: 2,
+};
+/// Short-prompt chat with aggressive eviction churn: shallow chains,
+/// little sharing, lots of duplicate re-publish and mid-chain gaps.
+const CHURN: Profile = Profile {
+    name: "churn",
+    holders_default: 256,
+    sharing_mix: [(1, 70), (8, 25), (64, 5)],
+    shared_depth: (4, 64),
+    tail_len: (2, 16),
+    duplicate_pct: 20,
+    gap_pct: 10,
+};
+/// Wide fleet at the default block budget: 4x the workers, each
+/// holding proportionally less — stresses holder-set interning and
+/// span fan-out rather than chain depth.
+const FLEET: Profile = Profile {
+    name: "fleet",
+    holders_default: 1024,
+    sharing_mix: [(1, 40), (8, 30), (64, 30)],
+    shared_depth: (8, 512),
+    tail_len: (4, 64),
+    duplicate_pct: 5,
+    gap_pct: 2,
+};
+
+fn profile() -> &'static Profile {
+    match std::env::var("RADIX_BENCH_PROFILE").as_deref() {
+        Ok("agentic") => &AGENTIC,
+        Ok("churn") => &CHURN,
+        Ok("fleet") => &FLEET,
+        Ok(other) if other != "pinned" => panic!("unknown RADIX_BENCH_PROFILE {other:?}"),
+        _ => &PINNED,
+    }
+}
 
 fn log_uniform(rng: &mut Rng, lo: u32, hi: u32) -> u32 {
     let (llo, lhi) = ((lo as f64).ln(), (hi as f64).ln());
@@ -65,7 +133,8 @@ fn build_families(rng: &mut Rng) -> Vec<Family> {
     let mut families = Vec::new();
     let next_content = |rng: &mut Rng| rng.next() | 1;
     // One forced gate family: H=64, shared length >= GATE_DEPTH.
-    let mut budgets: Vec<(usize, u64)> = SHARING_MIX
+    let mut budgets: Vec<(usize, u64)> = profile()
+        .sharing_mix
         .iter()
         .map(|&(h, pct)| (h, target_blocks() * pct / 100))
         .collect();
@@ -77,7 +146,7 @@ fn build_families(rng: &mut Rng) -> Vec<Family> {
                 force_gate = false;
                 96
             } else {
-                log_uniform(rng, SHARED_DEPTH.0, SHARED_DEPTH.1)
+                log_uniform(rng, profile().shared_depth.0, profile().shared_depth.1)
             };
             let mut blocks = Vec::with_capacity(shared_len as usize);
             let mut prev_key = 0u64;
@@ -111,9 +180,14 @@ fn build_families(rng: &mut Rng) -> Vec<Family> {
 
 /// Expand families into the mixed write stream (stores + duplicates +
 /// gap removes), per-holder order preserved, §7-scoped interleave.
-fn build_ops(rng: &mut Rng, families: &[Family]) -> (Vec<Op>, u64) {
+fn build_ops(rng: &mut Rng, families: &[Family]) -> (Vec<Op>, u64, u64) {
     let mut per_holder: Vec<Vec<Op>> = vec![Vec::new(); holders()];
     let mut holder_blocks = 0u64;
+    // Exact count of blocks the gap removes take back out: the
+    // resident cross-check must not blame the structure for blocks
+    // the WORKLOAD removed (the churn profile's 10% gaps tripped the
+    // pinned-calibrated 97% floor and killed the run).
+    let mut removed_blocks = 0u64;
     for family in families {
         for &holder in &family.holders {
             let mut parent = None;
@@ -127,7 +201,8 @@ fn build_ops(rng: &mut Rng, families: &[Family]) -> (Vec<Op>, u64) {
                 parent = Some(chunk.last().expect("non-empty").0);
             }
             // Divergent tail.
-            let tail_len = TAIL_LEN.0 + (rng.next() % (TAIL_LEN.1 - TAIL_LEN.0 + 1) as u64) as u32;
+            let (tail_lo, tail_hi) = profile().tail_len;
+            let tail_len = tail_lo + (rng.next() % (tail_hi - tail_lo + 1) as u64) as u32;
             let mut prev_key = parent.expect("family non-empty");
             let mut tail = Vec::with_capacity(tail_len as usize);
             for _ in 0..tail_len {
@@ -150,12 +225,12 @@ fn build_ops(rng: &mut Rng, families: &[Family]) -> (Vec<Op>, u64) {
             holder_blocks += (family.blocks.len() + tail.len()) as u64;
             let mut dups = Vec::new();
             for b in &batches {
-                if rng.chance(DUPLICATE_PCT) {
+                if rng.chance(profile().duplicate_pct) {
                     dups.push(b.clone());
                 }
             }
             let mut gaps = Vec::new();
-            if rng.chance(GAP_PCT * 10) && family.blocks.len() > 2 {
+            if rng.chance(profile().gap_pct * 10) && family.blocks.len() > 2 {
                 // ~GAP_PCT of blocks overall: one block per ~10% of
                 // instances at these lengths.
                 let victim = family.blocks[1 + rng.below(family.blocks.len() - 2)].0;
@@ -163,6 +238,9 @@ fn build_ops(rng: &mut Rng, families: &[Family]) -> (Vec<Op>, u64) {
                     holder,
                     keys: vec![victim],
                 });
+                // Dups precede gaps in the script, so the victim is
+                // present exactly once when the remove lands.
+                removed_blocks += 1;
             }
             let script = &mut per_holder[holder];
             script.extend(batches);
@@ -184,7 +262,7 @@ fn build_ops(rng: &mut Rng, families: &[Family]) -> (Vec<Op>, u64) {
             live.swap_remove(li);
         }
     }
-    (ops, holder_blocks)
+    (ops, holder_blocks, removed_blocks)
 }
 
 fn rss_kib() -> u64 {
@@ -301,7 +379,7 @@ impl Sider {
 fn pinned_workload() {
     let mut rng = Rng::new(20260901);
     let families = build_families(&mut rng);
-    let (ops, holder_blocks) = build_ops(&mut rng, &families);
+    let (ops, holder_blocks, removed_blocks) = build_ops(&mut rng, &families);
     let total_blocks: u64 = ops
         .iter()
         .map(|op| match op {
@@ -320,6 +398,7 @@ fn pinned_workload() {
 
     let side_name = side();
     println!("side: {side_name}");
+    println!("profile: {} ({} holders)", profile().name, holders());
     // P4 mixed-phase probes: built BEFORE the fill so latency can be
     // sampled while the write stream runs.
     let mut mixed_probes: Vec<Vec<u64>> = Vec::new();
@@ -388,9 +467,11 @@ fn pinned_workload() {
         Sider::R1(tree, _, _, _) => tree.stats().holder_blocks,
         Sider::R3(tree, _, _, _) => tree.stats().holder_blocks,
     };
+    let expected = holder_blocks - removed_blocks;
     assert!(
-        resident * 100 >= holder_blocks * 97,
-        "structure holds {resident} of {holder_blocks} generated holder-blocks — silent loss"
+        resident * 100 >= expected * 97,
+        "structure holds {resident} of {expected} expected holder-blocks \
+         ({holder_blocks} generated - {removed_blocks} removed) — silent loss"
     );
     let rss_after = rss_kib();
     println!(
@@ -415,7 +496,7 @@ fn pinned_workload() {
             .map(|&(_, c)| c)
             .collect()
     };
-    for &(h, _) in &SHARING_MIX {
+    for &(h, _) in &profile().sharing_mix {
         let mut queries = Vec::new();
         for fam in families.iter().filter(|f| f.holders.len() == h) {
             if queries.len() >= 2000 {
@@ -442,9 +523,11 @@ fn pinned_workload() {
     if !mixed_lat.is_empty() {
         mixed_lat.sort_unstable();
         println!(
-            "cell mixed-phase: n={} p50={}ns p99={}ns (queries during live writes)",
+            "cell mixed-phase: n={} p50={}ns p90={}ns p95={}ns p99={}ns (queries during live writes)",
             mixed_lat.len(),
             percentile(&mixed_lat, 0.50),
+            percentile(&mixed_lat, 0.90),
+            percentile(&mixed_lat, 0.95),
             percentile(&mixed_lat, 0.99),
         );
     }
@@ -466,9 +549,11 @@ fn pinned_workload() {
         }
         lat.sort_unstable();
         println!(
-            "cell {label}: n={} p50={}ns p99={}ns",
+            "cell {label}: n={} p50={}ns p90={}ns p95={}ns p99={}ns",
             lat.len(),
             percentile(&lat, 0.50),
+            percentile(&lat, 0.90),
+            percentile(&lat, 0.95),
             percentile(&lat, 0.99),
         );
     }
