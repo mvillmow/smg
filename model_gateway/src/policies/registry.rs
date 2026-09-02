@@ -265,6 +265,15 @@ impl PolicyRegistry {
         *self.remote_index.write() = handle;
     }
 
+    /// Whether the shared remote index is configured. A cheap gate for
+    /// callers that would otherwise pay to hoist owned routing inputs
+    /// (e.g. the HTTP router copying tokens out of its request view)
+    /// before the async `resolve_remote_overlap`; with the flag off this
+    /// returns `false` and that work is skipped entirely.
+    pub(crate) fn remote_index_enabled(&self) -> bool {
+        self.remote_index.read().is_some()
+    }
+
     /// Routing-time remote-index query — the piece that used to live in
     /// the gRPC selection stage, now here so every router shares it.
     /// Computes the request's content-hash chain, queries the index
