@@ -50,33 +50,50 @@ pub struct RemoteIndex {
     /// query resolves Disconnected immediately instead of burning its
     /// deadline on a stream that cannot answer.
     connected: Arc<AtomicBool>,
+    /// `Some` when digest publishing is enabled: a re-publish of an
+    /// established chain sends a `{tip, len}` digest instead of its
+    /// blocks (the index confirms it with one lookup, or misses and
+    /// the publisher resends full). Opt-in — off, every publish is a
+    /// full chain, byte-identical to the pre-digest client.
+    digest: Option<bridge::DigestCache>,
 }
 
 impl RemoteIndex {
     /// Lazy client: drivers connect (and reconnect) in the background.
+    pub fn connect(url: String) -> Arc<Self> {
+        // Digest publishing is opt-in (RADIX_CLIENT_DIGEST=1) until the
+        // sim rig validates it end to end, mirroring how the whole
+        // remote index sits behind --kv-indexer-url.
+        let digest_on = std::env::var("RADIX_CLIENT_DIGEST").as_deref() == Ok("1");
+        Self::connect_with(url, digest_on)
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "client-lifetime driver tasks; the owner holds the Arc for the process lifetime"
     )]
-    pub fn connect(url: String) -> Arc<Self> {
+    pub fn connect_with(url: String, digest_on: bool) -> Arc<Self> {
         let (query_tx, query_rx) = mpsc::channel::<PendingQuery>(4096);
         let (placement_tx, placement_rx) = mpsc::channel::<proto::Update>(65_536);
         let connected = Arc::new(AtomicBool::new(false));
+        let digest = digest_on.then(bridge::DigestCache::default);
         tokio::spawn(subscribe_driver(
             url.clone(),
             query_rx,
             Arc::clone(&connected),
         ));
-        tokio::spawn(bridge::run_publisher(
+        tokio::spawn(bridge::run_publisher_with_digest(
             placement_rx,
             url,
             bridge::EpochLedger::default(),
+            digest.clone(),
         ));
         Arc::new(Self {
             queries: query_tx,
             placements: placement_tx,
             next_id: AtomicU64::new(1),
             connected,
+            digest,
         })
     }
 
@@ -138,8 +155,13 @@ impl RemoteIndex {
         holder: &str,
         content_hashes: &[u64],
     ) {
+        if content_hashes.is_empty() {
+            return;
+        }
         let hashes: Vec<ContentHash> = content_hashes.iter().copied().map(ContentHash).collect();
-        let blocks = placement_chain(&hashes)
+        let chain = placement_chain(&hashes);
+        let tip = chain.last().expect("non-empty").seq_hash.0;
+        let blocks = chain
             .into_iter()
             .map(|b| proto::Block {
                 seq_hash: b.seq_hash.0,
@@ -163,7 +185,16 @@ impl RemoteIndex {
             added: None,
             dropped: false,
         };
-        let _ = self.placements.try_send(update);
+        // With digest enabled, an already-established chain publishes as
+        // a tiny {tip, len} digest; the run_publisher ack loop resends
+        // `update` in full on a miss. Otherwise send the full chain.
+        let to_send = match &self.digest {
+            Some(cache) => cache
+                .plan(tip, content_hashes.len() as u32, &update)
+                .unwrap_or(update),
+            None => update,
+        };
+        let _ = self.placements.try_send(to_send);
     }
 
     /// Fleet-membership lifecycle: soft-retire `holder` (stop scoring

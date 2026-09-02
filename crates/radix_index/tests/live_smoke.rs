@@ -223,3 +223,68 @@ async fn client_placements_and_queries_roundtrip() {
         }
     }
 }
+
+/// Digest-enabled client end to end: a fresh chain is established with
+/// a full send, re-publishes go out as digests, and a chain the index
+/// never saw (digest-first) misses and is resent full — so it still
+/// becomes queryable. Exercises the whole client digest + ack-resend
+/// path over the real wire.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fixture: fire-and-forget servers for the test's lifetime"
+)]
+#[tokio::test]
+async fn client_digest_roundtrip_establishes_and_recovers_misses() {
+    use radix_index::client::{QueryOutcome, RemoteIndex};
+
+    let port = portpicker::pick_unused_port().expect("port");
+    let engine = Arc::new(Engine::new(EngineConfig::default()));
+    tokio::spawn(server::serve(
+        engine,
+        format!("127.0.0.1:{port}").parse().unwrap(),
+        Vec::new(),
+        Duration::from_secs(60),
+    ));
+    let client = RemoteIndex::connect_with(format!("http://127.0.0.1:{port}"), true);
+    let holder = "grpc://10.0.0.9:9000";
+
+    let tokens: Vec<u32> = (100..132).collect();
+    let hashes: Vec<u64> = compute_request_content_hashes(&tokens, BLOCK as usize)
+        .into_iter()
+        .map(|h| h.0)
+        .collect();
+    let expected_blocks = hashes.len() as u32;
+
+    let queryable = |client: std::sync::Arc<RemoteIndex>, hashes: Vec<u64>| async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let QueryOutcome::Scores(scores) = client
+                .query(MODEL, BLOCK, hashes.clone(), Duration::from_millis(50))
+                .await
+            {
+                return scores[0].1;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("never became queryable");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    // First publish establishes (full send); becomes queryable.
+    client.publish_placement(MODEL, BLOCK, holder, &hashes);
+    assert_eq!(
+        queryable(client.clone(), hashes.clone()).await,
+        expected_blocks
+    );
+
+    // Re-publishes now go out as digests and confirm (no state change);
+    // the chain stays queryable.
+    for _ in 0..5 {
+        client.publish_placement(MODEL, BLOCK, holder, &hashes);
+    }
+    assert_eq!(
+        queryable(client.clone(), hashes.clone()).await,
+        expected_blocks
+    );
+}

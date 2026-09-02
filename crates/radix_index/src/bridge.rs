@@ -47,6 +47,64 @@ impl EpochLedger {
     }
 }
 
+/// Publisher-side digest state: chains this client has ESTABLISHED
+/// with the index (sent full, not since missed), so a re-publish can
+/// send a `{tip, len}` digest instead of the full block chain. The
+/// stored full `Update` is the replay source: a `digest_miss_tip` ack
+/// or a reconnect resends it in full — so a digest is NEVER a silent
+/// under-match. Bounded; eviction just forces a future full re-send.
+#[derive(Clone, Default)]
+pub struct DigestCache(Arc<Mutex<HashMap<u64, proto::Update>>>);
+
+/// Cap on established chains retained per client process. Past it,
+/// eviction forces full re-sends — correctness holds, cost rises.
+const DIGEST_CACHE_CAP: usize = 131_072;
+
+impl DigestCache {
+    /// Decide how to publish `full` (whose chain tip is `tip`): return
+    /// `Some(digest)` if the chain is already established (send that
+    /// instead), or `None` to send `full` as-is (and record it).
+    pub fn plan(&self, tip: u64, len: u32, full: &proto::Update) -> Option<proto::Update> {
+        let mut map = self.0.lock().expect("digest cache lock");
+        if map.contains_key(&tip) {
+            return Some(proto::Update {
+                keyspace: full.keyspace.clone(),
+                holder: full.holder.clone(),
+                epoch: full.epoch,
+                seq: 0,
+                events: vec![proto::Event {
+                    kind: Some(proto::event::Kind::StoredDigest(proto::StoredDigest {
+                        parent_seq_hash: None,
+                        tip_seq_hash: tip,
+                        len,
+                    })),
+                }],
+                added: None,
+                dropped: false,
+            });
+        }
+        if map.len() >= DIGEST_CACHE_CAP {
+            if let Some(&victim) = map.keys().next() {
+                map.remove(&victim);
+            }
+        }
+        map.insert(tip, full.clone());
+        None
+    }
+
+    /// The full chain to resend for a missed digest tip, if retained.
+    pub fn resend(&self, tip: u64) -> Option<proto::Update> {
+        self.0.lock().expect("digest cache lock").get(&tip).cloned()
+    }
+
+    /// Forget everything: after a reconnect the peer may be a different
+    /// replica (or a restarted one) that does not hold these chains, so
+    /// the next publishes must re-establish with full sends.
+    pub fn reset(&self) {
+        self.0.lock().expect("digest cache lock").clear();
+    }
+}
+
 pub fn keyspace(model: &str, block_size: u32) -> proto::Keyspace {
     proto::Keyspace {
         model: model.to_string(),
@@ -180,10 +238,18 @@ pub async fn worker_loop(
 /// The publish pump: drain `rx` into one (re)connected Publish stream to
 /// `index`. The receiver persists across reconnects, so no update is
 /// lost inside the bridge. Returns when all worker loops have ended.
-pub async fn run_publisher(
+pub async fn run_publisher(rx: mpsc::Receiver<proto::Update>, index: String, ledger: EpochLedger) {
+    run_publisher_with_digest(rx, index, ledger, None).await
+}
+
+/// As `run_publisher`, plus optional publisher-side digest support:
+/// on reconnect the cache is reset (the peer may not hold prior
+/// chains), and a `digest_miss_tip` ack resends that chain in full.
+pub async fn run_publisher_with_digest(
     mut rx: mpsc::Receiver<proto::Update>,
     index: String,
     ledger: EpochLedger,
+    digest: Option<DigestCache>,
 ) {
     loop {
         let Ok(client) = RadixIndexClient::connect(index.clone()).await else {
@@ -203,6 +269,11 @@ pub async fn run_publisher(
                 continue;
             }
         };
+        // New connection: the peer may be a different or restarted
+        // replica, so no chain can be assumed established.
+        if let Some(cache) = &digest {
+            cache.reset();
+        }
         loop {
             tokio::select! {
                 item = rx.recv() => match item {
@@ -215,7 +286,18 @@ pub async fn run_publisher(
                     None => return,
                 },
                 ack = acks.next() => match ack {
-                    Some(Ok(ack)) => ledger.observe(&ack.holder, ack.epoch),
+                    Some(Ok(ack)) => {
+                        ledger.observe(&ack.holder, ack.epoch);
+                        // A digest the index could not confirm: resend
+                        // the chain in full — never a silent under-match.
+                        if let (Some(cache), Some(tip)) = (&digest, ack.digest_miss_tip) {
+                            if let Some(full) = cache.resend(tip) {
+                                if fwd_tx.send(full).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     Some(Err(_)) | None => break,
                 }
             }
