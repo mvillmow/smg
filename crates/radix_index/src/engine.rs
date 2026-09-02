@@ -372,9 +372,22 @@ impl Engine {
                 j += 1;
             }
             let space = self.space_or_create(&updates[i].keyspace);
-            let mut guard = space.write().expect(LOCK_MSG);
-            for u in &updates[i..j] {
-                out.push(self.apply_locked(&mut guard, u));
+            // Apply the same-keyspace run in bounded sub-batches, RELEASING
+            // and re-acquiring the write lock between them, so shared-lock
+            // queries get a window every SUB_BATCH applies instead of
+            // waiting behind the whole run. Caps the query-latency tail
+            // under a heavy write burst without a per-update lock grab.
+            const SUB_BATCH: usize = 16;
+            let mut k = i;
+            while k < j {
+                let end = (k + SUB_BATCH).min(j);
+                {
+                    let mut guard = space.write().expect(LOCK_MSG);
+                    for u in &updates[k..end] {
+                        out.push(self.apply_locked(&mut guard, u));
+                    }
+                }
+                k = end;
             }
             i = j;
         }
