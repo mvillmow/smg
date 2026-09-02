@@ -52,7 +52,6 @@ use super::{
         },
         streaming,
     },
-    remote_index,
     spec::ResponseSpec,
     utils,
     utils::error_type_from_status,
@@ -99,9 +98,6 @@ pub(crate) struct PipelineDeps {
     /// `None` when tenant rate limiting is disabled; read only by the
     /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
     rate_limit_manager: Option<Arc<RateLimitManager>>,
-    /// Remote radix-index handle for the dispatch-time placement publish;
-    /// `None` unless `--kv-indexer-url` is configured.
-    remote_index: Option<Arc<remote_index::RemoteIndexHandle>>,
 }
 
 impl PipelineDeps {
@@ -119,7 +115,6 @@ impl PipelineDeps {
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
-        remote_index: Option<Arc<remote_index::RemoteIndexHandle>>,
     ) -> Self {
         Self {
             worker_registry,
@@ -129,7 +124,6 @@ impl PipelineDeps {
             configured_tool_parser,
             configured_reasoning_parser,
             rate_limit_manager,
-            remote_index,
         }
     }
 
@@ -139,7 +133,6 @@ impl PipelineDeps {
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
-        remote_index: Option<Arc<remote_index::RemoteIndexHandle>>,
     ) -> Self {
         Self {
             worker_registry,
@@ -149,7 +142,6 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager,
-            remote_index,
         }
     }
 
@@ -214,7 +206,6 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager: None,
-            remote_index: None,
         }
     }
 }
@@ -242,8 +233,10 @@ pub(crate) struct RequestPipeline {
     backend_type: &'static str,
     /// Disaggregation mode, for per-leg retry metric labels.
     mode: Mode,
-    /// Remote radix-index handle for the dispatch-time placement publish.
-    remote_index: Option<Arc<remote_index::RemoteIndexHandle>>,
+    /// Owns the remote-index placement publish (no-op unless the shared
+    /// index is configured). Held here so the post-dispatch success paths
+    /// can publish without re-plumbing a handle through every router.
+    policy_registry: Arc<PolicyRegistry>,
 }
 
 /// Outcome of one full pipeline run.
@@ -273,7 +266,6 @@ impl RequestPipeline {
             deps.worker_registry.clone(),
             deps.policy_registry.clone(),
             mode.worker_selection(),
-            deps.remote_index.clone(),
         );
         let plan_kind = mode.plan_kind();
         let inject_pd_metadata = mode.inject_pd_metadata();
@@ -386,7 +378,7 @@ impl RequestPipeline {
             stages: Arc::new(stages),
             backend_type: backend,
             mode,
-            remote_index: deps.remote_index.clone(),
+            policy_registry: deps.policy_registry.clone(),
         })
     }
 
@@ -717,16 +709,9 @@ impl RequestPipeline {
         let Some(prediction) = &dctx.index_prediction else {
             return;
         };
-        if let (Some(handle), Some(WorkerSelection::Single { worker })) =
-            (self.remote_index.as_ref(), &dctx.workers)
-        {
-            handle.client().publish_placement(
-                &prediction.model,
-                prediction.block_size as u32,
-                worker.url(),
-                &prediction.content_hashes,
-            );
-            Metrics::record_remote_index_publish();
+        if let Some(WorkerSelection::Single { worker }) = &dctx.workers {
+            self.policy_registry
+                .publish_placement(prediction, worker.url(), None);
         }
     }
 
@@ -851,43 +836,33 @@ impl RequestPipeline {
                     // KV spans prompt ⊕ output; stores dedupe on the shared
                     // prefix), and echoes the prediction so the harness can
                     // separate index error from policy spill.
-                    if let (Some(prediction), Some(handle)) =
-                        (&dctx.index_prediction, self.remote_index.as_ref())
-                    {
+                    if let Some(prediction) = &dctx.index_prediction {
                         if let Some(WorkerSelection::Single { worker }) = &dctx.workers {
-                            let tokens = (!dctx.routing.token_ids.is_empty())
-                                .then_some(&dctx.routing.token_ids);
-                            let chain: Vec<u64> = match (tokens, response.first()) {
-                                (Some(tokens), Some(first)) => {
-                                    let mut all = tokens.clone();
-                                    all.extend_from_slice(&first.output_ids);
-                                    kv_index::compute_request_content_hashes(
-                                        &all,
-                                        prediction.block_size,
-                                    )
-                                    .iter()
-                                    .map(|h| h.0)
-                                    .collect()
-                                }
-                                _ => prediction.content_hashes.clone(),
-                            };
-                            handle.client().publish_placement(
-                                &prediction.model,
-                                prediction.block_size as u32,
+                            // Prompt ⊕ output re-hash when both are present;
+                            // otherwise the policy republishes the prompt chain.
+                            let refined: Option<Vec<u32>> =
+                                match (dctx.routing.token_ids.is_empty(), response.first()) {
+                                    (false, Some(first)) => {
+                                        let mut all = dctx.routing.token_ids.clone();
+                                        all.extend_from_slice(&first.output_ids);
+                                        Some(all)
+                                    }
+                                    _ => None,
+                                };
+                            self.policy_registry.publish_placement(
+                                prediction,
                                 worker.url(),
-                                &chain,
+                                refined.as_deref(),
                             );
-                            Metrics::record_remote_index_publish();
-                            let predicted_tokens = prediction
-                                .scores
-                                .iter()
-                                .find(|(url, _)| url == worker.url())
-                                .map_or(0, |(_, blocks)| *blocks as usize * prediction.block_size);
                             let headers = http_response.headers_mut();
-                            if let Ok(value) = predicted_tokens.to_string().parse() {
+                            if let Ok(value) = prediction
+                                .predicted_tokens_for(worker.url())
+                                .to_string()
+                                .parse()
+                            {
                                 headers.insert("x-smg-index-predicted-tokens", value);
                             }
-                            if let Ok(value) = prediction.source.parse() {
+                            if let Ok(value) = prediction.source().parse() {
                                 headers.insert("x-smg-index-source", value);
                             }
                         }
@@ -1378,7 +1353,7 @@ mod alias_pipeline_tests {
             .unwrap();
 
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None, None);
+        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None);
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
             tokenizer_registry,
@@ -1746,7 +1721,6 @@ mod request_release_tests {
         let deps = PipelineDeps::pair(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-            None,
             None,
         );
         RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")

@@ -8,6 +8,7 @@ use http::{header::HeaderName, HeaderMap};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
+use super::remote_index::{outcome_label, IndexPrediction, RemoteIndexHandle, QUERY_DEADLINE};
 /// Policy Registry for managing model-to-policy mappings
 ///
 /// This registry manages the dynamic assignment of load balancing policies to models.
@@ -60,6 +61,10 @@ pub struct PolicyRegistry {
     /// Optional KV event monitor for event-driven cache-aware routing.
     /// When set, new CacheAwarePolicy instances are injected with this monitor.
     kv_event_monitor: Arc<RwLock<Option<Arc<KvEventMonitor>>>>,
+    /// The shared remote radix index (`--kv-indexer-url`); `None` = flag
+    /// off. Owning it here is what lets EVERY router get cache-aware
+    /// remote routing through one call, instead of per-router wiring.
+    remote_index: Arc<RwLock<Option<Arc<RemoteIndexHandle>>>>,
 
     /// Optional backend load-snapshot receiver from the `WorkerMonitor`. When
     /// set, new CacheAwarePolicy instances are injected with it for the KV-usage
@@ -156,6 +161,7 @@ impl PolicyRegistry {
             decode_policy: Arc::new(OnceLock::new()),
             encode_policy: Arc::new(OnceLock::new()),
             kv_event_monitor: Arc::new(RwLock::new(None)),
+            remote_index: Arc::new(RwLock::new(None)),
             load_rx: Arc::new(RwLock::new(None)),
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
@@ -251,6 +257,102 @@ impl PolicyRegistry {
             }
         }
         policy.select_worker(workers, info)
+    }
+
+    /// Set the shared remote-index handle (from `AppContext` after the
+    /// client connects). `None` clears it. Mirrors `set_kv_event_monitor`.
+    pub fn set_remote_index(&self, handle: Option<Arc<RemoteIndexHandle>>) {
+        *self.remote_index.write() = handle;
+    }
+
+    /// Routing-time remote-index query — the piece that used to live in
+    /// the gRPC selection stage, now here so every router shares it.
+    /// Computes the request's content-hash chain, queries the index
+    /// under the 2ms deadline, and returns the per-holder overlap for
+    /// the policy blend plus the prediction the router publishes/echoes.
+    /// `None` (no index work, plain select) when: flag off, non-cache_aware
+    /// policy, a sticky override key that wins anyway, or no tokens/hashes.
+    /// Token mode only for now (string/`Bytes` keyspace is a follow-up).
+    pub(crate) async fn resolve_remote_overlap(
+        &self,
+        model_id: &str,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
+    ) -> Option<(RemoteOverlap, IndexPrediction)> {
+        let handle = self.remote_index.read().clone()?;
+        if self.get_policy_or_default(model_id).name() != "cache_aware" {
+            return None;
+        }
+        let sticky_wins = self.routing_key_override_enabled()
+            && (rid_key.is_some() || self.resolve_routing_key(headers).is_some());
+        if sticky_wins {
+            return None;
+        }
+        let tokens = tokens?;
+        let block = handle.block_size();
+        let hashes: Vec<u64> = kv_index::compute_request_content_hashes(tokens, block)
+            .iter()
+            .map(|h| h.0)
+            .collect();
+        if hashes.is_empty() {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let outcome = handle
+            .client()
+            .query(model_id, block as u32, hashes.clone(), QUERY_DEADLINE)
+            .await;
+        let label = outcome_label(&outcome);
+        Metrics::record_remote_index_query(label, started.elapsed());
+        let scores = match outcome {
+            radix_index::client::QueryOutcome::Scores(scores) => scores,
+            _ => Vec::new(),
+        };
+        let overlap = RemoteOverlap {
+            scores: scores.clone(),
+            request_blocks: hashes.len(),
+            block_size: block,
+        };
+        let prediction = IndexPrediction {
+            source: label,
+            scores,
+            block_size: block,
+            content_hashes: hashes,
+            model: model_id.to_string(),
+        };
+        Some((overlap, prediction))
+    }
+
+    /// Publish a placement for the worker a request was dispatched to —
+    /// the router calls this at its post-dispatch SUCCESS point (never
+    /// at select time: that would advertise phantom holders on shed/
+    /// retry). `refine_tokens = Some(prompt ⊕ output)` re-hashes and
+    /// publishes that fuller chain; `None` publishes the prompt-only
+    /// chain the query already computed. No-op when the flag is off.
+    pub(crate) fn publish_placement(
+        &self,
+        prediction: &IndexPrediction,
+        worker_url: &str,
+        refine_tokens: Option<&[u32]>,
+    ) {
+        let Some(handle) = self.remote_index.read().clone() else {
+            return;
+        };
+        let hashes: Vec<u64> = match refine_tokens {
+            Some(tokens) => kv_index::compute_request_content_hashes(tokens, prediction.block_size)
+                .iter()
+                .map(|h| h.0)
+                .collect(),
+            None => prediction.content_hashes.clone(),
+        };
+        handle.client().publish_placement(
+            &prediction.model,
+            prediction.block_size as u32,
+            worker_url,
+            &hashes,
+        );
+        Metrics::record_remote_index_publish();
     }
 
     /// [`Self::select_worker`] with prefetched remote-index scores: the

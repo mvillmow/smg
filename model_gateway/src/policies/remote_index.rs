@@ -1,7 +1,9 @@
 //! Remote radix index access (`--kv-indexer-url`): a per-process client
-//! handle carried on `AppContext` and threaded into the gRPC pipelines.
-//! With the flag unset the handle is `None` and every caller's fast path
-//! is a `None` check.
+//! handle plus the routing-time query result carriers. Lives in the
+//! policy layer (not a router) because the cache-aware policy owns the
+//! index query/publish, so every router gets it through one uniform
+//! call. With the flag unset the handle is `None` and every caller's
+//! fast path is a `None` check.
 
 use std::{sync::Arc, time::Duration};
 
@@ -12,7 +14,8 @@ use radix_index::client::{QueryOutcome, RemoteIndex};
 pub(crate) const QUERY_DEADLINE: Duration = Duration::from_millis(2);
 
 /// The connected remote-index client plus the keyspace block size it was
-/// configured for. One per process, owned by `AppContext`.
+/// configured for. One per process, owned by `AppContext` and shared
+/// with the `PolicyRegistry`.
 pub struct RemoteIndexHandle {
     client: Arc<RemoteIndex>,
     block_size: usize,
@@ -46,8 +49,8 @@ impl std::fmt::Debug for RemoteIndexHandle {
     }
 }
 
-/// What the selection-stage prefetch resolved, kept on the request
-/// context for the placement publish and the response echo headers.
+/// What the routing-time query resolved, kept on the request context for
+/// the placement publish and the response echo headers.
 #[derive(Debug, Clone)]
 pub(crate) struct IndexPrediction {
     /// remote_hit | remote_empty | remote_timeout | remote_disconnected
@@ -59,6 +62,22 @@ pub(crate) struct IndexPrediction {
     /// republished as the placement chain after successful dispatch.
     pub content_hashes: Vec<u64>,
     pub model: String,
+}
+
+impl IndexPrediction {
+    /// Predicted cached tokens on `worker_url` — the echo header the gRPC
+    /// router surfaces so the harness can separate index error from
+    /// policy spill.
+    pub(crate) fn predicted_tokens_for(&self, worker_url: &str) -> usize {
+        self.scores
+            .iter()
+            .find(|(url, _)| url == worker_url)
+            .map_or(0, |(_, blocks)| *blocks as usize * self.block_size)
+    }
+
+    pub(crate) fn source(&self) -> &'static str {
+        self.source
+    }
 }
 
 pub(crate) fn outcome_label(outcome: &QueryOutcome) -> &'static str {

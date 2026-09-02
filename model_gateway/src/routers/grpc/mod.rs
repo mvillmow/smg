@@ -15,7 +15,6 @@ pub(crate) mod multimodal;
 pub(crate) mod pipeline;
 pub(crate) mod proto_wrapper;
 pub(crate) mod regular;
-pub(crate) mod remote_index;
 pub(crate) mod router; // Used by routers/factory
 pub(crate) mod spec;
 pub mod utils; // Used by routers/http and bindings/golang

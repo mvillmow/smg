@@ -24,7 +24,7 @@ use crate::{
                 DispatchContext, EncodeWorkerAssignment, RequestContext, RoutingSnapshot,
                 WireConstraint, WorkerSelection,
             },
-            multimodal, remote_index,
+            multimodal,
         },
     },
     worker::{
@@ -49,7 +49,6 @@ pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     mode: WorkerSelectionMode,
-    remote_index: Option<Arc<remote_index::RemoteIndexHandle>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,13 +66,11 @@ impl WorkerSelectionStage {
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
         mode: WorkerSelectionMode,
-        remote_index: Option<Arc<remote_index::RemoteIndexHandle>>,
     ) -> Self {
         Self {
             worker_registry,
             policy_registry,
             mode,
-            remote_index,
         }
     }
 }
@@ -125,55 +122,20 @@ impl PipelineStage for WorkerSelectionStage {
 
         let model_id = ctx.input.model_id.as_str();
 
-        // Remote-index prefetch (--kv-indexer-url, Regular mode only):
-        // resolve per-holder overlap scores from the shared radix index
-        // BEFORE the synchronous policy call, under a hard deadline.
-        // Skipped whenever it could not matter: flag off, non-cache_aware
-        // policy, no tokens, or a sticky override key that will win anyway.
+        // Remote-index prefetch (--kv-indexer-url, Regular mode only): the
+        // policy layer owns the overlap query so every router gets it from
+        // one call. It returns `None` (plain select) whenever the index
+        // could not matter — flag off, non-cache_aware policy, no tokens,
+        // no hashes, or a sticky override key that will win anyway.
         let mut remote_overlap: Option<crate::policies::RemoteOverlap> = None;
         if matches!(self.mode, WorkerSelectionMode::Regular) {
-            if let (Some(handle), Some(tokens)) = (self.remote_index.as_ref(), tokens) {
-                let sticky_wins = self.policy_registry.routing_key_override_enabled()
-                    && (rid_key.is_some()
-                        || self.policy_registry.resolve_routing_key(headers).is_some());
-                let policy = self.policy_registry.get_policy_or_default(model_id);
-                if policy.name() == "cache_aware" && !sticky_wins {
-                    let block = handle.block_size();
-                    let hashes: Vec<u64> = kv_index::compute_request_content_hashes(tokens, block)
-                        .iter()
-                        .map(|h| h.0)
-                        .collect();
-                    if !hashes.is_empty() {
-                        let started = std::time::Instant::now();
-                        let outcome = handle
-                            .client()
-                            .query(
-                                model_id,
-                                block as u32,
-                                hashes.clone(),
-                                remote_index::QUERY_DEADLINE,
-                            )
-                            .await;
-                        let label = remote_index::outcome_label(&outcome);
-                        Metrics::record_remote_index_query(label, started.elapsed());
-                        let scores = match outcome {
-                            radix_index::client::QueryOutcome::Scores(scores) => scores,
-                            _ => Vec::new(),
-                        };
-                        remote_overlap = Some(crate::policies::RemoteOverlap {
-                            scores: scores.clone(),
-                            request_blocks: hashes.len(),
-                            block_size: block,
-                        });
-                        ctx.state.index_prediction = Some(remote_index::IndexPrediction {
-                            source: label,
-                            scores,
-                            block_size: block,
-                            content_hashes: hashes,
-                            model: model_id.to_string(),
-                        });
-                    }
-                }
+            if let Some((overlap, prediction)) = self
+                .policy_registry
+                .resolve_remote_overlap(model_id, tokens, headers, rid_key)
+                .await
+            {
+                remote_overlap = Some(overlap);
+                ctx.state.index_prediction = Some(prediction);
             }
         }
 
@@ -1021,7 +983,6 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             WorkerSelectionMode::PrefillDecode,
-            None,
         );
         assert!(stage
             .select_pd_pair(model_id, None, None, None, None, None)
@@ -1073,7 +1034,6 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             WorkerSelectionMode::EncodePrefillDecode,
-            None,
         );
 
         // No prefill/decode workers registered: with encode undemanded this is
@@ -1099,7 +1059,6 @@ mod tests {
             Arc::new(WorkerRegistry::new()),
             Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             WorkerSelectionMode::PrefillDecode,
-            None,
         );
         assert_eq!(
             stage
@@ -1132,7 +1091,6 @@ mod tests {
             worker_registry,
             policy_registry,
             WorkerSelectionMode::PrefillDecode,
-            None,
         );
         let (prefill_hits, decode_hits) = count_select_pd_pair_hits(&stage, model_id, 40);
         assert_even_pd_round_robin_coverage(
@@ -1165,7 +1123,6 @@ mod tests {
             worker_registry,
             policy_registry,
             WorkerSelectionMode::PrefillDecode,
-            None,
         );
         let (prefill_hits, decode_hits) = count_select_pd_pair_hits(&stage, model_id, 40);
         assert_even_pd_round_robin_coverage(
@@ -1204,7 +1161,6 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::clone(&policy_registry),
             WorkerSelectionMode::PrefillDecode,
-            None,
         );
 
         assert!(
@@ -1256,7 +1212,6 @@ mod tests {
             worker_registry,
             policy_registry.clone(),
             WorkerSelectionMode::Regular,
-            None,
         );
 
         let rid_key = policy_registry.derive_rid_key(Some("conv7_t1"));
@@ -1316,7 +1271,6 @@ mod tests {
             Arc::clone(&worker_registry),
             policy_registry,
             WorkerSelectionMode::Regular,
-            None,
         );
 
         assert!(stage
@@ -1425,7 +1379,6 @@ mod tests {
             worker_registry,
             Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             WorkerSelectionMode::Regular,
-            None,
         );
 
         let mut ctx = dispatch_ctx(
@@ -1492,7 +1445,6 @@ mod tests {
             worker_registry,
             Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             WorkerSelectionMode::PrefillDecode,
-            None,
         );
 
         let mut ctx = dispatch_ctx(
@@ -1552,7 +1504,6 @@ mod tests {
             worker_registry,
             Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             WorkerSelectionMode::Regular,
-            None,
         );
         let mut ctx = dispatch_ctx(
             model_id,

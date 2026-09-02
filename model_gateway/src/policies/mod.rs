@@ -47,6 +47,8 @@ pub use round_robin::RoundRobinPolicy;
 ///
 /// This trait provides a unified interface for implementing routing algorithms
 /// that can work with both regular single-worker selection and PD dual-worker selection.
+pub(crate) mod remote_index;
+
 pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Select a single worker from the available workers
     ///
