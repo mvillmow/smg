@@ -343,6 +343,13 @@ async fn subscribe_driver(
         };
         connected.store(true, Ordering::Relaxed);
         let mut pending: HashMap<u64, oneshot::Sender<proto::Match>> = HashMap::new();
+        // A query whose answer is shed by the server (try_send Full) or
+        // otherwise lost never gets a matching Match, so its entry would
+        // linger for the life of the connection — an unbounded map under
+        // sustained shedding. Sweep entries whose caller already timed
+        // out (receiver dropped => Sender::is_closed) on a slow tick.
+        let mut evict = tokio::time::interval(PENDING_EVICT_INTERVAL);
+        evict.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 item = queries.recv() => match item {
@@ -363,6 +370,9 @@ async fn subscribe_driver(
                     }
                     _ => break, // stream error/closed; reconnect
                 },
+                _ = evict.tick() => {
+                    evict_timed_out(&mut pending);
+                }
             }
         }
         // Pending replies drop here -> callers resolve Disconnected;
@@ -377,5 +387,55 @@ async fn subscribe_driver(
 fn drain_disconnected(queries: &mut mpsc::Receiver<PendingQuery>) {
     while let Ok(PendingQuery { reply, .. }) = queries.try_recv() {
         drop(reply);
+    }
+}
+
+/// How often the subscribe driver sweeps abandoned pending-answer slots.
+/// A query's caller deadline is single-digit milliseconds, so a 1s sweep
+/// keeps the map bounded by roughly one interval of genuinely in-flight
+/// queries even when every answer is being shed.
+const PENDING_EVICT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Drop pending slots whose caller has already timed out (the receiver
+/// was dropped, so the `oneshot::Sender` reports closed). Bounds the map
+/// against lost/shed answers that would otherwise never remove their id.
+/// Returns the number evicted.
+fn evict_timed_out(pending: &mut HashMap<u64, oneshot::Sender<proto::Match>>) -> usize {
+    let before = pending.len();
+    pending.retain(|_, reply| !reply.is_closed());
+    before - pending.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pending-answer map must shed slots whose caller has timed out
+    /// (receiver dropped) while keeping still-live ones — otherwise a
+    /// shed/lost answer leaks its id for the life of the connection.
+    #[test]
+    fn evict_timed_out_drops_only_abandoned_slots() {
+        let mut pending: HashMap<u64, oneshot::Sender<proto::Match>> = HashMap::new();
+
+        // Two callers time out (receiver dropped); one is still waiting.
+        let (tx_gone_a, rx_a) = oneshot::channel::<proto::Match>();
+        let (tx_gone_b, rx_b) = oneshot::channel::<proto::Match>();
+        let (tx_live, _rx_live) = oneshot::channel::<proto::Match>();
+        drop(rx_a);
+        drop(rx_b);
+        pending.insert(1, tx_gone_a);
+        pending.insert(2, tx_gone_b);
+        pending.insert(3, tx_live);
+
+        assert_eq!(
+            evict_timed_out(&mut pending),
+            2,
+            "two abandoned slots evicted"
+        );
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&3), "the live caller's slot is kept");
+
+        // Idempotent: nothing left to evict.
+        assert_eq!(evict_timed_out(&mut pending), 0);
     }
 }

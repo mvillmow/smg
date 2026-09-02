@@ -84,6 +84,18 @@ pub fn placement_chain(content_hashes: &[ContentHash]) -> Vec<(SequenceHash, Con
 mod tests {
     use super::*;
 
+    /// The scheme gate backs the server's reject-to-empty guard: only the
+    /// versions this build can serve pass; a future/unknown scheme is
+    /// refused so a scheme-mismatched hash never silently matches nothing
+    /// against a v1 keyspace ("fail loudly, don't match silently").
+    #[test]
+    fn scheme_gate_admits_only_known_versions() {
+        assert!(scheme_supported(0), "0 = unset defaults to v1");
+        assert!(scheme_supported(HASH_SCHEME_V1));
+        assert!(!scheme_supported(2), "an unknown/future scheme is refused");
+        assert!(!scheme_supported(u32::MAX));
+    }
+
     /// The scheme must agree with the production gateway crate on
     /// every path — proven directly, not assumed.
     #[test]
