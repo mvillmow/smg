@@ -130,13 +130,19 @@ def main() -> None:
 
     stop_sampling = threading.Event()
     gpu_samples: list[tuple[float, float]] = []
+    gpu_errors: list[str] = []
 
     def sample_gpu() -> None:
         while not stop_sampling.wait(0.5):
             try:
                 gpu_samples.append(_gpu_sample(args.gpu))
-            except (OSError, subprocess.SubprocessError, ValueError):
-                pass
+            except (OSError, subprocess.SubprocessError, ValueError) as error:
+                # A missing nvidia-smi, a bad --gpu index or a permission error
+                # would otherwise just omit the GPU fields, and a summary with
+                # no GPU numbers reads the same as one that was never asked for
+                # them. Record the first failure so the output says so.
+                if not gpu_errors:
+                    gpu_errors.append(f"{type(error).__name__}: {error}")
 
     sampler = threading.Thread(target=sample_gpu, daemon=True)
     sampler.start()
@@ -191,6 +197,12 @@ def main() -> None:
             "process_cpu_s": _process_deltas(process_before, process_after),
         }
     )
+    if gpu_errors:
+        summary["gpu_sampling_error"] = gpu_errors[0]
+        print(
+            f"warning: GPU sampling for --gpu {args.gpu} failed: {gpu_errors[0]}",
+            file=sys.stderr,
+        )
     if gpu_samples:
         utils = [sample[0] for sample in gpu_samples]
         powers = [sample[1] for sample in gpu_samples]

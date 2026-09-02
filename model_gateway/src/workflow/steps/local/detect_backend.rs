@@ -319,17 +319,35 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
         }
 
         // An SMG worker endpoint does not expose an engine scheduler health
-        // surface. Until runtime metadata is part of the internal handshake,
-        // require it in the registration spec rather than guessing by racing
-        // engine-specific probes.
+        // surface, so engine-specific probing is off the table. It does not need
+        // to be: `DetectConnectionModeStep` has already completed the control
+        // handshake and recorded what the Worker says it runs. Use that rather
+        // than failing -- this step is retryable, so a hard error here would
+        // burn every retry attempt before the workflow reaches the metadata
+        // step that reads the same field.
         if config.worker_mode == WorkerMode::Smg {
-            return Err(WorkflowError::StepFailed {
-                step_id: wfaas::StepId::new("detect_backend"),
-                message: format!(
-                    "SMG worker {} must declare runtime_type explicitly; engine-specific gRPC probing is disabled for worker_mode=smg",
-                    config.url
-                ),
-            });
+            let discovered = context
+                .data
+                .smg_worker_discovery
+                .as_ref()
+                .and_then(|discovery| discovery.engines.first())
+                .map(|engine| engine.engine_type.clone());
+            let Some(runtime) = discovered else {
+                return Err(WorkflowError::StepFailed {
+                    step_id: wfaas::StepId::new("detect_backend"),
+                    message: format!(
+                        "SMG worker {} advertised no engines and declared no runtime_type; \
+                         engine-specific gRPC probing is disabled for worker_mode=smg",
+                        config.url
+                    ),
+                });
+            };
+            debug!(
+                "Using SMG-advertised runtime type: {} for {}",
+                runtime, config.url
+            );
+            context.data.detected_runtime_type = Some(runtime);
+            return Ok(StepResult::Success);
         }
 
         debug!(

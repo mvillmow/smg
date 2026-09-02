@@ -55,7 +55,11 @@ use crate::{
 /// Default HTTP client timeout for worker requests (in seconds)
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
 
-const TOKEN_ONLY_WIRE_FEATURE: &str = "token_only_wire";
+/// Capability a Worker advertises when its engine wire carries token ids only,
+/// so the Router must resolve string stops and the EOS backstop itself. Public
+/// because the Python `WorkerControlServer` bridge derives it from the engine
+/// transport and has to name the same string.
+pub const TOKEN_ONLY_WIRE_FEATURE: &str = "token_only_wire";
 
 fn smg_worker_uses_token_only_wire(labels: &std::collections::HashMap<String, String>) -> bool {
     if labels
@@ -1385,6 +1389,33 @@ impl BasicWorker {
         }
 
         self.adopt_backend_client_from(other);
+        self.adopt_smg_instance_id_from(other);
+    }
+
+    /// Carry over an instance ID the replaced worker had already accepted.
+    ///
+    /// `smg.instance_id` is frozen at registration, so a same-URL replacement
+    /// re-reads the *original* label. If the old worker had adopted a restarted
+    /// Worker's ID, dropping that adoption sends the replacement -- which
+    /// inherits `Ready` through the shared runtime above -- straight back into
+    /// failing every identity probe until the readiness state machine demotes
+    /// it, even though the Worker is serving normally.
+    ///
+    /// A replacement that carries a *newer* label wins: that is a genuine
+    /// re-registration, and its label is the authority.
+    fn adopt_smg_instance_id_from(&self, other: &BasicWorker) {
+        if self.metadata.spec.worker_mode != WorkerMode::Smg {
+            return;
+        }
+        let Some(accepted) = other.smg_instance_id.load_full() else {
+            return;
+        };
+        let own_label = self.metadata.spec.labels.get("smg.instance_id");
+        let other_label = other.metadata.spec.labels.get("smg.instance_id");
+        if own_label.is_some() && own_label != other_label {
+            return;
+        }
+        self.smg_instance_id.store(Some(accepted));
     }
 
     /// Adopt the replaced worker's backend-client cell so a same-URL
@@ -1877,6 +1908,17 @@ impl Worker for BasicWorker {
                             // `smg.instance_id` label is frozen at registration
                             // and static `--worker-urls` deployments have no
                             // re-registration path at all.
+                            //
+                            // Adoption is deliberately narrow: it lets the
+                            // worker probe its way back, and nothing more. The
+                            // rest of the registration -- `served_model_name`,
+                            // capabilities, `token_only_wire`/`engine_transport`
+                            // -- is not re-derived, so a Worker that came back
+                            // as a *different* engine or model keeps serving
+                            // under the old spec. Re-registration (discovery,
+                            // or the worker-management API) is what fixes that;
+                            // this only avoids the strictly worse outcome of a
+                            // permanently unroutable endpoint.
                             tracing::warn!(
                                 control_url,
                                 expected_instance_id = %expected_instance_id,
@@ -2142,6 +2184,7 @@ mod tests {
         routers::grpc::proto_wrapper::{ProtoGenerateRequest, ProtoResponseVariant},
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            manager::compute_next_status,
             BasicWorkerBuilder,
         },
     };
@@ -2279,6 +2322,181 @@ mod tests {
         }
     }
 
+    /// Answers `GetIdentity` with whatever the constructor was handed, so the
+    /// tests can reproduce a Worker that reports no usable instance ID at all:
+    /// `identity: None` (the field is absent on the wire) and an
+    /// all-whitespace `instance_id`.
+    struct BlankIdentityWorkerControl {
+        identity: Option<worker_proto::WorkerIdentity>,
+    }
+
+    impl BlankIdentityWorkerControl {
+        fn absent() -> Self {
+            Self { identity: None }
+        }
+
+        fn whitespace() -> Self {
+            Self {
+                identity: Some(worker_proto::WorkerIdentity {
+                    worker_id: "worker-a".to_string(),
+                    instance_id: "   ".to_string(),
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl WorkerControlService for BlankIdentityWorkerControl {
+        async fn get_identity(
+            &self,
+            _request: Request<GetIdentityRequest>,
+        ) -> Result<Response<worker_proto::GetIdentityResponse>, Status> {
+            Ok(Response::new(worker_proto::GetIdentityResponse {
+                identity: self.identity.clone(),
+            }))
+        }
+
+        async fn get_capabilities(
+            &self,
+            _request: Request<worker_proto::GetCapabilitiesRequest>,
+        ) -> Result<Response<worker_proto::GetCapabilitiesResponse>, Status> {
+            Err(Status::unimplemented("not needed by identity tests"))
+        }
+
+        async fn get_health(
+            &self,
+            _request: Request<GetHealthRequest>,
+        ) -> Result<Response<worker_proto::GetHealthResponse>, Status> {
+            Ok(Response::new(worker_proto::GetHealthResponse {
+                state: WorkerHealthState::Serving.into(),
+                message: "ready".to_string(),
+                ..Default::default()
+            }))
+        }
+
+        async fn get_topology(
+            &self,
+            _request: Request<worker_proto::GetTopologyRequest>,
+        ) -> Result<Response<worker_proto::GetTopologyResponse>, Status> {
+            Err(Status::unimplemented("not needed by identity tests"))
+        }
+    }
+
+    /// Serve `control` on an ephemeral port until the returned handle is
+    /// aborted, and hand back the address to point a worker at.
+    fn spawn_worker_control<S>(control: S) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
+    where
+        S: WorkerControlService,
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only tonic server is explicitly aborted before the test returns"
+        )]
+        let server = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(WorkerControlServer::new(control))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        (address, server)
+    }
+
+    #[test]
+    fn same_url_replacement_keeps_the_accepted_smg_instance_id() {
+        // `smg.instance_id` is frozen at registration, so a replacement built
+        // from the same spec re-reads the *original* label. It also inherits
+        // `Ready` through the shared runtime -- so without carrying the
+        // adoption over, the replacement would fail every identity probe until
+        // the state machine demoted it again, for a Worker that is serving.
+        let spec = || {
+            BasicWorkerBuilder::new("grpc://127.0.0.1:50051")
+                .worker_mode(WorkerMode::Smg)
+                .connection_mode(ConnectionMode::Grpc)
+                .label("smg.instance_id", "instance-before-restart")
+                .health_config(no_health_check())
+                .build()
+        };
+
+        let original = spec();
+        original
+            .smg_instance_id
+            .store(Some(Arc::new("instance-after-restart".to_string())));
+
+        let replacement = spec();
+        assert!(replacement.smg_instance_id.load().is_none());
+        replacement.install_shared_state_from_basic(&original);
+        assert_eq!(
+            replacement
+                .smg_instance_id
+                .load_full()
+                .as_deref()
+                .map(String::as_str),
+            Some("instance-after-restart")
+        );
+    }
+
+    #[test]
+    fn replacement_with_a_newer_instance_label_wins_over_the_adopted_id() {
+        // A replacement carrying a different label is a real re-registration,
+        // not a metadata-only update: its label is the authority.
+        let original = BasicWorkerBuilder::new("grpc://127.0.0.1:50051")
+            .worker_mode(WorkerMode::Smg)
+            .connection_mode(ConnectionMode::Grpc)
+            .label("smg.instance_id", "instance-a")
+            .health_config(no_health_check())
+            .build();
+        original
+            .smg_instance_id
+            .store(Some(Arc::new("instance-b".to_string())));
+
+        let replacement = BasicWorkerBuilder::new("grpc://127.0.0.1:50051")
+            .worker_mode(WorkerMode::Smg)
+            .connection_mode(ConnectionMode::Grpc)
+            .label("smg.instance_id", "instance-c")
+            .health_config(no_health_check())
+            .build();
+        replacement.install_shared_state_from_basic(&original);
+        assert!(replacement.smg_instance_id.load().is_none());
+    }
+
+    #[tokio::test]
+    async fn smg_health_never_adopts_a_blank_instance_id() {
+        // An adopted blank ID is worse than no adoption: the next probe would
+        // compare blank against blank, match, and report a Worker that lost all
+        // its state as healthy.
+        for control in [
+            BlankIdentityWorkerControl::absent(),
+            BlankIdentityWorkerControl::whitespace(),
+        ] {
+            let (address, server) = spawn_worker_control(control);
+            let worker = BasicWorkerBuilder::new(format!("grpc://{address}"))
+                .worker_mode(WorkerMode::Smg)
+                .connection_mode(ConnectionMode::Grpc)
+                .label("smg.instance_id", "stale-instance")
+                .health_config(HealthCheckConfig {
+                    timeout_secs: 2,
+                    ..HealthCheckConfig::default()
+                })
+                .build();
+            assert_eq!(worker.status(), WorkerStatus::Pending);
+
+            for _ in 0..3 {
+                assert!(worker.check_health_async().await.is_err());
+                assert!(
+                    worker.smg_instance_id.load().is_none(),
+                    "a blank instance ID must never be adopted"
+                );
+            }
+
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn smg_health_uses_control_url_not_inference_url() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2346,39 +2564,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn smg_health_keeps_failing_a_ready_worker_until_it_leaves_rotation() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test-only tonic server is explicitly aborted before the test returns"
-        )]
-        let server = tokio::spawn(async move {
-            Server::builder()
-                .add_service(WorkerControlServer::new(ServingWorkerControl))
-                .serve_with_incoming(TcpListenerStream::new(listener))
-                .await
-        });
+    async fn smg_health_drains_a_restarted_ready_worker_before_adopting_it() {
+        let (address, server) = spawn_worker_control(ServingWorkerControl);
 
-        let worker = BasicWorkerBuilder::new(format!("grpc://{address}"))
-            .worker_mode(WorkerMode::Smg)
-            .connection_mode(ConnectionMode::Grpc)
-            .label("smg.instance_id", "stale-instance")
-            .status(WorkerStatus::Ready)
-            .health_config(HealthCheckConfig {
-                timeout_secs: 2,
-                ..HealthCheckConfig::default()
-            })
-            .build();
+        let health_config = HealthCheckConfig {
+            timeout_secs: 2,
+            ..HealthCheckConfig::default()
+        };
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("grpc://{address}"))
+                .worker_mode(WorkerMode::Smg)
+                .connection_mode(ConnectionMode::Grpc)
+                .label("smg.instance_id", "stale-instance")
+                .status(WorkerStatus::Ready)
+                .health_config(health_config.clone())
+                .build(),
+        );
 
-        // A `Ready` worker only leaves rotation after `failure_threshold`
-        // consecutive failures (default 3). Adopting the new instance on the
-        // first failed probe would let the second probe succeed and reset that
-        // counter, so a restarted Worker would never leave `Ready` -- it would
-        // keep taking traffic on an instance that lost all its state.
-        for _ in 0..5 {
-            assert!(worker.check_health_async().await.is_err());
+        // Drive the same state machine the manager runs, rather than asserting
+        // a bare probe-failure count: the adoption gate is only correct if the
+        // loop it creates actually terminates, and that depends on
+        // `compute_next_status` demoting the worker after `failure_threshold`
+        // consecutive failures.
+        let mut statuses = vec![worker.status()];
+        let mut left_rotation = false;
+        for _ in 0..(health_config.failure_threshold as usize * 8) {
+            let probe_ok = worker.check_health_async().await.is_ok();
+            if let Some(next) = compute_next_status(&worker, probe_ok, &health_config) {
+                worker.set_status(next);
+            }
+            statuses.push(worker.status());
+            left_rotation |= worker.status() == WorkerStatus::NotReady;
+            if left_rotation && worker.status() == WorkerStatus::Ready {
+                break;
+            }
         }
+
+        // Ready while the restart is detected, NotReady once it has drained,
+        // then Ready again on the adopted instance -- and never Failed.
+        assert_eq!(statuses.first(), Some(&WorkerStatus::Ready));
+        assert!(
+            statuses.contains(&WorkerStatus::NotReady),
+            "a restarted worker must leave rotation before its new ID is adopted, saw {statuses:?}"
+        );
+        assert_eq!(
+            statuses.last(),
+            Some(&WorkerStatus::Ready),
+            "the worker must probe its way back once the new instance is adopted, saw {statuses:?}"
+        );
+        assert!(
+            !statuses.contains(&WorkerStatus::Failed),
+            "adoption must happen well before the liveness threshold, saw {statuses:?}"
+        );
+        assert_eq!(
+            worker
+                .as_any()
+                .downcast_ref::<BasicWorker>()
+                .unwrap()
+                .smg_instance_id
+                .load_full()
+                .as_deref()
+                .map(String::as_str),
+            Some("instance-a")
+        );
 
         server.abort();
     }

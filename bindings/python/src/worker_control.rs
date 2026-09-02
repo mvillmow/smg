@@ -20,7 +20,7 @@ use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
     prelude::*,
 };
-use smg::worker::{RuntimeType, ZmqWorkerTransport};
+use smg::worker::{RuntimeType, ZmqWorkerTransport, TOKEN_ONLY_WIRE_FEATURE};
 use smg_grpc_client::{
     worker_inference::{EngineTransport, EngineWorkerInference},
     worker_inference_proto::worker_inference_server::WorkerInferenceServer,
@@ -208,6 +208,41 @@ fn parse_engine_transport(value: &str) -> PyResult<WorkerEngineTransport> {
     }
 }
 
+/// Label the Router reads back off the registration to decide whether the
+/// Worker's wire is token-only. Must round-trip through [`parse_engine_transport`].
+fn engine_transport_label(transport: WorkerEngineTransport) -> &'static str {
+    match transport {
+        WorkerEngineTransport::Grpc => "grpc",
+        WorkerEngineTransport::Zmq => "zmq",
+    }
+}
+
+/// Fold the engine transport into what the Worker advertises.
+///
+/// `token_only_wire` and the `engine_transport` attribute follow the transport,
+/// not the caller: a ZMQ engine cannot match string stops, and the Router needs
+/// that fact to keep stop trimming and the EOS backstop on its own side.
+/// Deriving both at this boundary means every entry point -- `worker_sidecar.py`
+/// and `worker_control_lifecycle.py` alike -- advertises them, instead of each
+/// one having to remember.
+fn advertise_engine_transport(
+    transport: WorkerEngineTransport,
+    mut features: Vec<String>,
+    mut engine_attributes: HashMap<String, String>,
+) -> (Vec<String>, HashMap<String, String>) {
+    if transport == WorkerEngineTransport::Zmq
+        && !features
+            .iter()
+            .any(|feature| feature == TOKEN_ONLY_WIRE_FEATURE)
+    {
+        features.push(TOKEN_ONLY_WIRE_FEATURE.to_string());
+    }
+    engine_attributes
+        .entry("engine_transport".to_string())
+        .or_insert_with(|| engine_transport_label(transport).to_string());
+    (features, engine_attributes)
+}
+
 fn parse_zmq_runtime(engine_type: &str) -> PyResult<RuntimeType> {
     match engine_type.to_ascii_lowercase().as_str() {
         "vllm" => Ok(RuntimeType::Vllm),
@@ -310,6 +345,12 @@ impl PyWorkerControlServer {
             zmq_handshake_address,
             engine_count,
         });
+        let (features, engine_attributes) = advertise_engine_transport(
+            engine_transport,
+            features.unwrap_or_else(|| vec!["generate".to_string()]),
+            engine_attributes.unwrap_or_default(),
+        );
+
         let config = BridgeConfig {
             worker_id: worker_id.clone(),
             instance_id: instance_id
@@ -320,9 +361,9 @@ impl PyWorkerControlServer {
             engine_version,
             engine_endpoint,
             model_ids,
-            features: features.unwrap_or_else(|| vec!["generate".to_string()]),
+            features,
             max_concurrent_requests,
-            engine_attributes: engine_attributes.unwrap_or_default(),
+            engine_attributes,
             health: Arc::clone(&health),
         };
         py.detach(|| {
@@ -510,7 +551,19 @@ fn start_server(
 
     let address = started_rx
         .recv_timeout(startup_timeout)
-        .map_err(|_| PyRuntimeError::new_err("WorkerControl server exited during startup"))?
+        .map_err(|error| match error {
+            // The two arms mean opposite things -- the server thread died vs. it
+            // is still inside `connect_inference` -- and the ZMQ startup timeout
+            // is over ten minutes, so reporting "exited" for a hang sends an
+            // operator looking in the wrong place.
+            RecvTimeoutError::Timeout => PyRuntimeError::new_err(format!(
+                "WorkerControl server did not finish startup within {startup_timeout:.0?}; it \
+                 is still connecting to the engine"
+            )),
+            RecvTimeoutError::Disconnected => {
+                PyRuntimeError::new_err("WorkerControl server exited during startup")
+            }
+        })?
         .map_err(PyRuntimeError::new_err)?;
     Ok(PyWorkerControlServer {
         address: address.to_string(),
@@ -573,6 +626,56 @@ async fn connect_inference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zmq_transport_advertises_token_only_wire_without_the_caller_asking() {
+        let (features, attributes) = advertise_engine_transport(
+            WorkerEngineTransport::Zmq,
+            vec!["generate".to_string()],
+            HashMap::new(),
+        );
+        assert!(features.iter().any(|f| f == TOKEN_ONLY_WIRE_FEATURE));
+        assert_eq!(
+            attributes.get("engine_transport").map(String::as_str),
+            Some("zmq")
+        );
+    }
+
+    #[test]
+    fn grpc_transport_does_not_advertise_token_only_wire() {
+        let (features, attributes) = advertise_engine_transport(
+            WorkerEngineTransport::Grpc,
+            vec!["generate".to_string()],
+            HashMap::new(),
+        );
+        assert_eq!(features, vec!["generate".to_string()]);
+        assert_eq!(
+            attributes.get("engine_transport").map(String::as_str),
+            Some("grpc")
+        );
+    }
+
+    #[test]
+    fn an_explicit_transport_attribute_is_left_alone() {
+        // A caller that already set the attribute -- the sidecar did, before
+        // this moved to the boundary -- must not have it silently rewritten.
+        let (features, attributes) = advertise_engine_transport(
+            WorkerEngineTransport::Zmq,
+            vec!["generate".to_string(), TOKEN_ONLY_WIRE_FEATURE.to_string()],
+            HashMap::from([("engine_transport".to_string(), "zmq".to_string())]),
+        );
+        assert_eq!(
+            features
+                .iter()
+                .filter(|f| *f == TOKEN_ONLY_WIRE_FEATURE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            attributes.get("engine_transport").map(String::as_str),
+            Some("zmq")
+        );
+    }
 
     #[test]
     fn parses_supported_health_states() {

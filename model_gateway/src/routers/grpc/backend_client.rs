@@ -8,7 +8,7 @@
 //! pipeline (which works against [`ProtoStream`]/[`ProtoGenerateRequest`]) is
 //! shared unchanged.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
@@ -30,7 +30,9 @@ use crate::{
             finish_tokenspeed_request, finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest,
             ProtoGenerateRequest, ProtoStream,
         },
-        zmq_client::{fold_tokenizer_eos_backstop, ZmqDialect, ZmqEngineClient},
+        zmq_client::{
+            fold_eos_into_stop_token_ids, fold_tokenizer_eos_backstop, ZmqDialect, ZmqEngineClient,
+        },
         MultimodalData,
     },
     worker::RuntimeType,
@@ -52,6 +54,12 @@ pub struct SmgBackendClient {
     inference: WorkerInferenceClient,
     runtime: RuntimeType,
     token_only_wire: bool,
+    /// Primary EOS id from the Router's tokenizer, carried to the Worker on
+    /// every request. The Worker has no tokenizer, and its own connect-time
+    /// lookup reads the model *directory* -- which a repo-id deployment does
+    /// not have -- so this is the only path by which a tokenizer-less engine
+    /// learns which stop id is EOS rather than a user stop.
+    primary_eos: OnceLock<u32>,
 }
 
 impl SmgBackendClient {
@@ -64,8 +72,43 @@ impl SmgBackendClient {
             inference,
             runtime,
             token_only_wire,
+            primary_eos: OnceLock::new(),
         }
     }
+
+    /// Mirror of [`ZmqEngineClient::adopt_tokenizer_eos`] for the two-tier
+    /// lane. Idempotent, and a no-op when the tokenizer reports no EOS.
+    fn adopt_tokenizer_eos(&self, tokenizer: Option<&Arc<dyn llm_tokenizer::traits::Tokenizer>>) {
+        if self.primary_eos.get().is_some() {
+            return;
+        }
+        if let Some(&primary) = tokenizer.and_then(|t| t.eos_token_ids().first()) {
+            let _ = self.primary_eos.set(primary);
+        }
+    }
+}
+
+/// Fail closed on `require_reasoning` for an SMG Worker fronting SGLang.
+///
+/// `WorkerInference.SamplingParams` has no `require_reasoning` lane, so
+/// `into_sglang_request` hardcodes it to `None`. On the direct SGLang path the
+/// Router does forward it (`GrpcClient::build_chat_request`), and it is what
+/// emits the reasoning-started marker the downstream parser splits on -- so
+/// dropping it here would answer the same request differently depending on
+/// whether an SMG Worker is in front, with no error.
+///
+/// vLLM and TokenSpeed do not read the field on the direct path either, so
+/// there is nothing to diverge from and they stay permissive.
+fn reject_unsupported_reasoning(
+    runtime: RuntimeType,
+    options: &GenerateRequestBuildOptions,
+) -> Result<(), String> {
+    if options.require_reasoning && runtime == RuntimeType::Sglang {
+        return Err(
+            "WorkerInference v1 cannot carry require_reasoning to an SGLang engine".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// The native request builders of both ZMQ dialects for one request kind — the
@@ -152,6 +195,11 @@ impl BackendClient {
         let router_stops = helpers::resolve_string_stops(request, tokenizer, token_only_wire);
         if let Self::Smg(client) = self {
             if client.token_only_wire && client.runtime == RuntimeType::Vllm {
+                // Both halves, as on the direct-ZMQ path below: the stop set
+                // makes the engine halt, and the primary id (stamped onto the
+                // request in `generate`) makes it report a plain EOS finish
+                // rather than `matched_stop = <eos id>`.
+                client.adopt_tokenizer_eos(tokenizer);
                 fold_smg_vllm_eos_backstop(request, tokenizer);
             }
         } else if let Self::Zmq(client) = self {
@@ -323,7 +371,12 @@ impl BackendClient {
                         "Worker SMG requires the engine-neutral request representation",
                     ));
                 };
-                let request = from_tokenspeed_request(*request)?;
+                let mut request = from_tokenspeed_request(*request)?;
+                if let (Some(params), Some(&primary_eos)) =
+                    (request.sampling_params.as_mut(), client.primary_eos.get())
+                {
+                    params.eos_token_id.get_or_insert(primary_eos);
+                }
                 Ok(ProtoStream::Smg(client.inference.generate(request).await?))
             }
             Self::Zmq(client) => Ok(ProtoStream::Zmq(client.generate(req).await?)),
@@ -357,10 +410,11 @@ impl BackendClient {
             Self::Grpc(client) => {
                 client.build_chat_request(request_id, body, processed_text, token_ids, options)
             }
-            Self::Smg(_) => {
+            Self::Smg(client) => {
                 if options.multimodal_inputs.is_some() {
                     return Err("WorkerInference v1 does not support multimodal inputs".to_string());
                 }
+                reject_unsupported_reasoning(client.runtime, &options)?;
                 let request = TokenSpeedSchedulerClient::build_generate_request_from_chat(
                     request_id,
                     body,
@@ -401,10 +455,11 @@ impl BackendClient {
             Self::Grpc(client) => {
                 client.build_messages_request(request_id, body, processed_text, token_ids, options)
             }
-            Self::Smg(_) => {
+            Self::Smg(client) => {
                 if options.multimodal_inputs.is_some() {
                     return Err("WorkerInference v1 does not support multimodal inputs".to_string());
                 }
+                reject_unsupported_reasoning(client.runtime, &options)?;
                 let request = TokenSpeedSchedulerClient::build_generate_request_from_messages(
                     request_id,
                     body,
@@ -514,16 +569,7 @@ fn fold_smg_vllm_eos_backstop(
     let Some(params) = request.sampling_params.as_mut() else {
         return;
     };
-    if params.ignore_eos {
-        return;
-    }
-    if let Some(tokenizer) = tokenizer {
-        for &id in tokenizer.eos_token_ids() {
-            if !params.stop_token_ids.contains(&id) {
-                params.stop_token_ids.push(id);
-            }
-        }
-    }
+    fold_eos_into_stop_token_ids(params.ignore_eos, &mut params.stop_token_ids, tokenizer);
 }
 
 /// Build a multimodal-carrying request (chat, messages) for a ZMQ backend: one
@@ -635,6 +681,26 @@ mod tests {
     use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
 
     use super::*;
+
+    #[test]
+    fn require_reasoning_fails_closed_only_for_an_sglang_worker() {
+        let options = |require_reasoning| GenerateRequestBuildOptions {
+            multimodal_inputs: None,
+            tool_constraints: None,
+            require_reasoning,
+        };
+
+        // WorkerInference v1 has no lane for it and `into_sglang_request`
+        // hardcodes `require_reasoning: None`, so forwarding would silently
+        // answer differently than the direct SGLang path.
+        assert!(reject_unsupported_reasoning(RuntimeType::Sglang, &options(true)).is_err());
+
+        // vLLM and TokenSpeed ignore the field on the direct path too, so there
+        // is nothing to diverge from.
+        assert!(reject_unsupported_reasoning(RuntimeType::Vllm, &options(true)).is_ok());
+        assert!(reject_unsupported_reasoning(RuntimeType::TokenSpeed, &options(true)).is_ok());
+        assert!(reject_unsupported_reasoning(RuntimeType::Sglang, &options(false)).is_ok());
+    }
 
     #[test]
     fn smg_vllm_eos_backstop_updates_portable_request() {

@@ -73,6 +73,10 @@ class WorkerControlLifecycle:
             raise ValueError("SMG_WORKER_ENGINE_COUNT must be a positive integer") from error
         if engine_count <= 0:
             raise ValueError("SMG_WORKER_ENGINE_COUNT must be a positive integer")
+        if max_concurrent_requests < 0:
+            # Clamping to 0 would make an invalid limit indistinguishable from
+            # "unlimited", the default -- fail at startup instead.
+            raise ValueError("max_concurrent_requests must be non-negative")
 
         try:
             from smg.worker import WorkerControlServer
@@ -99,7 +103,7 @@ class WorkerControlLifecycle:
             engine_endpoint=engine_endpoint,
             model_ids=list(model_ids),
             features=list(features),
-            max_concurrent_requests=max(0, max_concurrent_requests),
+            max_concurrent_requests=max_concurrent_requests,
             inference_enabled=inference_enabled,
             engine_attributes=dict(engine_attributes or {}),
             engine_transport=engine_transport,

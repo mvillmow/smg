@@ -34,10 +34,12 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--engine-count must be positive")
     if args.engine_transport == "zmq" and args.engine_type == "sglang":
         raise ValueError("SGLang Worker transport does not support ZMQ yet")
+    if args.max_concurrent_requests < 0:
+        raise ValueError("--max-concurrent-requests must be non-negative")
     stopped = threading.Event()
+    # `token_only_wire` is not listed here: WorkerControlServer derives it from
+    # engine_transport, so every entry point advertises it consistently.
     features = ["generate", "stream", "abort"]
-    if args.engine_transport == "zmq":
-        features.append("token_only_wire")
     server = WorkerControlServer(
         bind_address=args.bind_address,
         worker_id=args.worker_id,
@@ -46,12 +48,11 @@ def main(argv: list[str] | None = None) -> None:
         engine_endpoint=args.engine_endpoint,
         model_ids=args.model_ids,
         features=features,
-        max_concurrent_requests=max(0, args.max_concurrent_requests),
+        max_concurrent_requests=args.max_concurrent_requests,
         inference_enabled=True,
         engine_attributes={
             "model_path": args.model_ids[0],
             "tokenizer_path": args.model_ids[0],
-            "engine_transport": args.engine_transport,
         },
         engine_transport=args.engine_transport,
         zmq_handshake_address=args.zmq_handshake_address,

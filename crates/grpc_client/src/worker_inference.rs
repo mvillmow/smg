@@ -275,20 +275,31 @@ impl proto::worker_inference_server::WorkerInference for TokenSpeedWorkerInferen
             .client
             .generate(into_tokenspeed_request(request.into_inner()))
             .await?;
-        let stream = futures::stream::unfold(stream, |mut stream| async move {
-            let item = stream.next().await?;
-            let mapped = item.map(from_tokenspeed_response);
-            if matches!(
-                &mapped,
-                Ok(proto::GenerateResponse {
-                    response: Some(proto::generate_response::Response::Complete(_)),
-                    ..
-                })
-            ) {
-                stream.mark_completed();
-            }
-            Some((mapped, stream))
-        });
+        // TokenSpeed's gRPC chunks are cumulative, but `GenerateStreamChunk` is
+        // specified as a delta. Drain what has already been emitted per index
+        // here, so every Worker adapter puts the same shape on the wire and the
+        // Router's accumulation does not have to know which engine is behind
+        // this Worker.
+        let emitted_by_index: HashMap<u32, usize> = HashMap::new();
+        let stream = futures::stream::unfold(
+            (stream, emitted_by_index),
+            |(mut stream, mut emitted_by_index)| async move {
+                let item = stream.next().await?;
+                let mapped = item.map(from_tokenspeed_response).and_then(|response| {
+                    drain_emitted_chunk_tokens(response, &mut emitted_by_index)
+                });
+                if matches!(
+                    &mapped,
+                    Ok(proto::GenerateResponse {
+                        response: Some(proto::generate_response::Response::Complete(_)),
+                        ..
+                    })
+                ) {
+                    stream.mark_completed();
+                }
+                Some((mapped, (stream, emitted_by_index)))
+            },
+        );
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -443,7 +454,7 @@ impl proto::worker_inference_server::WorkerInference for EngineWorkerInference {
 }
 
 pub fn into_vllm_request(request: proto::GenerateRequest) -> Result<vllm::GenerateRequest, Status> {
-    let tokenized = request.tokenized.unwrap_or_default();
+    let tokenized = request.tokenized.ok_or_else(missing_tokenized_input)?;
     let sampling_params = request
         .sampling_params
         .map(|params| {
@@ -543,18 +554,29 @@ fn into_vllm_sampling(
         min_tokens: params.min_new_tokens,
         stop: params.stop,
         stop_token_ids: params.stop_token_ids,
-        skip_special_tokens: params.skip_special_tokens,
-        spaces_between_special_tokens: params.spaces_between_special_tokens,
+        // vLLM's own defaults for the omitted case, matching the direct path.
+        skip_special_tokens: params.skip_special_tokens.unwrap_or(true),
+        spaces_between_special_tokens: params.spaces_between_special_tokens.unwrap_or(true),
         ignore_eos: params.ignore_eos,
         n: params.n.max(1),
         logprobs,
         prompt_logprobs,
         seed,
-        include_stop_str_in_output: params.no_stop_trim,
+        include_stop_str_in_output: params.no_stop_trim.unwrap_or(false),
         logit_bias,
         truncate_prompt_tokens: None,
+        eos_token_id: params.eos_token_id,
         constraint,
     })
+}
+
+fn missing_tokenized_input() -> Status {
+    // `unwrap_or_default()` here would turn an omitted field into a legitimate
+    // zero-token prompt: the engine either errors opaquely or generates
+    // unconditioned output, and the Router sees a normal stream either way.
+    // This is a server-side boundary reachable by any gRPC peer, so name the
+    // failure where it can still be named.
+    Status::invalid_argument("WorkerInference GenerateRequest requires tokenized input")
 }
 
 pub fn from_vllm_response(
@@ -600,6 +622,69 @@ pub fn from_vllm_response(
     }
 }
 
+/// Inverse of [`from_vllm_response`], for the Router side of the Worker wire.
+///
+/// The vLLM response *shape* is what the Router's accumulation is keyed on
+/// (delta chunks, cumulative `Complete`), and that is exactly the
+/// `WorkerInference` contract -- so this is the shape an SMG stream maps onto,
+/// whichever engine the Worker actually fronts.
+pub fn into_vllm_response(response: proto::GenerateResponse) -> vllm::GenerateResponse {
+    use proto::generate_response::Response;
+
+    vllm::GenerateResponse {
+        response: response.response.map(|response| match response {
+            Response::Chunk(chunk) => {
+                vllm::generate_response::Response::Chunk(vllm::GenerateStreamChunk {
+                    token_ids: chunk.token_ids,
+                    prompt_tokens: chunk.prompt_tokens,
+                    completion_tokens: chunk.completion_tokens,
+                    cached_tokens: chunk.cached_tokens,
+                    output_logprobs: chunk.output_logprobs.map(into_vllm_logprobs),
+                    input_logprobs: None,
+                    index: chunk.index,
+                })
+            }
+            Response::Complete(complete) => {
+                vllm::generate_response::Response::Complete(vllm::GenerateComplete {
+                    output_ids: complete.output_ids,
+                    finish_reason: complete.finish_reason,
+                    prompt_tokens: complete.prompt_tokens,
+                    completion_tokens: complete.completion_tokens,
+                    cached_tokens: complete.cached_tokens,
+                    output_logprobs: complete.output_logprobs.map(into_vllm_logprobs),
+                    input_logprobs: None,
+                    kv_transfer_params: None,
+                    kv_transfer_params_json: None,
+                    matched_stop: complete.matched_stop.map(|matched| match matched {
+                        proto::generate_complete::MatchedStop::MatchedTokenId(id) => {
+                            vllm::generate_complete::MatchedStop::MatchedTokenId(id)
+                        }
+                        proto::generate_complete::MatchedStop::MatchedStopStr(value) => {
+                            vllm::generate_complete::MatchedStop::MatchedStopStr(value)
+                        }
+                    }),
+                    index: complete.index,
+                })
+            }
+        }),
+    }
+}
+
+fn into_vllm_logprobs(logprobs: proto::OutputLogProbs) -> vllm::OutputLogProbs {
+    vllm::OutputLogProbs {
+        token_logprobs: logprobs.token_logprobs,
+        token_ids: logprobs.token_ids,
+        top_logprobs: logprobs
+            .top_logprobs
+            .into_iter()
+            .map(|top| vllm::TopLogProbs {
+                values: top.values,
+                token_ids: top.token_ids,
+            })
+            .collect(),
+    }
+}
+
 fn from_vllm_logprobs(logprobs: vllm::OutputLogProbs) -> proto::OutputLogProbs {
     proto::OutputLogProbs {
         token_logprobs: logprobs.token_logprobs,
@@ -626,15 +711,11 @@ fn into_sglang_request(request: proto::GenerateRequest) -> Result<sglang::Genera
     }
     let input_ids = request
         .tokenized
-        .map(|input| {
-            input
-                .input_ids
-                .into_iter()
-                .map(|id| i32::try_from(id).map_err(|_| numeric_range_error("input token id")))
-                .collect()
-        })
-        .transpose()?
-        .unwrap_or_default();
+        .ok_or_else(missing_tokenized_input)?
+        .input_ids
+        .into_iter()
+        .map(|id| i32::try_from(id).map_err(|_| numeric_range_error("input token id")))
+        .collect::<Result<Vec<_>, _>>()?;
     let sampling_params = request
         .sampling_params
         .map(into_sglang_sampling)
@@ -665,10 +746,22 @@ fn into_sglang_sampling(params: proto::SamplingParams) -> Result<sglang::Samplin
     // `no_stop_trim=false`. Silently dropping a non-default value would flip
     // detokenization behind the caller's back -- the Harmony path relies on
     // `skip_special_tokens=false`. Fail closed, matching the checks above.
-    if !params.skip_special_tokens || !params.spaces_between_special_tokens || params.no_stop_trim {
+    //
+    // Only an *explicit* override is a failure: the fields are presence-tracked
+    // precisely so an omission can fall through to SGLang's defaults, which are
+    // what the adapter would have produced anyway.
+    if params.skip_special_tokens == Some(false)
+        || params.spaces_between_special_tokens == Some(false)
+        || params.no_stop_trim == Some(true)
+    {
         return Err(Status::unimplemented(
             "SGLang native gRPC cannot express skip_special_tokens, \
              spaces_between_special_tokens, or no_stop_trim overrides",
+        ));
+    }
+    if params.eos_token_id.is_some() {
+        return Err(Status::unimplemented(
+            "SGLang native gRPC has no eos_token_id override; SGLang resolves EOS itself",
         ));
     }
     Ok(sglang::SamplingParams {
@@ -874,6 +967,27 @@ pub fn into_tokenspeed_request(request: proto::GenerateRequest) -> ts::GenerateR
     }
 }
 
+/// Turn a cumulative chunk into the delta `GenerateStreamChunk` specifies, by
+/// dropping the prefix already emitted for that `index`. `Complete` frames are
+/// cumulative by contract and pass through untouched.
+fn drain_emitted_chunk_tokens(
+    mut response: proto::GenerateResponse,
+    emitted_by_index: &mut HashMap<u32, usize>,
+) -> Result<proto::GenerateResponse, Status> {
+    let Some(proto::generate_response::Response::Chunk(chunk)) = response.response.as_mut() else {
+        return Ok(response);
+    };
+    let emitted = emitted_by_index.entry(chunk.index).or_default();
+    if chunk.token_ids.len() < *emitted {
+        return Err(Status::internal(
+            "engine returned a shorter cumulative token sequence",
+        ));
+    }
+    chunk.token_ids.drain(..*emitted);
+    *emitted += chunk.token_ids.len();
+    Ok(response)
+}
+
 pub fn from_tokenspeed_response(response: ts::GenerateResponse) -> proto::GenerateResponse {
     use ts::generate_response::Response;
     proto::GenerateResponse {
@@ -964,8 +1078,11 @@ fn from_tokenspeed_sampling(params: ts::SamplingParams) -> proto::SamplingParams
         stop: params.stop,
         stop_token_ids: params.stop_token_ids,
         ignore_eos: params.ignore_eos,
-        skip_special_tokens: params.skip_special_tokens,
-        spaces_between_special_tokens: params.spaces_between_special_tokens,
+        // The TokenSpeed request these are read from has plain bools, so the
+        // Router always states them explicitly; presence only carries meaning
+        // for a peer that builds a WorkerInference request directly.
+        skip_special_tokens: Some(params.skip_special_tokens),
+        spaces_between_special_tokens: Some(params.spaces_between_special_tokens),
         n: params.n,
         logit_bias: params.logit_bias,
         constraint: params.constraint.map(|constraint| match constraint {
@@ -983,8 +1100,10 @@ fn from_tokenspeed_sampling(params: ts::SamplingParams) -> proto::SamplingParams
             }
         }),
         engine_parameters: params.custom_params,
-        no_stop_trim: params.no_stop_trim,
+        no_stop_trim: Some(params.no_stop_trim),
         sampling_seed: params.sampling_seed,
+        // Stamped by the Router after this conversion, from its own tokenizer.
+        eos_token_id: None,
     }
 }
 
@@ -1002,8 +1121,8 @@ fn into_tokenspeed_sampling(params: proto::SamplingParams) -> ts::SamplingParams
         stop: params.stop,
         stop_token_ids: params.stop_token_ids,
         ignore_eos: params.ignore_eos,
-        skip_special_tokens: params.skip_special_tokens,
-        spaces_between_special_tokens: params.spaces_between_special_tokens,
+        skip_special_tokens: params.skip_special_tokens.unwrap_or(true),
+        spaces_between_special_tokens: params.spaces_between_special_tokens.unwrap_or(true),
         n: params.n,
         logit_bias: params.logit_bias,
         constraint: params.constraint.map(|constraint| match constraint {
@@ -1021,7 +1140,7 @@ fn into_tokenspeed_sampling(params: proto::SamplingParams) -> ts::SamplingParams
             }
         }),
         custom_params: params.engine_parameters,
-        no_stop_trim: params.no_stop_trim,
+        no_stop_trim: params.no_stop_trim.unwrap_or(false),
         sampling_seed: params.sampling_seed,
     }
 }
@@ -1162,8 +1281,8 @@ mod tests {
                 sampling_seed: Some(7),
                 // The Router always sets these explicitly; SGLang's native
                 // proto has no field for them, so only its own defaults pass.
-                skip_special_tokens: true,
-                spaces_between_special_tokens: true,
+                skip_special_tokens: Some(true),
+                spaces_between_special_tokens: Some(true),
                 ..Default::default()
             }),
             stream: true,
@@ -1190,29 +1309,191 @@ mod tests {
         // on `skip_special_tokens: false`), so the adapter must fail closed.
         for params in [
             proto::SamplingParams {
-                skip_special_tokens: false,
-                spaces_between_special_tokens: true,
+                skip_special_tokens: Some(false),
                 ..Default::default()
             },
             proto::SamplingParams {
-                skip_special_tokens: true,
-                spaces_between_special_tokens: false,
+                spaces_between_special_tokens: Some(false),
                 ..Default::default()
             },
             proto::SamplingParams {
-                skip_special_tokens: true,
-                spaces_between_special_tokens: true,
-                no_stop_trim: true,
+                no_stop_trim: Some(true),
+                ..Default::default()
+            },
+            proto::SamplingParams {
+                eos_token_id: Some(128009),
                 ..Default::default()
             },
         ] {
             let request = proto::GenerateRequest {
                 request_id: "native-flags".to_string(),
+                tokenized: Some(proto::TokenizedInput {
+                    input_ids: vec![1],
+                    ..Default::default()
+                }),
                 sampling_params: Some(params),
                 ..Default::default()
             };
             let status = into_sglang_request(request).expect_err("unsupported flag");
             assert_eq!(status.code(), tonic::Code::Unimplemented);
+        }
+    }
+
+    #[test]
+    fn sglang_native_lets_omitted_detokenization_flags_fall_through() {
+        // Proto3 decodes an omitted scalar bool as `false`, so gating on the
+        // value alone would reject every request that simply did not mention
+        // these fields -- and SGLang's own defaults are exactly what the
+        // adapter would have produced.
+        let request = proto::GenerateRequest {
+            request_id: "native-defaults".to_string(),
+            tokenized: Some(proto::TokenizedInput {
+                input_ids: vec![10, 20],
+                ..Default::default()
+            }),
+            sampling_params: Some(proto::SamplingParams {
+                temperature: Some(0.3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let native = into_sglang_request(request).expect("defaults are expressible");
+        assert_eq!(
+            native.sampling_params.expect("sampling params").temperature,
+            Some(0.3)
+        );
+    }
+
+    #[test]
+    fn vllm_request_carries_the_router_supplied_eos() {
+        let sampling = into_vllm_request(proto::GenerateRequest {
+            request_id: "vllm-eos".to_string(),
+            tokenized: Some(proto::TokenizedInput {
+                input_ids: vec![1],
+                ..Default::default()
+            }),
+            sampling_params: Some(proto::SamplingParams {
+                eos_token_id: Some(128009),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("vLLM request")
+        .sampling_params
+        .expect("sampling params");
+        assert_eq!(sampling.eos_token_id, Some(128009));
+    }
+
+    #[test]
+    fn worker_responses_round_trip_through_the_vllm_shape() {
+        // The Router maps an SMG stream onto the vLLM response shape, which is
+        // what `ChunkSemantics::Delta` describes -- so this conversion has to be
+        // lossless in both directions for the fields the Router reads.
+        for response in [
+            proto::GenerateResponse {
+                request_id: "rt-chunk".to_string(),
+                response: Some(proto::generate_response::Response::Chunk(
+                    proto::GenerateStreamChunk {
+                        token_ids: vec![7, 8],
+                        prompt_tokens: 3,
+                        completion_tokens: 2,
+                        cached_tokens: 1,
+                        output_logprobs: Some(proto::OutputLogProbs {
+                            token_logprobs: vec![-0.5],
+                            token_ids: vec![7],
+                            top_logprobs: vec![proto::TopLogProbs {
+                                values: vec![-0.5, -1.5],
+                                token_ids: vec![7, 8],
+                            }],
+                        }),
+                        index: 1,
+                    },
+                )),
+            },
+            proto::GenerateResponse {
+                request_id: "rt-complete".to_string(),
+                response: Some(proto::generate_response::Response::Complete(
+                    proto::GenerateComplete {
+                        output_ids: vec![7, 8],
+                        finish_reason: "stop".to_string(),
+                        prompt_tokens: 3,
+                        completion_tokens: 2,
+                        cached_tokens: 1,
+                        output_logprobs: None,
+                        matched_stop: Some(proto::generate_complete::MatchedStop::MatchedStopStr(
+                            "END".to_string(),
+                        )),
+                        index: 1,
+                    },
+                )),
+            },
+        ] {
+            let request_id = response.request_id.clone();
+            let vllm_shaped = into_vllm_response(response.clone());
+            assert_eq!(from_vllm_response(&request_id, vllm_shaped), response);
+        }
+    }
+
+    #[test]
+    fn cumulative_engine_chunks_are_drained_into_deltas() {
+        // `GenerateStreamChunk` is specified as a delta. TokenSpeed streams
+        // cumulatively, so its adapter has to drain what it already emitted --
+        // otherwise the Router accumulates each chunk's full prefix again.
+        let chunk = |token_ids: Vec<u32>, index: u32| proto::GenerateResponse {
+            request_id: "cumulative".to_string(),
+            response: Some(proto::generate_response::Response::Chunk(
+                proto::GenerateStreamChunk {
+                    token_ids,
+                    index,
+                    ..Default::default()
+                },
+            )),
+        };
+        let tokens_of = |response: proto::GenerateResponse| match response.response {
+            Some(proto::generate_response::Response::Chunk(chunk)) => chunk.token_ids,
+            other => panic!("expected a chunk, got {other:?}"),
+        };
+
+        let mut emitted = HashMap::new();
+        assert_eq!(
+            tokens_of(drain_emitted_chunk_tokens(chunk(vec![1], 0), &mut emitted).unwrap()),
+            vec![1]
+        );
+        assert_eq!(
+            tokens_of(drain_emitted_chunk_tokens(chunk(vec![1, 2, 3], 0), &mut emitted).unwrap()),
+            vec![2, 3]
+        );
+        // Indices are tracked independently for n>1.
+        assert_eq!(
+            tokens_of(drain_emitted_chunk_tokens(chunk(vec![9], 1), &mut emitted).unwrap()),
+            vec![9]
+        );
+        // A shorter sequence than already emitted is an engine bug, not a delta.
+        assert_eq!(
+            drain_emitted_chunk_tokens(chunk(vec![], 0), &mut emitted)
+                .expect_err("shrinking sequence")
+                .code(),
+            tonic::Code::Internal
+        );
+    }
+
+    #[test]
+    fn requests_without_tokenized_input_are_rejected() {
+        // An empty `TokenizedInput` default would reach the engine as a
+        // legitimate zero-token prompt, so the boundary that can name the
+        // problem has to reject it.
+        for build in [
+            (|request| into_vllm_request(request).map(|_| ())) as fn(_) -> Result<(), Status>,
+            |request| into_sglang_request(request).map(|_| ()),
+        ] {
+            let status = build(proto::GenerateRequest {
+                request_id: "no-input".to_string(),
+                sampling_params: Some(proto::SamplingParams::default()),
+                ..Default::default()
+            })
+            .expect_err("tokenized input is required");
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
         }
     }
 
@@ -1261,6 +1542,10 @@ mod tests {
     ) -> vllm::SamplingParams {
         into_vllm_request(proto::GenerateRequest {
             request_id: "vllm-logprobs".to_string(),
+            tokenized: Some(proto::TokenizedInput {
+                input_ids: vec![1],
+                ..Default::default()
+            }),
             sampling_params: Some(proto::SamplingParams::default()),
             return_logprob,
             logprob_start_len,
@@ -1293,6 +1578,10 @@ mod tests {
         // today, and unset must stay unset so vLLM picks its own seed.
         let request = |seed: Option<u64>| proto::GenerateRequest {
             request_id: "vllm-seed".to_string(),
+            tokenized: Some(proto::TokenizedInput {
+                input_ids: vec![1],
+                ..Default::default()
+            }),
             sampling_params: Some(proto::SamplingParams {
                 sampling_seed: seed,
                 ..Default::default()

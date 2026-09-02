@@ -106,12 +106,33 @@ impl EngineTransport for ZmqWorkerTransport {
                 )))
             }
         };
-        let stream = self.client.generate(engine_request).await?;
-        let (cancel_tx, cancel_rx) = oneshot::channel();
+        // Register before submitting, not after: an `abort` landing in the gap
+        // would find no entry, still answer `success: true`, and leave the
+        // engine generating to completion behind an accepted cancellation.
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
         self.active
             .lock()
             .map_err(|_| Status::internal("Worker ZMQ request registry is poisoned"))?
             .insert(request_id.clone(), cancel_tx);
+
+        let stream = match self.client.generate(engine_request).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                // Nothing else will drop the registration: `ZmqStreamState` is
+                // never built on this path.
+                if let Ok(mut active) = self.active.lock() {
+                    active.remove(&request_id);
+                }
+                return Err(error);
+            }
+        };
+        // An abort that raced the submission has already fired the sender. The
+        // engine has the request by now, so surface it as an immediately
+        // finished stream and let the drop-driven auto-abort reach the engine.
+        if cancel_rx.try_recv().is_ok() {
+            drop(stream);
+            return Ok(Box::pin(futures::stream::empty()));
+        }
 
         let state = ZmqStreamState {
             request_id,

@@ -116,8 +116,12 @@ image:
 An earlier revision of this branch also passed SGLang non-streaming on B200,
 using a `--grpc-port` launch that has since been reverted; that result does not
 describe the current code, which rejects SGLang two-tier workers at startup.
-Stock SGLang 0.5.18 streaming additionally remains blocked by its upstream
-request-normalization defect.
+Streaming did not pass in that same run (measured 2026-08-31, stock SGLang
+0.5.18): the failure was in the engine's own streaming path, not in the
+Router/Worker contract, and it was not isolated to a specific upstream issue
+before the launch change was reverted. Treat it as untested rather than as a
+known-broken combination, and re-measure against the SGLang version in use when
+the launch path is wired up.
 
 ## Performance result
 
