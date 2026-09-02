@@ -17,8 +17,11 @@ flowchart LR
     R -->|WorkerControl + WorkerInference\nRust gRPC| W[SMG Worker]
     W -->|ZMQ IPC| V[vLLM]
     W -->|ZMQ IPC| T[TokenSpeed]
-    W -->|native gRPC\nloopback| S[SGLang]
+    W -.->|native gRPC loopback\n(adapter only, not launchable)| S[SGLang]
 ```
+
+Dashed edges are implemented in the Worker but not reachable through
+`smg serve` yet; see [Engine transports](#engine-transports).
 
 The Router owns public APIs, authentication, tokenization, fleet membership,
 admission, and request placement. The Worker owns engine readiness, topology,
@@ -59,8 +62,15 @@ outside the GIL.
 
 - vLLM and TokenSpeed: same-host msgpack over ZMQ IPC, including the native
   HELLO/INIT/READY handshake and explicit abort.
-- SGLang: native Rust gRPC over loopback for now. Direct scheduler IPC can be
-  adopted later without changing the Router/Worker contract.
+- SGLang: a native Rust gRPC loopback adapter exists in the Worker, but no
+  launch path reaches it yet, so `--router-worker-mode smg --backend sglang` is
+  rejected at startup for every transport. `sglang.launch_server --grpc-mode`
+  serves `sglang.grpc.scheduler.SglangScheduler` (what the Router's existing
+  direct client speaks), while the Worker adapter dials
+  `sglang.runtime.v1.SglangService`; since connecting only opens a channel, a
+  mismatched pair would report SERVING and then fail every request with
+  `Unimplemented`. Wiring the launch side up -- or direct scheduler IPC -- can
+  land later without changing the Router/Worker contract.
 - `grpc` remains a compatibility option for existing engine deployments.
 
 ## Implementation
@@ -75,7 +85,8 @@ outside the GIL.
   transport arguments.
 - `smg serve --router-worker-mode smg --connection-mode zmq` launches a
   colocated vLLM or TokenSpeed engine, Worker sidecar, and Router.
-- SGLang rejects ZMQ explicitly instead of silently selecting the wrong wire.
+- SGLang is rejected for both `grpc` and `zmq` instead of silently selecting
+  the wrong wire.
 
 ## Validation
 
@@ -102,8 +113,11 @@ image:
   `[DONE]`, client-disconnect cancellation, and draining; while the Worker was
   draining, new generation returned 503 and Router liveness remained 200.
 
-B200 validation also passed SGLang non-streaming. Stock SGLang 0.5.18
-streaming remains blocked by its upstream request-normalization defect.
+An earlier revision of this branch also passed SGLang non-streaming on B200,
+using a `--grpc-port` launch that has since been reverted; that result does not
+describe the current code, which rejects SGLang two-tier workers at startup.
+Stock SGLang 0.5.18 streaming additionally remains blocked by its upstream
+request-normalization defect.
 
 ## Performance result
 

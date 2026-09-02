@@ -1840,20 +1840,50 @@ impl Worker for BasicWorker {
                             .map(|identity| identity.instance_id)
                             .unwrap_or_default();
                         if observed != *expected_instance_id {
+                            // Never adopt an empty ID: the next probe would
+                            // match it and report the worker healthy.
+                            // `try_smg_worker_reachable` requires a non-empty
+                            // instance_id at registration, so an empty one here
+                            // means the Worker is misbehaving.
+                            if observed.trim().is_empty() {
+                                tracing::warn!(
+                                    control_url,
+                                    expected_instance_id = %expected_instance_id,
+                                    "SMG Worker returned an empty instance ID; not adopting"
+                                );
+                                return Ok(false);
+                            }
+                            // Keep failing until the readiness state machine has
+                            // actually taken this worker out of rotation
+                            // (`failure_threshold` consecutive failures), and
+                            // only then adopt so it can probe its way back.
+                            // Adopting on the first failed probe would let the
+                            // next probe succeed and call
+                            // `consecutive_failures_reset`, so a restarted
+                            // Worker would never leave `Ready` -- silently
+                            // routing to an instance that lost all its state.
+                            if self.status() == WorkerStatus::Ready {
+                                tracing::warn!(
+                                    control_url,
+                                    expected_instance_id = %expected_instance_id,
+                                    observed_instance_id = %observed,
+                                    "SMG Worker instance changed; failing probes until this \
+                                     worker leaves rotation"
+                                );
+                                return Ok(false);
+                            }
+                            // Out of rotation now. Adopt the new instance so the
+                            // worker is not pinned unhealthy forever: the
+                            // `smg.instance_id` label is frozen at registration
+                            // and static `--worker-urls` deployments have no
+                            // re-registration path at all.
                             tracing::warn!(
                                 control_url,
                                 expected_instance_id = %expected_instance_id,
                                 observed_instance_id = %observed,
-                                "SMG Worker instance changed; failing this probe and adopting the \
-                                 new instance"
+                                status = ?self.status(),
+                                "SMG Worker instance changed; adopting the new instance"
                             );
-                            // Adopt the new ID so the next probe can pass. The
-                            // registration label is frozen, so leaving the old
-                            // value in place would pin this worker unhealthy
-                            // forever -- static `--worker-urls` deployments have
-                            // no re-registration path at all. Reporting a single
-                            // unhealthy probe is enough to drain in-flight work
-                            // and trip the circuit breaker.
                             self.smg_instance_id.store(Some(Arc::new(observed)));
                             return Ok(false);
                         }
@@ -2304,11 +2334,51 @@ mod tests {
                 ..HealthCheckConfig::default()
             })
             .build();
+        assert_eq!(worker.status(), WorkerStatus::Pending);
         assert!(worker.check_health_async().await.is_err());
 
-        // The registration label is frozen, so the probe must adopt the observed
-        // instance ID; otherwise a restarted Worker stays unhealthy forever.
+        // Out of rotation already, so the probe adopts the observed ID: the
+        // registration label is frozen, and leaving it in place would pin the
+        // worker unhealthy forever.
         assert!(worker.check_health_async().await.is_ok());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn smg_health_keeps_failing_a_ready_worker_until_it_leaves_rotation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only tonic server is explicitly aborted before the test returns"
+        )]
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(WorkerControlServer::new(ServingWorkerControl))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+        });
+
+        let worker = BasicWorkerBuilder::new(format!("grpc://{address}"))
+            .worker_mode(WorkerMode::Smg)
+            .connection_mode(ConnectionMode::Grpc)
+            .label("smg.instance_id", "stale-instance")
+            .status(WorkerStatus::Ready)
+            .health_config(HealthCheckConfig {
+                timeout_secs: 2,
+                ..HealthCheckConfig::default()
+            })
+            .build();
+
+        // A `Ready` worker only leaves rotation after `failure_threshold`
+        // consecutive failures (default 3). Adopting the new instance on the
+        // first failed probe would let the second probe succeed and reset that
+        // counter, so a restarted Worker would never leave `Ready` -- it would
+        // keep taking traffic on an instance that lost all its state.
+        for _ in 0..5 {
+            assert!(worker.check_health_async().await.is_err());
+        }
 
         server.abort();
     }
