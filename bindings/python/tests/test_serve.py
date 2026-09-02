@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from smg.serve import (
+    _ZMQ_HANDSHAKE_PORT_SPAN,
     BACKEND_ARG_ADDERS,
     BACKEND_CHOICES,
     BACKEND_LAUNCHERS,
@@ -669,12 +670,21 @@ class TestZmqHandshakePort:
     def test_reject_collisions_raises_and_names_urls(self):
         # Two ports whose ipc paths derive the same handshake port must be
         # rejected before launch, naming both colliding URLs.
-        base = 30000
-        collider = next(
-            p
-            for p in range(base + 1, base + 20000)
-            if _zmq_handshake_port(_zmq_ipc_url(p)) == _zmq_handshake_port(_zmq_ipc_url(base))
-        )
+        #
+        # Search for *any* colliding pair rather than one that collides with a
+        # fixed base: the ipc path contains the socket dir, which carries the
+        # uid, so which ports collide differs per machine. Scanning more ports
+        # than the 10000-wide band guarantees a pair by pigeonhole.
+        seen: dict[int, int] = {}
+        for port in range(30000, 30000 + _ZMQ_HANDSHAKE_PORT_SPAN + 1):
+            handshake_port = _zmq_handshake_port(_zmq_ipc_url(port))
+            if handshake_port in seen:
+                base, collider = seen[handshake_port], port
+                break
+            seen[handshake_port] = port
+        else:
+            pytest.fail("no handshake-port collision in a range wider than the band")
+
         with pytest.raises(ValueError) as exc:
             _reject_handshake_port_collisions([base, collider])
         assert _zmq_ipc_url(base) in str(exc.value)
