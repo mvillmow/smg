@@ -448,6 +448,12 @@ impl FlatTree {
         self.live(id).map_or(0, |s| s.registry.len() as u64)
     }
 
+    /// Read-only: the position at which `holder` holds `key` (see
+    /// `RadixTree::position_of`).
+    pub fn position_of(&self, id: HolderId, key: BlockKey) -> Option<u32> {
+        self.live(id)?.registry.get(&key).map(|info| info.pos)
+    }
+
     // ---- writes (§4) ----
 
     /// All-or-nothing on error; see `StoreError` for the recovery

@@ -66,6 +66,11 @@ impl From<&proto::Update> for UpdateMsg {
                         seq_hashes: r.seq_hashes.iter().copied().map(SequenceHash).collect(),
                     },
                     proto::event::Kind::Cleared(_) => WireEvent::Cleared,
+                    proto::event::Kind::StoredDigest(d) => WireEvent::StoredDigest {
+                        parent: d.parent_seq_hash.map(SequenceHash),
+                        tip: SequenceHash(d.tip_seq_hash),
+                        len: d.len,
+                    },
                 })
                 .collect(),
             added: u.added.as_ref().map(|a| AddedControl {
@@ -115,6 +120,13 @@ impl From<&UpdateMsg> for proto::Update {
                             })
                         }
                         WireEvent::Cleared => proto::event::Kind::Cleared(true),
+                        WireEvent::StoredDigest { parent, tip, len } => {
+                            proto::event::Kind::StoredDigest(proto::StoredDigest {
+                                parent_seq_hash: parent.map(|p| p.0),
+                                tip_seq_hash: tip.0,
+                                len: *len,
+                            })
+                        }
                     }),
                 })
                 .collect(),

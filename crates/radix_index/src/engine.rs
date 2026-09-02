@@ -50,6 +50,14 @@ pub enum WireEvent {
         seq_hashes: Vec<SequenceHash>,
     },
     Cleared,
+    /// Duplicate-placement digest (see proto `StoredDigest`): confirm a
+    /// chain is already held without its blocks, or miss and force a
+    /// full resend.
+    StoredDigest {
+        parent: Option<SequenceHash>,
+        tip: SequenceHash,
+        len: u32,
+    },
 }
 
 /// Membership / capacity control payload.
@@ -81,6 +89,9 @@ pub enum ApplyOutcome {
     FeedRejected,
     /// Keyspace block_size conflict — publisher misconfigured.
     KeyspaceMismatch,
+    /// A `StoredDigest` the index could not confirm; the publisher must
+    /// resend the chain in full (never a silent under-match).
+    DigestMiss,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -298,6 +309,37 @@ impl Engine {
                     // feed flip, retire): the general path re-resolves.
                 }
             }
+
+            // Digest fast path: a duplicate placement that carries NO
+            // blocks, only {parent, tip, len}. Confirmed with one
+            // read-lock key lookup (prefix-closed => tip at the
+            // expected position proves full coverage); a miss returns
+            // DigestMiss so the publisher resends the chain in full.
+            if let [WireEvent::StoredDigest { parent, tip, len }] = update.events.as_slice() {
+                let shared = space.read().expect(LOCK_MSG);
+                if let Some(holder) = shared.holders.get(&update.holder) {
+                    if holder.event_fed || holder.dropped || update.epoch != holder.epoch {
+                        return (ApplyOutcome::DigestMiss, holder.last_seq, false);
+                    }
+                    let start_pos = match parent {
+                        None => Some(0u32),
+                        Some(p) => shared.tree.position_of(holder.id, p.0).map(|pp| pp + 1),
+                    };
+                    let confirmed = *len > 0
+                        && start_pos.is_some_and(|start| {
+                            shared.tree.position_of(holder.id, tip.0) == Some(start + *len - 1)
+                        });
+                    if confirmed {
+                        holder
+                            .last_publish_ns
+                            .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
+                        return (ApplyOutcome::Applied, holder.last_seq, false);
+                    }
+                }
+                // Unknown holder or unconfirmed: force a full resend.
+                let last_seq = shared.holders.get(&update.holder).map_or(0, |h| h.last_seq);
+                return (ApplyOutcome::DigestMiss, last_seq, false);
+            }
         }
 
         let mut space = space.write().expect(LOCK_MSG);
@@ -448,6 +490,14 @@ impl Engine {
                 WireEvent::Cleared => {
                     tree.clear(holder.id);
                     changed = true;
+                }
+                WireEvent::StoredDigest { .. } => {
+                    // Digests are handled by the read-lock fast path and
+                    // are only ever sent alone. Reaching the general
+                    // loop (a mixed batch) means we cannot confirm it
+                    // here without its blocks: force a full resend
+                    // rather than silently drop it.
+                    outcome = ApplyOutcome::DigestMiss;
                 }
             }
         }
@@ -826,6 +876,77 @@ mod tests {
         }
     }
 
+    fn digest(holder: &str, seed: u32, blocks: usize) -> UpdateMsg {
+        let chain = placement_chain(&prefix_hashes(seed, blocks));
+        UpdateMsg {
+            keyspace: keyspace(),
+            holder: holder.into(),
+            epoch: 1,
+            seq: 0,
+            events: vec![WireEvent::StoredDigest {
+                parent: None,
+                tip: chain.last().expect("non-empty").seq_hash,
+                len: blocks as u32,
+            }],
+            added: None,
+            dropped: false,
+        }
+    }
+
+    #[test]
+    fn digest_confirms_held_chain_and_misses_otherwise() {
+        let engine = Engine::new(EngineConfig {
+            inferred_ttl: Duration::from_millis(30),
+            ..EngineConfig::default()
+        });
+        // Digest for a chain the index has never seen -> MISS (resend).
+        let (o, _, changed) = engine.apply(&digest("w1", 71, 6));
+        assert_eq!(o, ApplyOutcome::DigestMiss);
+        assert!(!changed);
+
+        // Establish it with a full placement, then the identical digest
+        // is confirmed as a no-op (Applied, no relay) — same observable
+        // outcome as a full duplicate placement.
+        engine.apply(&placement("w1", 71, 6));
+        let (o, _, changed) = engine.apply(&digest("w1", 71, 6));
+        assert_eq!(o, ApplyOutcome::Applied);
+        assert!(!changed, "confirmed digest must not relay");
+        assert_eq!(scores(&engine, 71, 6).len(), 1);
+
+        // Wrong length (chain only 6 deep) -> MISS.
+        let (o, _, _) = engine.apply(&digest("w1", 71, 8));
+        assert_eq!(o, ApplyOutcome::DigestMiss);
+
+        // A confirmed digest refreshes freshness under the TTL: a
+        // digest-only-fed holder must not be swept.
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(15));
+            assert_eq!(engine.apply(&digest("w1", 71, 6)).0, ApplyOutcome::Applied);
+            engine.sweep_idle();
+        }
+        assert_eq!(
+            scores(&engine, 71, 6).len(),
+            1,
+            "digest must keep holder fresh"
+        );
+
+        // Event-fed holders never accept placement digests.
+        engine.apply(&event_batch(
+            "w2",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(72, 4)),
+            }],
+        ));
+        let (o, _, _) = engine.apply(&digest("w2", 72, 4));
+        assert_eq!(
+            o,
+            ApplyOutcome::DigestMiss,
+            "event-fed holder rejects digest"
+        );
+    }
+
     fn scores(engine: &Engine, seed: u32, blocks: usize) -> Vec<(String, u32)> {
         engine
             .find_matches(&keyspace(), &prefix_hashes(seed, blocks))
@@ -1198,8 +1319,11 @@ mod tests {
 
     #[test]
     fn keyspace_gc_removes_emptied_keyspaces_only() {
+        // Small real TTL (not ZERO: with ZERO the idle predicate is
+        // elapsed_ns > 0, which can round to the same nanosecond as
+        // creation under parallel test load and flake).
         let engine = Engine::new(EngineConfig {
-            inferred_ttl: Duration::ZERO,
+            inferred_ttl: Duration::from_millis(1),
             ..EngineConfig::default()
         });
         engine.apply(&placement("w1", 31, 4));
@@ -1208,13 +1332,15 @@ mod tests {
         engine.apply(&other);
         assert_eq!(engine.stats().keyspaces, 2);
 
-        // Dropping w1 and sweeping (TTL zero: instantly idle) retires
-        // the holder AND unlinks its now-empty keyspace; the live
-        // keyspace stays.
+        // Dropping w1 and sweeping past the TTL retires the holder AND
+        // unlinks its now-empty keyspace; the live keyspace stays. w2
+        // stays a holder (its blocks are cleared as idle-inferred, but
+        // the holder — hence its keyspace — remains).
         let mut drop_w1 = placement("w1", 31, 0);
         drop_w1.events.clear();
         drop_w1.dropped = true;
         engine.apply(&drop_w1);
+        std::thread::sleep(Duration::from_millis(3));
         engine.sweep_idle();
         let stats = engine.stats();
         assert_eq!(stats.keyspaces, 1);

@@ -17,13 +17,13 @@ use tokio::sync::mpsc;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 
 use crate::{
-    engine::{Engine, KeyspaceKey, SymbolKind},
+    engine::{ApplyOutcome, Engine, KeyspaceKey, SymbolKind},
     proto::{
         self,
         radix_index_client::RadixIndexClient,
         radix_index_server::{RadixIndex, RadixIndexServer},
     },
-    ContentHash, UpdateMsg,
+    ContentHash, UpdateMsg, WireEvent,
 };
 
 type AckStream = Pin<Box<dyn Stream<Item = Result<proto::PublishAck, Status>> + Send>>;
@@ -197,8 +197,17 @@ impl RadixIndex for IndexService {
             while let Some((deadline, update)) = delayed_rx.recv().await {
                 tokio::time::sleep_until(deadline).await;
                 let msg = UpdateMsg::from(&update);
-                let (_outcome, applied_seq, state_changed) = apply_engine.apply(&msg);
+                let (outcome, applied_seq, state_changed) = apply_engine.apply(&msg);
                 apply_stats.applies.fetch_add(1, Ordering::Relaxed);
+                // A digest the index could not confirm: tell the
+                // publisher which tip to resend in full. Never a silent
+                // under-match.
+                let digest_miss_tip = (outcome == ApplyOutcome::DigestMiss)
+                    .then(|| match msg.events.first() {
+                        Some(WireEvent::StoredDigest { tip, .. }) => Some(tip.0),
+                        _ => None,
+                    })
+                    .flatten();
                 // Relay ONLY state-changing applies: a relayed update
                 // echoed back by a symmetric peer is a no-op here and
                 // stops, instead of ping-ponging forever (bounded
@@ -214,6 +223,7 @@ impl RadixIndex for IndexService {
                     holder: msg.holder,
                     epoch: msg.epoch,
                     applied_seq,
+                    digest_miss_tip,
                 };
                 // Acks are advisory (clients watch for stream death,
                 // not individual acks): drop when the publisher is

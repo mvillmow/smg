@@ -464,6 +464,19 @@ impl RadixTree {
         (run, true)
     }
 
+    /// Read-only: the absolute position at which `holder` holds `key`,
+    /// or None. The digest fast path uses this to confirm a placement
+    /// chain is fully present without receiving its contents — sound
+    /// because an inferred (placement-fed) holder's held positions are
+    /// a contiguous prefix per chain (stores add contiguously,
+    /// truncate cuts the tail, no mid-chain removes), so a tip key at
+    /// position p proves positions 0..=p are held.
+    pub fn position_of(&self, id: HolderId, key: BlockKey) -> Option<u32> {
+        self.live(id)?;
+        let holder = id.parts().0;
+        self.state_of(holder).keys.get(&key).map(|&(_, pos)| pos)
+    }
+
     pub fn remove(&mut self, id: HolderId, keys: &[BlockKey]) -> u32 {
         if self.live(id).is_none() {
             return 0;

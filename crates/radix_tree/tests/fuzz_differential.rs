@@ -178,6 +178,12 @@ impl Subject {
             Core::Chain(t) => t.dup_prefix(self.ids[h], parent, blocks),
         }
     }
+    fn position_of(&self, h: usize, key: u64) -> Option<u32> {
+        match &self.core {
+            Core::Flat(t) => t.position_of(self.ids[h], key),
+            Core::Chain(t) => t.position_of(self.ids[h], key),
+        }
+    }
     fn audit(&self) -> Result<(), String> {
         match &self.core {
             Core::Flat(t) => t.audit(),
@@ -214,6 +220,13 @@ fn run_one_in_contract(seed: u64, wide: bool) {
                     expect,
                     "dup_prefix diverged from model"
                 );
+                for &(key, _) in blocks.iter() {
+                    assert_eq!(
+                        subject.position_of(*holder, key),
+                        model.position_of(*holder, key),
+                        "position_of diverged from model"
+                    );
+                }
             }
         }
         let model_outcome = model.apply(op);
@@ -292,6 +305,7 @@ fn run_one_in_contract(seed: u64, wide: bool) {
 trait CoreApi {
     fn create_holder(&mut self, name: &str) -> HolderId;
     fn dup_prefix(&self, id: HolderId, parent: Option<u64>, blocks: &[(u64, u64)]) -> (u32, bool);
+    fn position_of(&self, id: HolderId, key: u64) -> Option<u32>;
     fn store(
         &mut self,
         id: HolderId,
@@ -322,6 +336,9 @@ macro_rules! impl_core_api {
                 blocks: &[(u64, u64)],
             ) -> (u32, bool) {
                 <$t>::dup_prefix(self, id, parent, blocks)
+            }
+            fn position_of(&self, id: HolderId, key: u64) -> Option<u32> {
+                <$t>::position_of(self, id, key)
             }
             fn store(
                 &mut self,
@@ -492,6 +509,13 @@ fn run_one_chaos(seed: u64) {
                             model.dup_prefix(*slot, parent, blocks),
                             "dup_prefix diverged from model (chaos)"
                         );
+                        for &(key, _) in blocks.iter() {
+                            assert_eq!(
+                                tree.position_of(id, key),
+                                model.position_of(*slot, key),
+                                "position_of diverged from model (chaos)"
+                            );
+                        }
                         let predicted = predicted_pair.1;
                         let subject = tree.store(id, parent, blocks);
                         let modeled = model.store(*slot, parent, blocks);

@@ -69,11 +69,28 @@ message Added {
   bytes metadata = 3;
 }
 
+// Duplicate-placement digest: re-publish a chain the index already
+// holds WITHOUT resending its blocks. `tip_seq_hash` is the chain's
+// rolling prefix hash at its last block; `len` its block count.
+// Placement holders are prefix-closed (contiguous adds, tail-only
+// truncation, no mid-chain removes), so the index confirms full
+// coverage by checking the tip key sits at position (start+len-1) —
+// one lookup, no contents. A miss (tip absent / wrong position /
+// holder not inferred) is answered with PublishAck.digest_miss so the
+// publisher resends the full chain: never a silent under-match.
+// Digests are unsequenced placement-only (seq 0, inferred holders).
+message StoredDigest {
+  optional fixed64 parent_seq_hash = 1; // absent = chain start
+  fixed64 tip_seq_hash = 2;
+  uint32 len = 3;
+}
+
 message Event {
   oneof kind {
     Stored stored = 1;
     Removed removed = 2;
     bool cleared = 3;
+    StoredDigest stored_digest = 4;
   }
 }
 
@@ -101,6 +118,10 @@ message PublishAck {
   string holder = 1;
   uint64 epoch = 2;
   uint64 applied_seq = 3;
+  // Set when a StoredDigest could not be confirmed: the publisher must
+  // resend that chain in full. Carries the unconfirmed tip so the
+  // publisher matches it to its buffered chain.
+  optional fixed64 digest_miss_tip = 4;
 }
 
 message Query {

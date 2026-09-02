@@ -93,6 +93,38 @@ fn worker_url(w: usize) -> String {
     format!("grpc://10.0.0.{}:{}", w % 250, 9000 + w / 250)
 }
 
+/// A hot chain's rolling tip hash — its digest identity.
+fn tip_of(worker: usize, slot: usize, len: usize) -> u64 {
+    wire_hash::placement_chain(&hot_contents(worker, slot, len))
+        .last()
+        .expect("non-empty")
+        .0
+         .0
+}
+
+fn digest_update(holder: &str, tip: u64, len: usize) -> proto::Update {
+    proto::Update {
+        keyspace: Some(proto::Keyspace {
+            model: MODEL.into(),
+            symbol_kind: proto::SymbolKind::Tokens as i32,
+            block_size: BLOCK_SIZE,
+            hash_scheme: wire_hash::HASH_SCHEME_V1,
+        }),
+        holder: holder.into(),
+        epoch: 1,
+        seq: 0,
+        events: vec![proto::Event {
+            kind: Some(proto::event::Kind::StoredDigest(proto::StoredDigest {
+                parent_seq_hash: None,
+                tip_seq_hash: tip,
+                len: len as u32,
+            })),
+        }],
+        added: None,
+        dropped: false,
+    }
+}
+
 struct Percentiles {
     n: usize,
     p50: u64,
@@ -182,6 +214,11 @@ async fn run_publisher(
     sent_blocks: Arc<AtomicU64>,
     // Per-publisher target updates/sec; 0 = unthrottled (max hammer).
     target_ups: u64,
+    // Reference-gateway digest protocol: re-publish established hot
+    // chains as {tip,len} digests instead of full blocks. Off = every
+    // publish carries full blocks (the pre-digest baseline).
+    use_digest: bool,
+    resent_blocks: Arc<AtomicU64>,
 ) {
     let client = RadixIndexClient::connect(url)
         .await
@@ -196,8 +233,40 @@ async fn run_publisher(
         .await
         .expect("publish stream")
         .into_inner();
-    // Drain acks so the server's advisory ack channel never backs up.
-    tokio::spawn(async move { while let Some(_ack) = acks.next().await {} });
+
+    // Chains this publisher has established (sent full, not since
+    // missed): tip -> (worker, slot), so a miss ack can rebuild and
+    // resend the exact chain in full. Bounded by workers*hot_per_worker.
+    let established: Arc<std::sync::Mutex<std::collections::HashMap<u64, (usize, usize)>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Ack reader: on a digest miss, resend the chain in FULL — never a
+    // silent under-match. This is the publisher-side replay ring.
+    let ack_tx = tx.clone();
+    let ack_established = Arc::clone(&established);
+    let ack_resent = Arc::clone(&resent_blocks);
+    let ack_from = count_from;
+    tokio::spawn(async move {
+        while let Some(Ok(ack)) = acks.next().await {
+            if let Some(tip) = ack.digest_miss_tip {
+                let ws = ack_established.lock().expect("established").remove(&tip);
+                if let Some((w, slot)) = ws {
+                    let contents = hot_contents(w, slot, chain_len);
+                    let full = placement_update(&worker_url(w), &contents);
+                    if Instant::now() >= ack_from {
+                        ack_resent.fetch_add(contents.len() as u64, Ordering::Relaxed);
+                    }
+                    // Re-establish once the full resend is in flight.
+                    if ack_tx.send(full).await.is_ok() {
+                        ack_established
+                            .lock()
+                            .expect("established")
+                            .insert(tip, (w, slot));
+                    }
+                }
+            }
+        }
+    });
 
     let mut rng = seed ^ 0xF00D;
     let mut nonce = 0u64;
@@ -214,33 +283,39 @@ async fn run_publisher(
         rng = splitmix(rng);
         let w = (rng % workers as u64) as usize;
         let slot = ((rng >> 32) % hot_per_worker as u64) as usize;
+        let mut wire_blocks = 0u64;
         let update = if rng % 100 < dup_pct {
             // The multi-gateway steady state: another gateway routed the
             // same hot prefix and re-publishes an identical chain.
-            let contents = hot_contents(w, slot, chain_len);
-            placement_update(&worker_url(w), &contents)
+            let tip = tip_of(w, slot, chain_len);
+            let known = use_digest && established.lock().expect("established").contains_key(&tip);
+            if known {
+                digest_update(&worker_url(w), tip, chain_len)
+            } else {
+                if use_digest {
+                    established
+                        .lock()
+                        .expect("established")
+                        .insert(tip, (w, slot));
+                }
+                wire_blocks = chain_len as u64;
+                placement_update(&worker_url(w), &hot_contents(w, slot, chain_len))
+            }
         } else {
             // Fresh traffic: the hot prefix extended by a new tail (a
-            // follow-up turn), attributed to the same worker.
+            // follow-up turn) — always full (a new, unestablished tip).
             nonce += 1;
             let mut contents = hot_contents(w, slot, chain_len);
             let tail_seed = seed.wrapping_mul(0x51D) ^ nonce;
             contents.extend((0..32u64).map(|p| ContentHash(splitmix(tail_seed ^ p) | 1)));
+            wire_blocks = contents.len() as u64;
             placement_update(&worker_url(w), &contents)
         };
-        let blocks: u64 = update
-            .events
-            .iter()
-            .map(|e| match &e.kind {
-                Some(proto::event::Kind::Stored(s)) => s.blocks.len() as u64,
-                _ => 0,
-            })
-            .sum();
         if tx.send(update).await.is_err() {
             break;
         }
         if Instant::now() >= count_from {
-            sent_blocks.fetch_add(blocks, Ordering::Relaxed);
+            sent_blocks.fetch_add(wire_blocks, Ordering::Relaxed);
         }
     }
 }
@@ -258,28 +333,40 @@ async fn main() {
     // Per-publisher target updates/sec (0 = max hammer). Model a
     // realistic gateway: 200 req/s each => --target-ups 200.
     let target_ups: u64 = parse_flag(&args, "--target-ups").unwrap_or(0);
+    // --connect <URL> drives an EXTERNAL service (separate process, so
+    // the OS schedules service vs loadgen independently — the honest
+    // measurement). Omitted: an in-process service shares this
+    // runtime, which conflates service cost with loadgen cost.
+    let connect: Option<String> = parse_flag(&args, "--connect");
+    // Reference-gateway digest protocol on the duplicate stream.
+    let use_digest: bool = args.iter().any(|a| a == "--digest");
 
     let engine = Arc::new(Engine::new(EngineConfig::default()));
     let stats = Arc::new(server::ServiceStats::default());
-    let port = {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
-        probe.local_addr().expect("probe addr").port()
+    let external = connect.is_some();
+    let url = match &connect {
+        Some(u) => u.clone(),
+        None => {
+            let port = {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+                probe.local_addr().expect("probe addr").port()
+            };
+            let url = format!("http://127.0.0.1:{port}");
+            let engine = Arc::clone(&engine);
+            let stats = Arc::clone(&stats);
+            tokio::spawn(server::serve_until(
+                engine,
+                format!("127.0.0.1:{port}").parse().unwrap(),
+                Vec::new(),
+                Duration::from_secs(60),
+                Duration::ZERO,
+                Duration::ZERO,
+                stats,
+                std::future::pending::<()>(),
+            ));
+            url
+        }
     };
-    let url = format!("http://127.0.0.1:{port}");
-    {
-        let engine = Arc::clone(&engine);
-        let stats = Arc::clone(&stats);
-        tokio::spawn(server::serve_until(
-            engine,
-            format!("127.0.0.1:{port}").parse().unwrap(),
-            Vec::new(),
-            Duration::from_secs(60),
-            Duration::ZERO,
-            Duration::ZERO,
-            stats,
-            std::future::pending::<()>(),
-        ));
-    }
     // Wait for the service to accept.
     let mut attempt = 0;
     loop {
@@ -359,6 +446,7 @@ async fn main() {
     // Phase 2: full write load + queries.
     let running = Arc::new(AtomicBool::new(true));
     let sent_blocks = Arc::new(AtomicU64::new(0));
+    let resent_blocks = Arc::new(AtomicU64::new(0));
     let warmup = Duration::from_secs(2);
     let count_from = Instant::now() + warmup;
     let mut pubs = Vec::new();
@@ -374,6 +462,8 @@ async fn main() {
             count_from,
             Arc::clone(&sent_blocks),
             target_ups,
+            use_digest,
+            Arc::clone(&resent_blocks),
         )));
     }
     tokio::time::sleep(warmup).await;
@@ -404,12 +494,31 @@ async fn main() {
     let loaded = percentiles(lat);
     let blocks = sent_blocks.load(Ordering::Relaxed);
 
-    let gauges = engine.stats();
     println!(
-        "loaded_publish blocks_per_sec {:.0} updates_per_sec {:.0} (window {window:.1}s, {publishers} publishers, dup {dup_pct}%)",
-        blocks as f64 / window,
-        applies as f64 / window,
+        "mode {} digest={} miss_resent_blocks={}",
+        if external { "external" } else { "in-process" },
+        use_digest,
+        resent_blocks.load(Ordering::Relaxed),
     );
+    if external {
+        // Publisher rate is client-observed; applies/gauges live in the
+        // other process (scrape its /metrics for those).
+        println!(
+            "loaded_publish blocks_per_sec {:.0} (window {window:.1}s, {publishers} publishers, dup {dup_pct}%)",
+            blocks as f64 / window,
+        );
+    } else {
+        let gauges = engine.stats();
+        println!(
+            "loaded_publish blocks_per_sec {:.0} updates_per_sec {:.0} (window {window:.1}s, {publishers} publishers, dup {dup_pct}%)",
+            blocks as f64 / window,
+            applies as f64 / window,
+        );
+        println!(
+            "engine keyspaces={} holders={} blocks={}",
+            gauges.keyspaces, gauges.holders, gauges.blocks
+        );
+    }
     println!(
         "loaded_query_ns n={} p50={} p90={} p99={}",
         loaded.n, loaded.p50, loaded.p90, loaded.p99
@@ -417,9 +526,5 @@ async fn main() {
     println!(
         "isolation p99_loaded/p99_idle {:.2} (goal G2: <= 2.0)",
         loaded.p99 as f64 / idle.p99.max(1) as f64
-    );
-    println!(
-        "engine keyspaces={} holders={} blocks={}",
-        gauges.keyspaces, gauges.holders, gauges.blocks
     );
 }

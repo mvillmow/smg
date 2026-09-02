@@ -198,6 +198,11 @@ impl Model {
         (run, true)
     }
 
+    /// Read-only mirror of the subjects' `position_of`.
+    pub fn position_of(&self, holder: usize, key: u64) -> Option<u32> {
+        self.holders[holder].registry.get(&key).map(|r| r.pos)
+    }
+
     pub fn remove(&mut self, holder: usize, keys: &[u64]) -> u32 {
         let h = &mut self.holders[holder];
         let mut removed = 0;

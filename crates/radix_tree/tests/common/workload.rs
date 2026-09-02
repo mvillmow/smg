@@ -123,7 +123,10 @@ pub fn generate(seed: u64, cfg: &Config) -> Workload {
     // enumerate parity check).
     let mut per_holder: Vec<Vec<Op>> = vec![Vec::new(); cfg.holders];
     let mut tailed: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-    let mut tails: Vec<(usize, u32, Vec<(u64, u64)>)> = Vec::new();
+    // (holder, fork-position, tail blocks) pending mid-chain diverging
+    // queries.
+    type PendingTail = (usize, u32, Vec<(u64, u64)>);
+    let mut tails: Vec<PendingTail> = Vec::new();
     for (fi, family) in families.iter().enumerate() {
         let count = cfg.holders_per_family.0
             + rng.below(cfg.holders_per_family.1 - cfg.holders_per_family.0 + 1);
