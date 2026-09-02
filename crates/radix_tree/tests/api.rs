@@ -1,4 +1,4 @@
-//! Targeted API contract tests (SPEC.md §4/§5): the behaviors the
+//! Targeted API contract tests: the behaviors the
 //! differential harness can't reach because the model deliberately
 //! has no ids, config bounds, or lifecycle.
 

@@ -1,4 +1,4 @@
-//! The model-referee differential harness (SPEC.md §10.1), R0 stage:
+//! The model-referee differential harness, R0 stage:
 //! model vs oracle. When the R1 core exists it joins as the third
 //! side with the HARD assertion `RadixTree == model`; until then this
 //! file proves the model, the oracle adapter, and the generator agree

@@ -2,11 +2,11 @@
 name = "radix-tree"
 version = "0.1.0"
 edition = "2021"
-description = "Generic prefix-membership index (spec stage; see SPEC.md)"
+description = "Generic prefix-membership index"
 license = "Apache-2.0"
 
 [dependencies]
-# Zero SMG dependencies (SPEC.md §1). External utility crates only.
+# Zero SMG dependencies. External utility crates only.
 rustc-hash = "2"
 
 

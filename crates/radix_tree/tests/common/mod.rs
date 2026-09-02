@@ -1,4 +1,4 @@
-//! The model-referee harness (SPEC.md §10.1).
+//! The model-referee harness.
 //!
 //! Three pieces:
 //! - [`model`]: a trivially-correct implementation of the §6/§7

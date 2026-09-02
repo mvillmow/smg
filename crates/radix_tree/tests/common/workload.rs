@@ -1,6 +1,6 @@
 //! Seeded workload generator producing §7-scoped operation streams.
 //!
-//! Shape (mirrors SPEC.md §11's pinned-workload structure at test
+//! Shape (mirrors the pinned-workload structure at test
 //! scale): prefix FAMILIES — shared base chains that several holders
 //! store identically (same keys, same contents: exactly what the
 //! placement feed produces) — plus per-holder divergent tails,
