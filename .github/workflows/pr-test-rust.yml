@@ -329,24 +329,39 @@ jobs:
         # `cargo test` builds a test binary for bindings/python. Unlike the
         # maturin cdylib -- which enables `extension-module` and deliberately
         # leaves the libpython symbols undefined -- that binary must link
-        # libpython. setup-python ships a shared CPython but only as
-        # `libpython3.X.so.1.0`; the bare `libpython3.X.so` symlink that
-        # `-lpython3.X` resolves against normally comes from a -dev package.
-        # Create it if missing, and fail loudly rather than letting this
-        # resurface as "unable to find library -lpython3.X" at link time.
+        # libpython.
+        #
+        # Two things get in the way. `sysconfig`'s LIBDIR is the path CPython
+        # was *built* with (/opt/hostedtoolcache/...), but setup-python
+        # relocates the tool cache on this runner, so that directory does not
+        # exist and the `-L` PyO3 emits from it points nowhere. And the
+        # interpreter ships only `libpython3.X.so.1.0`, without the bare `.so`
+        # symlink `-lpython3.X` resolves against (normally from a -dev
+        # package). So: derive the real lib dir from the install prefix, make
+        # the symlink, and add that dir via RUSTFLAGS. Setting RUSTFLAGS
+        # changes the cache key and forces a full rebuild -- acceptable for one
+        # `-L`, but the reason this is a separate, documented step.
         run: |
           set -euo pipefail
-          libdir=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+          libdir="${pythonLocation:-$(python3 -c 'import sys; print(sys.base_prefix)')}/lib"
           ldlib=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LDLIBRARY"))')
+          if [ ! -d "$libdir" ]; then
+            echo "::error::python lib dir $libdir does not exist"
+            exit 1
+          fi
           if [ ! -e "$libdir/$ldlib" ]; then
             real=$(find "$libdir" -maxdepth 1 -name "$ldlib.*" -print -quit)
             if [ -z "$real" ]; then
               echo "::error::no libpython shared object in $libdir; the bindings/python test binary cannot link"
+              ls -la "$libdir"
               exit 1
             fi
             ln -sf "$real" "$libdir/$ldlib"
             echo "linked $libdir/$ldlib -> $real"
+          else
+            echo "libpython already linkable at $libdir/$ldlib"
           fi
+          echo "RUSTFLAGS=${RUSTFLAGS:-} -L $libdir" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=${libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       - name: Run Rust tests
