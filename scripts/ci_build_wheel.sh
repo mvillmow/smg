@@ -26,7 +26,11 @@ GO_PID=$!
 # Build Python wheel in foreground
 echo "Building Python wheel..."
 cd bindings/python
-maturin build --profile ci --features vendored-openssl --manylinux 2_28 --zig --out dist
+# `extension-module` is listed in pyproject.toml's `[tool.maturin] features`,
+# but a command-line `--features` overrides that list rather than adding to it.
+# Name it explicitly here: without it the wheel's .so links libpython and fails
+# to load wherever that exact libpython is absent.
+maturin build --profile ci --features extension-module,vendored-openssl --manylinux 2_28 --zig --out dist
 echo "Python wheel: OK"
 ls -lh dist/
 

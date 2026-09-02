@@ -38,7 +38,13 @@ workspace = true
 workspace = true
 
 [features]
-default = ["pyo3/extension-module"]
+# `extension-module` must NOT be in `default`. It tells PyO3 to leave the
+# libpython symbols undefined (the interpreter supplies them when it dlopens
+# the module), which is right for the cdylib but unlinkable for the test
+# binary `cargo test` builds for this crate. maturin turns it on explicitly
+# via `[tool.maturin] features` in pyproject.toml.
+default = []
+extension-module = ["pyo3/extension-module"]
 opencv-video = ["smg/opencv-video"]
 vendored-openssl = ["smg/vendored-openssl"]
 jemalloc-profiling = ["smg/jemalloc-profiling", "tikv-jemallocator/profiling"]

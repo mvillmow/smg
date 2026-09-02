@@ -325,6 +325,18 @@ jobs:
           bash scripts/ci_agentic_svc_deps.sh check --postgres postgres-db
           bash scripts/ci_agentic_svc_deps.sh create-postgres-db postgres-db
 
+      - name: Expose libpython to cargo test
+        # `cargo test` builds a test binary for bindings/python. Unlike the
+        # maturin cdylib -- which enables `extension-module` and deliberately
+        # leaves the libpython symbols undefined -- that binary must link
+        # libpython. setup-python ships a shared CPython, so just put its lib
+        # dir on the loader path. Fail loudly if it is ever a static build,
+        # rather than surfacing as undefined Py_* symbols at link time.
+        run: |
+          python3 -c 'import sysconfig, sys; sys.exit(0 if sysconfig.get_config_var("Py_ENABLE_SHARED") else 1)' \
+            || { echo "::error::CPython is not a shared build; bindings/python test binary cannot link libpython"; exit 1; }
+          echo "LD_LIBRARY_PATH=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
       - name: Run Rust tests
         timeout-minutes: 30
         run: |
