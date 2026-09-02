@@ -21,6 +21,10 @@ path = "src/bin/bridge.rs"
 name = "radix-index-bench"
 path = "src/bin/bench.rs"
 
+[[bin]]
+name = "radix-index-loadbench"
+path = "src/bin/loadbench.rs"
+
 [dependencies]
 radix-tree = { path = "../radix_tree" }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

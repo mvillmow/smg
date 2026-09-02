@@ -568,6 +568,80 @@ impl FlatTree {
         })
     }
 
+    /// Read-only no-op predicate: true iff `store(id, parent, blocks)`
+    /// would apply nothing (see `RadixTree::covered` — same contract,
+    /// gated against the model by the same fuzz assertions).
+    pub fn covered(
+        &self,
+        id: HolderId,
+        parent: Option<BlockKey>,
+        blocks: &[(BlockKey, ContentHash)],
+    ) -> bool {
+        self.dup_prefix(id, parent, blocks).1
+    }
+
+    /// See `RadixTree::dup_prefix` — same contract, gated against the
+    /// model by the same fuzz assertions.
+    pub fn dup_prefix(
+        &self,
+        id: HolderId,
+        parent: Option<BlockKey>,
+        blocks: &[(BlockKey, ContentHash)],
+    ) -> (u32, bool) {
+        if self.live(id).is_none() {
+            return (0, false);
+        }
+        if blocks.is_empty() {
+            return (0, true);
+        }
+        let state = self.slots[id.index as usize]
+            .state
+            .as_ref()
+            .expect("checked live");
+        let (start_pos, mut lineage_prev) = match parent {
+            Some(parent_key) => match state.registry.get(&parent_key) {
+                None => return (0, false),
+                Some(info) => (info.pos + 1, Some(info.lineage)),
+            },
+            None => (0, None),
+        };
+        if start_pos as u64 + blocks.len() as u64 > self.cfg.max_chain_len as u64 {
+            return (0, false);
+        }
+        let mut run = 0u32;
+        let mut run_live = true;
+        for (i, &(key, content)) in blocks.iter().enumerate() {
+            let pos = start_pos + i as u32;
+            let lineage = match lineage_prev {
+                None => lineage_root(content),
+                Some(prev) => lineage_step(prev, content),
+            };
+            lineage_prev = Some(lineage);
+            let info = BlockInfo {
+                pos,
+                content,
+                lineage,
+            };
+            let plain = state.registry.get(&key) == Some(&info);
+            let held = plain
+                || self
+                    .entries
+                    .get(&(info.pos, info.content))
+                    .is_some_and(|m| m.contains(info.lineage, id.index));
+            if !held {
+                return (run, false);
+            }
+            if run_live {
+                if plain {
+                    run += 1;
+                } else {
+                    run_live = false;
+                }
+            }
+        }
+        (run, true)
+    }
+
     /// Idempotent; returns blocks actually removed (advisory).
     pub fn remove(&mut self, id: HolderId, keys: &[BlockKey]) -> u32 {
         if self.live(id).is_none() {

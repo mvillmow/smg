@@ -139,6 +139,65 @@ impl Model {
         }
     }
 
+    /// Read-only mirror of [`Self::store`]: true iff the store would
+    /// return `Applied { applied: 0, .. }` (every block an exact-triple
+    /// duplicate or alias), false where it would error. Referees the
+    /// subject's shared-lock duplicate fast path.
+    pub fn covered(&self, holder: usize, parent: Option<u64>, blocks: &[(u64, u64)]) -> bool {
+        self.dup_prefix(holder, parent, blocks).1
+    }
+
+    /// Read-only mirror of the subjects' `dup_prefix`: (leading run of
+    /// plain same-key duplicates, store-would-apply-nothing).
+    pub fn dup_prefix(
+        &self,
+        holder: usize,
+        parent: Option<u64>,
+        blocks: &[(u64, u64)],
+    ) -> (u32, bool) {
+        if blocks.is_empty() {
+            return (0, true);
+        }
+        let h = &self.holders[holder];
+        let (start_pos, mut prefix) = match parent {
+            None => (0u32, Vec::new()),
+            Some(parent_key) => match h.registry.get(&parent_key) {
+                None => return (0, false),
+                Some(rec) => (rec.pos + 1, rec.lineage.as_ref().clone()),
+            },
+        };
+        if start_pos as u64 + blocks.len() as u64 > self.max_chain_len as u64 {
+            return (0, false);
+        }
+        let mut run = 0u32;
+        let mut run_live = true;
+        for (i, &(key, content)) in blocks.iter().enumerate() {
+            let pos = start_pos + i as u32;
+            prefix.push(content);
+            let candidate = BlockRec {
+                pos,
+                content,
+                lineage: Rc::new(prefix.clone()),
+            };
+            let plain = h.registry.get(&key) == Some(&candidate);
+            let held = plain
+                || h.registry
+                    .iter()
+                    .any(|(&k, rec)| k != key && *rec == candidate);
+            if !held {
+                return (run, false);
+            }
+            if run_live {
+                if plain {
+                    run += 1;
+                } else {
+                    run_live = false;
+                }
+            }
+        }
+        (run, true)
+    }
+
     pub fn remove(&mut self, holder: usize, keys: &[u64]) -> u32 {
         let h = &mut self.holders[holder];
         let mut removed = 0;

@@ -143,13 +143,15 @@ struct HolderState {
     event_fed: bool,
     capacity_blocks: u64,
     dropped: bool,
-    last_publish: Instant,
+    /// Nanoseconds since `Engine::start` — atomic so the shared-lock
+    /// duplicate fast path can refresh freshness WITHOUT the keyspace
+    /// write lock (a holder fed only by duplicate placements must not
+    /// TTL out).
+    last_publish_ns: std::sync::atomic::AtomicU64,
 }
 
 struct KeyspaceState {
     tree: RadixTree,
-    scratch: OverlapScratch,
-    answers: Vec<Overlap>,
     holders: HashMap<String, HolderState>,
 }
 
@@ -160,30 +162,41 @@ const LOCK_MSG: &str = "engine lock poisoned by a panic mid-mutation: aborting s
 
 /// The engine: all keyspaces, locked at TWO levels. The outer RwLock
 /// guards only the keyspace map (creation/removal — rare); every
-/// keyspace mutates under its own mutex. Snapshot, sweep, and stats
-/// therefore stall at most ONE keyspace at a time instead of the whole
-/// engine (a full-fleet Pull used to block every apply and query for
-/// its entire serialization). Convergence arguments are unaffected:
-/// all wire-visible ordering (epoch, seq, feed authority) is per
-/// HOLDER, and a holder lives in exactly one keyspace.
+/// keyspace lives behind its own RwLock. Queries take the SHARED side
+/// with caller-owned scratch, and so does the duplicate fast path —
+/// the >=90%-duplicate multi-gateway placement stream and all
+/// routing-time queries proceed concurrently, while only genuinely
+/// state-changing applies take the exclusive side (the multi-writer
+/// baseline measured 50-390x query-p99 degradation when every
+/// duplicate held an exclusive lock for its full chain walk).
+/// Convergence arguments are unaffected: all wire-visible ordering
+/// (epoch, seq, feed authority) is per HOLDER, and a holder lives in
+/// exactly one keyspace.
 pub struct Engine {
     cfg: EngineConfig,
-    keyspaces: std::sync::RwLock<HashMap<KeyspaceKey, Arc<std::sync::Mutex<KeyspaceState>>>>,
+    /// Basis for the per-holder atomic freshness stamps.
+    start: Instant,
+    keyspaces: std::sync::RwLock<HashMap<KeyspaceKey, Arc<std::sync::RwLock<KeyspaceState>>>>,
 }
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Self {
         Self {
             cfg,
+            start: Instant::now(),
             keyspaces: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
-    fn space(&self, key: &KeyspaceKey) -> Option<Arc<std::sync::Mutex<KeyspaceState>>> {
+    fn now_ns(&self) -> u64 {
+        self.start.elapsed().as_nanos() as u64
+    }
+
+    fn space(&self, key: &KeyspaceKey) -> Option<Arc<std::sync::RwLock<KeyspaceState>>> {
         self.keyspaces.read().expect(LOCK_MSG).get(key).cloned()
     }
 
-    fn space_or_create(&self, key: &KeyspaceKey) -> Arc<std::sync::Mutex<KeyspaceState>> {
+    fn space_or_create(&self, key: &KeyspaceKey) -> Arc<std::sync::RwLock<KeyspaceState>> {
         if let Some(space) = self.space(key) {
             return space;
         }
@@ -192,10 +205,8 @@ impl Engine {
             .expect(LOCK_MSG)
             .entry(key.clone())
             .or_insert_with(|| {
-                Arc::new(std::sync::Mutex::new(KeyspaceState {
+                Arc::new(std::sync::RwLock::new(KeyspaceState {
                     tree: RadixTree::new(TreeConfig::default()),
-                    scratch: OverlapScratch::default(),
-                    answers: Vec::new(),
                     holders: HashMap::new(),
                 }))
             })
@@ -204,7 +215,7 @@ impl Engine {
 
     /// Stable iteration set for the cross-keyspace paths: each entry is
     /// then locked INDIVIDUALLY, so the walk never freezes the engine.
-    fn all_spaces(&self) -> Vec<(KeyspaceKey, Arc<std::sync::Mutex<KeyspaceState>>)> {
+    fn all_spaces(&self) -> Vec<(KeyspaceKey, Arc<std::sync::RwLock<KeyspaceState>>)> {
         self.keyspaces
             .read()
             .expect(LOCK_MSG)
@@ -228,7 +239,68 @@ impl Engine {
             return (ApplyOutcome::KeyspaceMismatch, 0, false);
         }
         let space = self.space_or_create(&update.keyspace);
-        let mut space = space.lock().expect(LOCK_MSG);
+
+        // SHARED-lock duplicate fast path: the multi-gateway steady
+        // state is every gateway re-publishing hot placement chains.
+        // A placement whose chain the holder fully holds changes
+        // NOTHING — resolve it under the read lock (concurrent with
+        // queries and with each other) and never touch the write side.
+        // Conditions are exactly the shapes whose slow-path outcome is
+        // (Applied, last_seq, changed=false): plain same-epoch
+        // placement Stored for a known non-event-fed holder.
+        if update.seq == 0 && update.added.is_none() && !update.dropped {
+            if let [WireEvent::Stored { parent, blocks }] = update.events.as_slice() {
+                let pairs: Vec<(u64, u64)> = blocks
+                    .iter()
+                    .map(|b| (b.seq_hash.0, b.content_hash.0))
+                    .collect();
+                // The read-side walk answers both placement questions:
+                // fully covered => return without any exclusive work;
+                // covered PREFIX => the exclusive section applies only
+                // the suffix, re-anchored at the last plain-duplicate
+                // key (a fresh 32-block tail on a hot 256-block prefix
+                // holds the write lock for the 32, not the 288 — the
+                // full-batch hold is what starved queries in the
+                // multi-writer baseline).
+                let mut split: Option<(u64, usize)> = None;
+                {
+                    let shared = space.read().expect(LOCK_MSG);
+                    if let Some(holder) = shared.holders.get(&update.holder) {
+                        if !holder.event_fed && !holder.dropped && update.epoch == holder.epoch {
+                            let (run, all) =
+                                shared
+                                    .tree
+                                    .dup_prefix(holder.id, parent.map(|p| p.0), &pairs);
+                            if all {
+                                holder
+                                    .last_publish_ns
+                                    .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
+                                return (ApplyOutcome::Applied, holder.last_seq, false);
+                            }
+                            if run > 0 {
+                                split = Some((pairs[run as usize - 1].0, run as usize));
+                            }
+                        }
+                    }
+                }
+                if let Some((anchor, run)) = split {
+                    if let Some(result) = self.apply_placement_suffix(
+                        &space,
+                        update,
+                        parent.map(|p| p.0),
+                        &pairs,
+                        anchor,
+                        run,
+                    ) {
+                        return result;
+                    }
+                    // Posture changed between the locks (epoch bump,
+                    // feed flip, retire): the general path re-resolves.
+                }
+            }
+        }
+
+        let mut space = space.write().expect(LOCK_MSG);
         let space = &mut *space;
 
         if !space.holders.contains_key(&update.holder) {
@@ -242,7 +314,7 @@ impl Engine {
                     event_fed: false,
                     capacity_blocks: self.cfg.default_capacity_blocks,
                     dropped: false,
-                    last_publish: Instant::now(),
+                    last_publish_ns: std::sync::atomic::AtomicU64::new(self.now_ns()),
                 },
             );
         }
@@ -294,7 +366,9 @@ impl Engine {
         } else if update.epoch < holder.epoch {
             return (ApplyOutcome::Deduped, holder.last_seq, changed);
         }
-        holder.last_publish = Instant::now();
+        holder
+            .last_publish_ns
+            .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
 
         // Sequenced = event feed; unsequenced = placement/control.
         let sequenced = update.seq != 0;
@@ -380,6 +454,58 @@ impl Engine {
         (outcome, holder.last_seq, changed)
     }
 
+    /// Split placement apply: exclusive work for ONLY the uncovered
+    /// suffix, anchored at the last plain-duplicate key found by the
+    /// shared-lock walk. Returns None when holder posture changed
+    /// between the locks (the caller falls through to the general
+    /// path). A concurrent clear/truncate can invalidate the anchor —
+    /// then the FULL batch is stored instead (with the general path's
+    /// dangling-parent re-anchor), which is exactly what a full-batch
+    /// apply serialized after that clear would have produced: the
+    /// split is linearizable, never lossy.
+    fn apply_placement_suffix(
+        &self,
+        space: &Arc<std::sync::RwLock<KeyspaceState>>,
+        update: &UpdateMsg,
+        original_parent: Option<u64>,
+        pairs: &[(u64, u64)],
+        anchor: u64,
+        run: usize,
+    ) -> Option<(ApplyOutcome, u64, bool)> {
+        let mut space = space.write().expect(LOCK_MSG);
+        let space = &mut *space;
+        let holder = space.holders.get_mut(&update.holder)?;
+        if holder.event_fed || holder.dropped || update.epoch != holder.epoch {
+            return None;
+        }
+        holder
+            .last_publish_ns
+            .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
+        let tree = &mut space.tree;
+        let stored = tree
+            .store(holder.id, Some(anchor), &pairs[run..])
+            .or_else(|e| match e {
+                StoreError::ParentNotFound => tree
+                    .store(holder.id, original_parent, pairs)
+                    .or_else(|e| match e {
+                        StoreError::ParentNotFound => tree.store(holder.id, None, pairs),
+                        other => Err(other),
+                    }),
+                other => Err(other),
+            });
+        let mut changed = false;
+        if let Ok(outcome) = &stored {
+            changed |= outcome.applied > 0;
+        }
+        if stored.is_ok() {
+            let bound = holder.capacity_blocks.saturating_mul(2);
+            if tree.holder_blocks(holder.id) > bound {
+                tree.truncate_tail(holder.id, bound);
+            }
+        }
+        Some((ApplyOutcome::Applied, holder.last_seq, changed))
+    }
+
     /// TTL sweep: clear inferred holders idle beyond the window, and
     /// RETIRE dropped holders entirely (including event-fed ones —
     /// the lifecycle leak the old engine carried). Cheap per-holder
@@ -387,13 +513,19 @@ impl Engine {
     pub fn sweep_idle(&self) {
         let ttl = self.cfg.inferred_ttl;
         let event_ttl = self.cfg.event_ttl;
+        let now = self.now_ns();
+        let since = |stamp: &std::sync::atomic::AtomicU64| {
+            Duration::from_nanos(
+                now.saturating_sub(stamp.load(std::sync::atomic::Ordering::Relaxed)),
+            )
+        };
         for (key, space_arc) in self.all_spaces() {
             let now_empty = {
-                let mut space = space_arc.lock().expect(LOCK_MSG);
+                let mut space = space_arc.write().expect(LOCK_MSG);
                 let space = &mut *space;
                 let mut retire: Vec<String> = Vec::new();
                 for (name, holder) in space.holders.iter_mut() {
-                    let idle = holder.last_publish.elapsed() > ttl;
+                    let idle = since(&holder.last_publish_ns) > ttl;
                     if holder.dropped && idle {
                         retire.push(name.clone());
                     } else if !holder.event_fed && idle {
@@ -401,7 +533,7 @@ impl Engine {
                     } else if holder.event_fed
                         && !holder.dropped
                         && !event_ttl.is_zero()
-                        && holder.last_publish.elapsed() > event_ttl
+                        && since(&holder.last_publish_ns) > event_ttl
                     {
                         // Liveness backstop: silence far beyond the
                         // event feed's cadence means the departure
@@ -431,7 +563,7 @@ impl Engine {
                 let mut map = self.keyspaces.write().expect(LOCK_MSG);
                 if let Some(arc) = map.get(&key) {
                     let unshared = Arc::strong_count(arc) == 2; // map + our iteration clone
-                    if unshared && arc.lock().expect(LOCK_MSG).holders.is_empty() {
+                    if unshared && arc.read().expect(LOCK_MSG).holders.is_empty() {
                         map.remove(&key);
                     }
                 }
@@ -445,15 +577,15 @@ impl Engine {
         let Some(space) = self.space(keyspace) else {
             return Vec::new();
         };
-        let mut space = space.lock().expect(LOCK_MSG);
+        // SHARED lock with caller-owned scratch: queries run
+        // concurrently with each other and with the duplicate fast
+        // path; only state-changing applies exclude them.
+        let space = space.read().expect(LOCK_MSG);
         let chain: Vec<u64> = hashes.iter().map(|h| h.0).collect();
-        let KeyspaceState {
-            tree,
-            scratch,
-            answers,
-            holders,
-        } = &mut *space;
-        tree.overlap(&chain, scratch, answers);
+        let KeyspaceState { tree, holders } = &*space;
+        let mut scratch = OverlapScratch::default();
+        let mut answers: Vec<Overlap> = Vec::new();
+        tree.overlap(&chain, &mut scratch, &mut answers);
         let mut scores = Vec::with_capacity(answers.len());
         for o in answers.iter() {
             let Some(name) = tree.holder_name(o.holder) else {
@@ -490,7 +622,7 @@ impl Engine {
     pub fn snapshot(&self) -> Vec<UpdateMsg> {
         let mut out = Vec::new();
         for (key, space_arc) in self.all_spaces() {
-            let space = space_arc.lock().expect(LOCK_MSG);
+            let space = space_arc.read().expect(LOCK_MSG);
             for (holder_key, holder) in &space.holders {
                 let blocks: Vec<WireBlock> = space
                     .tree
@@ -552,7 +684,7 @@ impl Engine {
     pub fn entry_count(&self) -> usize {
         self.all_spaces()
             .iter()
-            .map(|(_, s)| s.lock().expect(LOCK_MSG).tree.stats().distinct_entries as usize)
+            .map(|(_, s)| s.read().expect(LOCK_MSG).tree.stats().distinct_entries as usize)
             .sum()
     }
 
@@ -565,7 +697,7 @@ impl Engine {
             ..EngineStats::default()
         };
         for (_, space_arc) in &spaces {
-            let space = space_arc.lock().expect(LOCK_MSG);
+            let space = space_arc.read().expect(LOCK_MSG);
             stats.blocks += space.tree.stats().distinct_entries as usize;
             for holder in space.holders.values() {
                 stats.holders += 1;
@@ -1016,6 +1148,52 @@ mod tests {
         engine.sweep_idle();
         assert_eq!(engine.stats().holders, 0, "dropped idle holder must retire");
         assert_eq!(engine.stats().keyspaces, 0);
+    }
+
+    #[test]
+    fn duplicate_fast_path_matches_slow_path_and_keeps_holders_fresh() {
+        let engine = Engine::new(EngineConfig {
+            inferred_ttl: Duration::from_millis(30),
+            ..EngineConfig::default()
+        });
+        let first = engine.apply(&placement("w1", 61, 6));
+        assert_eq!(first.0, ApplyOutcome::Applied);
+        assert!(first.2, "fresh placement must relay");
+        // Re-publish (another gateway routed the same prefix): covered
+        // by the shared-lock fast path — same outcome shape, no relay.
+        let dup = engine.apply(&placement("w1", 61, 6));
+        assert_eq!(dup.0, ApplyOutcome::Applied);
+        assert!(!dup.2, "duplicate placement must not relay");
+        assert_eq!(scores(&engine, 61, 6).len(), 1);
+
+        // Duplicate-only traffic is still proof of freshness: the fast
+        // path must refresh the TTL stamp without the write lock, or a
+        // hot-but-duplicate-fed holder would be swept.
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(15));
+            engine.apply(&placement("w1", 61, 6));
+            engine.sweep_idle();
+        }
+        assert_eq!(
+            scores(&engine, 61, 6).len(),
+            1,
+            "duplicate-fed holder must never TTL out"
+        );
+
+        // Event-fed holders still reject placements (the fast path
+        // must not swallow the FeedRejected outcome).
+        engine.apply(&event_batch(
+            "w2",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: placement_chain(&prefix_hashes(62, 4)),
+            }],
+        ));
+        let mut evt_placement = placement("w2", 62, 4);
+        evt_placement.epoch = 1;
+        let (outcome, _, _) = engine.apply(&evt_placement);
+        assert_eq!(outcome, ApplyOutcome::FeedRejected);
     }
 
     #[test]

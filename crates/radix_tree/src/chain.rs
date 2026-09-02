@@ -354,6 +354,116 @@ impl RadixTree {
         Ok(Placed::Applied)
     }
 
+    /// Read-only no-op predicate: true iff `store(id, parent, blocks)`
+    /// would apply NOTHING — every block already sits at its resolved
+    /// (position, content, lineage) for this holder (plain duplicate,
+    /// §4 alias, or refused move: all observably identical no-ops).
+    /// Exactly `store(..) == Ok(StoreOutcome { applied: 0, .. })`,
+    /// and false wherever store would error — the caller falls through
+    /// to the mutating path, which surfaces the error itself. This is
+    /// the shared-lock fast path for duplicate-dominated multi-writer
+    /// placement streams: the walk mirrors `place_block`'s resolution,
+    /// and any step that would create, extend, or fork a chain is by
+    /// definition not covered.
+    pub fn covered(
+        &self,
+        id: HolderId,
+        parent: Option<BlockKey>,
+        blocks: &[(BlockKey, ContentHash)],
+    ) -> bool {
+        self.dup_prefix(id, parent, blocks).1
+    }
+
+    /// One read-only walk answering two questions for the shared-lock
+    /// apply paths: `(plain_dup_run, fully_covered)`.
+    ///
+    /// - `plain_dup_run`: length of the LEADING run of blocks that are
+    ///   plain same-key duplicates — the holder's key map holds each
+    ///   block's own key at exactly the resolved placement. A caller
+    ///   may re-anchor a store at `blocks[run - 1].0` and apply only
+    ///   the suffix: the skipped prefix is bit-for-bit already there,
+    ///   key included, so the split store lands the identical state
+    ///   (aliases deliberately do NOT extend the run — their key may
+    ///   not be an anchor).
+    /// - `fully_covered`: the [`Self::covered`] predicate — every
+    ///   block (aliases included) is a no-op, i.e. `store` would
+    ///   return `applied == 0`.
+    pub fn dup_prefix(
+        &self,
+        id: HolderId,
+        parent: Option<BlockKey>,
+        blocks: &[(BlockKey, ContentHash)],
+    ) -> (u32, bool) {
+        if self.live(id).is_none() {
+            return (0, false);
+        }
+        let holder = id.parts().0;
+        if blocks.is_empty() {
+            return (0, true);
+        }
+        let anchor: Option<(u32, u32)> = match parent {
+            Some(parent_key) => match self.state_of(holder).keys.get(&parent_key) {
+                None => return (0, false),
+                Some(&at) => Some(at),
+            },
+            None => None,
+        };
+        let start_pos = anchor.map_or(0, |(_, p)| p + 1);
+        if start_pos as u64 + blocks.len() as u64 > self.cfg.max_chain_len as u64 {
+            return (0, false);
+        }
+        let mut cursor: Option<(u32, u32)> = anchor.map(|(c, p)| (c, p + 1));
+        let mut lineage = anchor.map(|(c, p)| self.lineage_at(c, p));
+        let mut run = 0u32;
+        let mut run_live = true;
+        for &(key, content) in blocks {
+            let next_lineage = match lineage {
+                None => lineage_root(content),
+                Some(prev) => lineage_step(prev, content),
+            };
+            let target: (u32, u32) = match cursor {
+                None => {
+                    match self.roots.get(&next_lineage).and_then(|list| {
+                        list.iter()
+                            .copied()
+                            .find(|&c| self.chains[c as usize].contents[0] == content)
+                    }) {
+                        Some(c) => (c, 0),
+                        None => return (run, false),
+                    }
+                }
+                Some((chain, pos)) => {
+                    let cd = &self.chains[chain as usize];
+                    if pos < cd.end_pos() && cd.content_at(pos) == content {
+                        (chain, pos)
+                    } else {
+                        match cd.child_at(pos - 1, content) {
+                            Some(child) => {
+                                let base = self.chains[child as usize].base_pos;
+                                (child, base)
+                            }
+                            None => return (run, false),
+                        }
+                    }
+                }
+            };
+            let (chain, pos) = target;
+            if !self.chains[chain as usize].covered(pos, holder) {
+                return (run, false);
+            }
+            if run_live {
+                if self.state_of(holder).keys.get(&key) == Some(&(chain, pos)) {
+                    run += 1;
+                } else {
+                    run_live = false;
+                }
+            }
+            cursor = Some((chain, pos + 1));
+            lineage = Some(next_lineage);
+        }
+        (run, true)
+    }
+
     pub fn remove(&mut self, id: HolderId, keys: &[BlockKey]) -> u32 {
         if self.live(id).is_none() {
             return 0;

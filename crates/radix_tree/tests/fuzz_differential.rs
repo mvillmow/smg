@@ -102,10 +102,24 @@ impl Subject {
                 parent,
                 blocks,
             } => {
+                // covered() is the shared-lock duplicate fast path's
+                // load-bearing predicate: gate it as an exact no-op
+                // oracle on EVERY store of every seed.
+                let predicted = match &self.core {
+                    Core::Flat(t) => Some(t.covered(self.ids[*holder], *parent, blocks)),
+                    Core::Chain(t) => Some(t.covered(self.ids[*holder], *parent, blocks)),
+                };
                 let r = match &mut self.core {
                     Core::Flat(t) => t.store(self.ids[*holder], *parent, blocks),
                     Core::Chain(t) => t.store(self.ids[*holder], *parent, blocks),
                 };
+                if let Some(predicted) = predicted {
+                    let no_op = matches!(&r, Ok(o) if o.applied == 0);
+                    assert_eq!(
+                        predicted, no_op,
+                        "covered() disagreed with store outcome {r:?}"
+                    );
+                }
                 match r {
                     Ok(o) => Some((o.applied, o.duplicates)),
                     Err(StoreError::ParentNotFound) => None,
@@ -158,6 +172,12 @@ impl Subject {
             Core::Chain(t) => t.stats().distinct_entries,
         }
     }
+    fn dup_prefix(&self, h: usize, parent: Option<u64>, blocks: &[(u64, u64)]) -> (u32, bool) {
+        match &self.core {
+            Core::Flat(t) => t.dup_prefix(self.ids[h], parent, blocks),
+            Core::Chain(t) => t.dup_prefix(self.ids[h], parent, blocks),
+        }
+    }
     fn audit(&self) -> Result<(), String> {
         match &self.core {
             Core::Flat(t) => t.audit(),
@@ -178,6 +198,24 @@ fn run_one_in_contract(seed: u64, wide: bool) {
     ];
     let checkpoint_every = (wl.ops.len() / 6).max(1);
     for (i, op) in wl.ops.iter().enumerate() {
+        if let Op::Store {
+            holder,
+            parent,
+            blocks,
+        } = op
+        {
+            // dup_prefix parity: the engine's split-apply re-anchors a
+            // store at blocks[run-1] and applies only the suffix, so a
+            // wrong run means silently corrupted placements.
+            let expect = model.dup_prefix(*holder, *parent, blocks);
+            for subject in subjects.iter() {
+                assert_eq!(
+                    subject.dup_prefix(*holder, *parent, blocks),
+                    expect,
+                    "dup_prefix diverged from model"
+                );
+            }
+        }
         let model_outcome = model.apply(op);
         for (ci, subject) in subjects.iter_mut().enumerate() {
             let subject_out = subject.apply(op);
@@ -253,6 +291,7 @@ fn run_one_in_contract(seed: u64, wide: bool) {
 /// Uniform surface over both cores for the generic chaos driver.
 trait CoreApi {
     fn create_holder(&mut self, name: &str) -> HolderId;
+    fn dup_prefix(&self, id: HolderId, parent: Option<u64>, blocks: &[(u64, u64)]) -> (u32, bool);
     fn store(
         &mut self,
         id: HolderId,
@@ -275,6 +314,14 @@ macro_rules! impl_core_api {
         impl CoreApi for $t {
             fn create_holder(&mut self, name: &str) -> HolderId {
                 <$t>::create_holder(self, name)
+            }
+            fn dup_prefix(
+                &self,
+                id: HolderId,
+                parent: Option<u64>,
+                blocks: &[(u64, u64)],
+            ) -> (u32, bool) {
+                <$t>::dup_prefix(self, id, parent, blocks)
             }
             fn store(
                 &mut self,
@@ -437,8 +484,19 @@ fn run_one_chaos(seed: u64) {
                             1 => Some(key_pool[(*parent_pick as usize / 3) % key_pool.len()]),
                             _ => Some(parent_pick | 1),
                         };
+                        // Chaos-side covered() gate: subject and model
+                        // must agree on the no-op prediction too.
+                        let predicted_pair = tree.dup_prefix(id, parent, blocks);
+                        assert_eq!(
+                            predicted_pair,
+                            model.dup_prefix(*slot, parent, blocks),
+                            "dup_prefix diverged from model (chaos)"
+                        );
+                        let predicted = predicted_pair.1;
                         let subject = tree.store(id, parent, blocks);
                         let modeled = model.store(*slot, parent, blocks);
+                        let no_op = matches!(&subject, Ok(o) if o.applied == 0);
+                        assert_eq!(predicted, no_op, "covered() wrong vs chaos store");
                         let pair = (
                             subject.is_ok(),
                             !matches!(
