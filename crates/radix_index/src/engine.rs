@@ -725,6 +725,75 @@ impl Engine {
     /// because every UpdateMsg (and all dedup posture: epoch, seq,
     /// feed authority) is scoped to one holder in one keyspace, so a
     /// puller lands each holder exactly as some real moment saw it.
+    /// Reconstruct holder state from a snapshot/Pull `Update`, bypassing
+    /// the live feed's seq-dedup and placement/feed-authority rules.
+    /// Snapshot chunks all carry the holder's TRUE `last_seq` (a holder
+    /// larger than `SNAPSHOT_CHUNK` spans several), so applying them
+    /// through `apply` would seq-dedup every chunk after the first and
+    /// silently truncate the holder on the bootstrapping replica. This is
+    /// authoritative state, not a feed: chunks arrive in order and
+    /// parent-linked, and the posture (added/dropped/capacity/event_fed)
+    /// rides the first chunk.
+    pub fn apply_snapshot(&self, update: &UpdateMsg) {
+        if update.keyspace.block_size == 0 {
+            return;
+        }
+        let space = self.space_or_create(&update.keyspace);
+        let mut space = space.write().expect(LOCK_MSG);
+        let space = &mut *space;
+        if !space.holders.contains_key(&update.holder) {
+            let id = space.tree.create_holder(&update.holder);
+            space.holders.insert(
+                update.holder.clone(),
+                HolderState {
+                    id,
+                    epoch: update.epoch,
+                    last_seq: 0,
+                    event_fed: false,
+                    capacity_blocks: self.cfg.default_capacity_blocks,
+                    dropped: false,
+                    last_publish_ns: std::sync::atomic::AtomicU64::new(self.now_ns()),
+                },
+            );
+        }
+        let tree = &mut space.tree;
+        let holder = space
+            .holders
+            .get_mut(&update.holder)
+            .expect("holder inserted above");
+        // Posture rides the first chunk (later chunks carry no control).
+        if let Some(added) = &update.added {
+            if added.capacity_blocks != 0 {
+                holder.capacity_blocks = added.capacity_blocks;
+            }
+            if added.event_fed {
+                holder.event_fed = true;
+            }
+        }
+        holder.dropped = update.dropped;
+        holder.epoch = update.epoch;
+        holder.last_seq = update.seq;
+        holder
+            .last_publish_ns
+            .store(self.now_ns(), std::sync::atomic::Ordering::Relaxed);
+        // Store every chunk's blocks, parent-linked, with no feed
+        // rejection or capacity truncation — reconstructed ground truth.
+        for event in &update.events {
+            if let WireEvent::Stored { parent, blocks } = event {
+                let pairs: Vec<(u64, u64)> = blocks
+                    .iter()
+                    .map(|b| (b.seq_hash.0, b.content_hash.0))
+                    .collect();
+                let _ = tree
+                    .store(holder.id, parent.map(|p| p.0), &pairs)
+                    .or_else(|e| match e {
+                        StoreError::ParentNotFound => tree.store(holder.id, None, &pairs),
+                        other => Err(other),
+                    });
+            }
+        }
+    }
+
     pub fn snapshot(&self) -> Vec<UpdateMsg> {
         let mut out = Vec::new();
         for (key, space_arc) in self.all_spaces() {
@@ -1233,7 +1302,7 @@ mod tests {
 
         let b = Engine::new(EngineConfig::default());
         for update in a.snapshot() {
-            b.apply(&update);
+            b.apply_snapshot(&update);
         }
         assert_eq!(scores(&a, 21, 5), scores(&b, 21, 5));
         assert_eq!(scores(&a, 22, 4), scores(&b, 22, 4));
@@ -1506,6 +1575,59 @@ mod tests {
         assert_eq!(stats.keyspaces, 2);
         assert_eq!(stats.holders, 2);
         assert_eq!(scores(&engine, 40, 6).len(), 1);
+    }
+
+    /// A holder larger than one snapshot chunk (16384 blocks) must fully
+    /// reconstruct on a bootstrapping replica. Event-fed holders are the
+    /// risk: their snapshot chunks all carry the same last_seq, so a naive
+    /// per-chunk apply seq-dedups every chunk after the first — silently
+    /// truncating the holder to 16384 blocks on the new replica.
+    #[test]
+    fn snapshot_bootstrap_reconstructs_large_event_fed_chain() {
+        let src = Engine::new(EngineConfig::default());
+        let big = 20_000usize; // > SNAPSHOT_CHUNK (16384) => multiple chunks
+        let chain = placement_chain(&prefix_hashes(1, big));
+        // Sequenced (event-fed) so the source is not capacity-truncated.
+        src.apply(&event_batch(
+            "w-big",
+            1,
+            vec![WireEvent::Stored {
+                parent: None,
+                blocks: chain,
+            }],
+        ));
+        assert_eq!(scores(&src, 1, big).first().map(|s| s.1), Some(big as u32));
+
+        // Multiple parent-linked chunks for the big holder.
+        let snap = src.snapshot();
+        let chunk_count = snap
+            .iter()
+            .filter(|u| {
+                u.holder == "w-big" && matches!(u.events.as_slice(), [WireEvent::Stored { .. }])
+            })
+            .count();
+        assert!(
+            chunk_count >= 2,
+            "a >16384-block holder must snapshot into multiple chunks, got {chunk_count}"
+        );
+
+        // Bootstrap via the reconstruction path (as bootstrap_from does).
+        let dst = Engine::new(EngineConfig::default());
+        for u in &snap {
+            dst.apply_snapshot(u);
+        }
+        assert_eq!(
+            scores(&dst, 1, big).first().map(|s| s.1),
+            Some(big as u32),
+            "a >16384-block event-fed holder must fully reconstruct from its chunked snapshot"
+        );
+        // last_seq is preserved (the source's, not bumped per chunk) so
+        // the replica resumes the event feed correctly.
+        assert_eq!(
+            scores(&dst, 1, 16_385).first().map(|s| s.1),
+            Some(16_385),
+            "the chunk boundary reconstructs as one contiguous chain"
+        );
     }
 
     fn ks_with_block(block_size: u32) -> KeyspaceKey {

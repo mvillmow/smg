@@ -419,7 +419,11 @@ pub async fn bootstrap_from(engine: &Engine, peer: &str) -> Result<usize, tonic:
     let mut applied = 0usize;
     while let Some(update) = stream.next().await {
         let update = update?;
-        engine.apply(&UpdateMsg::from(&update));
+        // Snapshot reconstruction, NOT a live feed: `apply_snapshot`
+        // bypasses seq-dedup so a holder spanning several chunks (all
+        // carrying the same last_seq) reconstructs in full instead of
+        // being truncated to the first chunk.
+        engine.apply_snapshot(&UpdateMsg::from(&update));
         applied += 1;
     }
     Ok(applied)
