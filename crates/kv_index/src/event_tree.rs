@@ -2915,4 +2915,12 @@ mod tests {
         assert!(compute_request_byte_content_hashes(b"anything", 0).is_empty());
         assert!(compute_request_byte_content_hashes(b"", 4).is_empty());
     }
+
+    /// The token hasher's block_size==0 guard: return empty rather than
+    /// panicking on chunks(0). Mirrors the byte-mode guard.
+    #[test]
+    fn token_content_hashes_empty_on_zero_block() {
+        assert!(compute_request_content_hashes(&[1, 2, 3], 0).is_empty());
+        assert!(compute_request_content_hashes(&[], 4).is_empty());
+    }
 }

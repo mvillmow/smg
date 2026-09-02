@@ -85,6 +85,25 @@ fn spawn_index() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// An empty content-hash slice is a silent no-op, not a panic: the
+/// placement builder's `chain.last().expect(...)` is guarded, so a
+/// sub-one-block request cannot take down the caller task.
+#[tokio::test]
+async fn empty_placement_is_a_noop_not_a_panic() {
+    let dead_port = portpicker::pick_unused_port().expect("port");
+    let client = RemoteIndex::connect(format!("http://127.0.0.1:{dead_port}"));
+    // Neither of these may panic on an empty chain.
+    client.publish_placement(MODEL, BLOCK, "grpc://x:1", &[]);
+    client.publish_placement_bytes(MODEL, BLOCK, "grpc://x:1", &[]);
+    // The client is still usable afterward.
+    assert_eq!(
+        client
+            .query(MODEL, BLOCK, vec![1, 2], Duration::from_millis(20))
+            .await,
+        QueryOutcome::Disconnected
+    );
+}
+
 /// A query against an index that is not reachable resolves `Disconnected`
 /// immediately (the caller falls through to local state) — it never burns
 /// its deadline on a stream that cannot answer.
