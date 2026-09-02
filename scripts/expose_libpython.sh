@@ -36,13 +36,29 @@ if [ -z "$ldlib" ]; then
 fi
 
 candidates=()
-add_candidate() { [ -n "${1:-}" ] && [ -d "$1" ] && candidates+=("$1"); }
+# Must not end on a failing test: under `set -e` a function that returns
+# non-zero as its last command kills the script, which would turn "this
+# candidate does not exist" -- the normal case for sysconfig's baked-in LIBDIR
+# under actions/setup-python -- into a silent exit 1.
+add_candidate() {
+    if [ -n "${1:-}" ] && [ -d "$1" ]; then
+        candidates+=("$1")
+    fi
+    return 0
+}
 
 add_candidate "$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
-add_candidate "${pythonLocation:-}/lib"
+if [ -n "${pythonLocation:-}" ]; then
+    add_candidate "${pythonLocation}/lib"
+fi
 add_candidate "$("$python" -c 'import sys; print(sys.base_prefix)')/lib"
 multiarch=$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("MULTIARCH") or "")')
 add_candidate "${multiarch:+/usr/lib/$multiarch}"
+
+if [ ${#candidates[@]} -eq 0 ]; then
+    echo "error: no plausible python library directory exists for $python" >&2
+    exit 1
+fi
 
 for dir in "${candidates[@]}"; do
     if [ -e "$dir/$ldlib" ]; then
@@ -52,7 +68,7 @@ for dir in "${candidates[@]}"; do
 done
 
 for dir in "${candidates[@]}"; do
-    real=$(find "$dir" -maxdepth 1 -name "$ldlib.*" -print -quit)
+    real=$(find "$dir" -maxdepth 1 -name "$ldlib.*" -print -quit 2>/dev/null)
     [ -n "$real" ] || continue
     scratch="${CARGO_TARGET_DIR:-target}/libpython-link"
     mkdir -p "$scratch"
