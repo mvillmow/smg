@@ -24,6 +24,7 @@
 
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -141,21 +142,64 @@ struct KeyspaceState {
     holders: HashMap<String, HolderState>,
 }
 
-/// The engine: all keyspaces. One lock over everything — apply and query
-/// rates in scope (hundreds of k ops/s) are far below contention range
-/// for the critical sections involved, and single-lock semantics make
-/// the convergence argument checkable.
+/// Poisoned-lock policy: a panic mid-mutation leaves state that must
+/// never be served; crash so the replica re-bootstraps clean from a
+/// sibling.
+const LOCK_MSG: &str = "engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling";
+
+/// The engine: all keyspaces, locked at TWO levels. The outer RwLock
+/// guards only the keyspace map (creation/removal — rare); every
+/// keyspace mutates under its own mutex. Snapshot, sweep, and stats
+/// therefore stall at most ONE keyspace at a time instead of the whole
+/// engine (a full-fleet Pull used to block every apply and query for
+/// its entire serialization). Convergence arguments are unaffected:
+/// all wire-visible ordering (epoch, seq, feed authority) is per
+/// HOLDER, and a holder lives in exactly one keyspace.
 pub struct Engine {
     cfg: EngineConfig,
-    keyspaces: std::sync::Mutex<HashMap<KeyspaceKey, KeyspaceState>>,
+    keyspaces: std::sync::RwLock<HashMap<KeyspaceKey, Arc<std::sync::Mutex<KeyspaceState>>>>,
 }
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Self {
         Self {
             cfg,
-            keyspaces: std::sync::Mutex::new(HashMap::new()),
+            keyspaces: std::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    fn space(&self, key: &KeyspaceKey) -> Option<Arc<std::sync::Mutex<KeyspaceState>>> {
+        self.keyspaces.read().expect(LOCK_MSG).get(key).cloned()
+    }
+
+    fn space_or_create(&self, key: &KeyspaceKey) -> Arc<std::sync::Mutex<KeyspaceState>> {
+        if let Some(space) = self.space(key) {
+            return space;
+        }
+        self.keyspaces
+            .write()
+            .expect(LOCK_MSG)
+            .entry(key.clone())
+            .or_insert_with(|| {
+                Arc::new(std::sync::Mutex::new(KeyspaceState {
+                    tree: RadixTree::new(TreeConfig::default()),
+                    scratch: OverlapScratch::default(),
+                    answers: Vec::new(),
+                    holders: HashMap::new(),
+                }))
+            })
+            .clone()
+    }
+
+    /// Stable iteration set for the cross-keyspace paths: each entry is
+    /// then locked INDIVIDUALLY, so the walk never freezes the engine.
+    fn all_spaces(&self) -> Vec<(KeyspaceKey, Arc<std::sync::Mutex<KeyspaceState>>)> {
+        self.keyspaces
+            .read()
+            .expect(LOCK_MSG)
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Apply one update. Returns what happened, the holder's applied
@@ -165,8 +209,6 @@ impl Engine {
     /// forever (the metrics timeline caught ~190x apply amplification
     /// from exactly that loop).
     pub fn apply(&self, update: &UpdateMsg) -> (ApplyOutcome, u64, bool) {
-        let mut spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
-
         // A keyspace is created on first contact; a later publisher whose
         // key differs only in block_size is a DIFFERENT keyspace by key
         // construction, so mismatch cannot silently merge. Reject only
@@ -174,14 +216,9 @@ impl Engine {
         if update.keyspace.block_size == 0 {
             return (ApplyOutcome::KeyspaceMismatch, 0, false);
         }
-        let space = spaces
-            .entry(update.keyspace.clone())
-            .or_insert_with(|| KeyspaceState {
-                tree: RadixTree::new(TreeConfig::default()),
-                scratch: OverlapScratch::default(),
-                answers: Vec::new(),
-                holders: HashMap::new(),
-            });
+        let space = self.space_or_create(&update.keyspace);
+        let mut space = space.lock().expect(LOCK_MSG);
+        let space = &mut *space;
 
         if !space.holders.contains_key(&update.holder) {
             let id = space.tree.create_holder(&update.holder);
@@ -321,20 +358,41 @@ impl Engine {
     /// timestamps; run from a timer.
     pub fn sweep_idle(&self) {
         let ttl = self.cfg.inferred_ttl;
-        let mut spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
-        for space in spaces.values_mut() {
-            let mut retire: Vec<String> = Vec::new();
-            for (name, holder) in space.holders.iter_mut() {
-                let idle = holder.last_publish.elapsed() > ttl;
-                if holder.dropped && idle {
-                    retire.push(name.clone());
-                } else if !holder.event_fed && idle {
-                    space.tree.clear(holder.id);
+        for (key, space_arc) in self.all_spaces() {
+            let now_empty = {
+                let mut space = space_arc.lock().expect(LOCK_MSG);
+                let space = &mut *space;
+                let mut retire: Vec<String> = Vec::new();
+                for (name, holder) in space.holders.iter_mut() {
+                    let idle = holder.last_publish.elapsed() > ttl;
+                    if holder.dropped && idle {
+                        retire.push(name.clone());
+                    } else if !holder.event_fed && idle {
+                        space.tree.clear(holder.id);
+                    }
                 }
-            }
-            for name in retire {
-                if let Some(holder) = space.holders.remove(&name) {
-                    space.tree.retire_holder(holder.id);
+                for name in retire {
+                    if let Some(holder) = space.holders.remove(&name) {
+                        space.tree.retire_holder(holder.id);
+                    }
+                }
+                space.holders.is_empty()
+            };
+            // Keyspace GC (audit finding: any publisher can mint
+            // keyspaces and they were never removed). A keyspace whose
+            // last holder retired is unlinked — but only when nothing
+            // else holds its Arc: a concurrent apply that already
+            // cloned it would otherwise mutate an orphan and lose the
+            // update. New clones need the map lock we hold, so the
+            // count check cannot race; a skipped removal is retried
+            // next sweep.
+            if now_empty {
+                let mut map = self.keyspaces.write().expect(LOCK_MSG);
+                if let Some(arc) = map.get(&key) {
+                    let unshared = Arc::strong_count(arc) == 2; // map + our iteration clone
+                    if unshared && arc.lock().expect(LOCK_MSG).holders.is_empty() {
+                        map.remove(&key);
+                    }
                 }
             }
         }
@@ -343,17 +401,17 @@ impl Engine {
     /// Overlap query: per-holder matched prefix depth, dropped holders
     /// excluded. Missing keyspace = empty answer (advisory semantics).
     pub fn find_matches(&self, keyspace: &KeyspaceKey, hashes: &[ContentHash]) -> Vec<HolderScore> {
-        let mut spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
-        let Some(space) = spaces.get_mut(keyspace) else {
+        let Some(space) = self.space(keyspace) else {
             return Vec::new();
         };
+        let mut space = space.lock().expect(LOCK_MSG);
         let chain: Vec<u64> = hashes.iter().map(|h| h.0).collect();
         let KeyspaceState {
             tree,
             scratch,
             answers,
             holders,
-        } = space;
+        } = &mut *space;
         tree.overlap(&chain, scratch, answers);
         let mut scores = Vec::with_capacity(answers.len());
         for o in answers.iter() {
@@ -384,10 +442,14 @@ impl Engine {
     /// dedup posture. (Gap positions collapse to a contiguous chain,
     /// as before: bootstrap equivalence is scoped to gap-free
     /// holders; gapped ones converge through the feeds.)
+    /// Consistency: the cut is per KEYSPACE, not global — sufficient
+    /// because every UpdateMsg (and all dedup posture: epoch, seq,
+    /// feed authority) is scoped to one holder in one keyspace, so a
+    /// puller lands each holder exactly as some real moment saw it.
     pub fn snapshot(&self) -> Vec<UpdateMsg> {
-        let spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
         let mut out = Vec::new();
-        for (key, space) in spaces.iter() {
+        for (key, space_arc) in self.all_spaces() {
+            let space = space_arc.lock().expect(LOCK_MSG);
             for (holder_key, holder) in &space.holders {
                 let blocks: Vec<WireBlock> = space
                     .tree
@@ -447,22 +509,22 @@ impl Engine {
 
     /// Total indexed blocks across keyspaces (stats/tests).
     pub fn entry_count(&self) -> usize {
-        let spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
-        spaces
-            .values()
-            .map(|s| s.tree.stats().distinct_entries as usize)
+        self.all_spaces()
+            .iter()
+            .map(|(_, s)| s.lock().expect(LOCK_MSG).tree.stats().distinct_entries as usize)
             .sum()
     }
 
-    /// Point-in-time gauges for the metrics endpoint. One pass under the
-    /// engine lock; cheap relative to apply/query traffic.
+    /// Point-in-time gauges for the metrics endpoint. One keyspace
+    /// locked at a time; cheap relative to apply/query traffic.
     pub fn stats(&self) -> EngineStats {
-        let spaces = self.keyspaces.lock().expect("engine lock poisoned by a panic mid-mutation: aborting so the replica re-bootstraps clean state from a sibling");
+        let spaces = self.all_spaces();
         let mut stats = EngineStats {
             keyspaces: spaces.len(),
             ..EngineStats::default()
         };
-        for space in spaces.values() {
+        for (_, space_arc) in &spaces {
+            let space = space_arc.lock().expect(LOCK_MSG);
             stats.blocks += space.tree.stats().distinct_entries as usize;
             for holder in space.holders.values() {
                 stats.holders += 1;
@@ -831,5 +893,75 @@ mod tests {
         // the watermark seq travels, so a replayed old batch is dropped.
         let (outcome, _, _) = b.apply(&event_batch("w2", 2, vec![WireEvent::Cleared]));
         assert_eq!(outcome, ApplyOutcome::Deduped);
+    }
+
+    #[test]
+    fn keyspace_gc_removes_emptied_keyspaces_only() {
+        let engine = Engine::new(EngineConfig {
+            inferred_ttl: Duration::ZERO,
+            ..EngineConfig::default()
+        });
+        engine.apply(&placement("w1", 31, 4));
+        let mut other = placement("w2", 32, 4);
+        other.keyspace.model = "other-model".into();
+        engine.apply(&other);
+        assert_eq!(engine.stats().keyspaces, 2);
+
+        // Dropping w1 and sweeping (TTL zero: instantly idle) retires
+        // the holder AND unlinks its now-empty keyspace; the live
+        // keyspace stays.
+        let mut drop_w1 = placement("w1", 31, 0);
+        drop_w1.events.clear();
+        drop_w1.dropped = true;
+        engine.apply(&drop_w1);
+        engine.sweep_idle();
+        let stats = engine.stats();
+        assert_eq!(stats.keyspaces, 1);
+        assert_eq!(stats.holders, 1);
+        // Recreation after GC is a fresh first contact, not a resurrection.
+        engine.apply(&placement("w1", 31, 4));
+        assert_eq!(engine.stats().keyspaces, 2);
+        assert!(!scores(&engine, 31, 4).is_empty());
+    }
+
+    #[test]
+    fn per_keyspace_locking_survives_concurrent_mixed_traffic() {
+        // Not a performance proof — a race smoke: applies to two
+        // keyspaces race snapshot/stats/sweep from other threads, and
+        // the end state must equal the sequential expectation.
+        let engine = std::sync::Arc::new(Engine::new(EngineConfig::default()));
+        let mut handles = Vec::new();
+        for space_no in 0..2u32 {
+            let engine = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                for round in 0..200u32 {
+                    let mut update = placement(&format!("w{space_no}"), 40 + space_no, 6);
+                    if space_no == 1 {
+                        update.keyspace.model = "other-model".into();
+                    }
+                    engine.apply(&update);
+                    if round % 16 == 0 {
+                        engine.sweep_idle();
+                    }
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let engine = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let _ = engine.snapshot();
+                    let _ = engine.stats();
+                    let _ = engine.entry_count();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("no thread may panic");
+        }
+        let stats = engine.stats();
+        assert_eq!(stats.keyspaces, 2);
+        assert_eq!(stats.holders, 2);
+        assert_eq!(scores(&engine, 40, 6).len(), 1);
     }
 }

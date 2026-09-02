@@ -239,10 +239,21 @@ merged with the author's own pre-registered list. Dispositions:
   them): bound the accepted keyspace set at the auth layer.
 
 **Accepted with eyes open:**
-- The reference model shares an author with both cores (mitigated by
-  the kv_index oracle, the API suite, and now-stronger observables;
-  an independent reader of SPEC.md reviewing model.rs is the
-  remaining step).
+- The reference model shares an author with both cores. The planned
+  mitigation RAN: an independent adversarial reader reviewed model.rs
+  clause-by-clause against SPEC.md (16 findings; 12 CLEAN). It caught
+  the feared failure mode live — SPEC §4's refused-move parenthetical
+  still described the DESTRUCTIVE behavior the code had been fixed
+  away from, so model+cores agreed with each other while all three
+  contradicted the spec text (spec corrected; the non-destructive
+  refusal was always the intent — the destructive order is the C1
+  corruption). Four underdetermined mechanical readings (empty batch,
+  exact chain-length inequality, in-batch duplicate key, truncation
+  tie direction) are now pinned as normative in §4.
+- §5 stale-id/UnknownHolder semantics sit OUTSIDE the model gate (the
+  model is not total over retire): they are enforced by direct chaos
+  assertions instead — narrower than model equality, kept explicit
+  here.
 - Fault-drill evidence lives on the local simrig branch; the drills'
   harness is committed on the sim PR, results summarized here.
 
