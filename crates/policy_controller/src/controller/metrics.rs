@@ -1,11 +1,12 @@
-//! The controller's process series: its state, its start time and the load
-//! driver's counts (design 14 names the rest, which arrive with the scopes,
-//! the replication and the election). They live on a recorder of the
-//! controller's own, not the process global, so a gateway that embeds the
-//! controller keeps its recorder and two controllers in one test process
-//! keep theirs; the admin listener renders it in the Prometheus text form.
-//! The driver's counts are read from its atomics at each render, so the
-//! driver carries no recorder handle.
+//! The controller's process series: its state, its start time, the load
+//! driver's counts and the store's two counts (design 14 names the rest,
+//! which arrive with the scopes, the replication and the election). They
+//! live on a recorder of the controller's own, not the process global, so a
+//! gateway that embeds the controller keeps its recorder and two controllers
+//! in one test process keep theirs; the admin listener renders it in the
+//! Prometheus text form. The driver's counts are read from its atomics at
+//! each render and the store's from the store, so neither carries a
+//! recorder handle.
 
 use std::{
     sync::atomic::Ordering,
@@ -17,7 +18,10 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use parking_lot::Mutex;
 
 use super::readiness::State;
-use crate::ingest::loads::{Failures, Stats};
+use crate::{
+    ingest::loads::{Failures, Stats},
+    store::{MemoryStore, OutsideLists},
+};
 
 /// `1` for the controller's state (`starting`, `leader`, `follower`,
 /// `draining`), `0` for the other three. The admin listener sets it from the
@@ -38,6 +42,12 @@ pub const LOAD_SCRAPES_TOTAL: &str = "smg_policy_controller_load_scrapes_total";
 pub const LOAD_SCRAPE_FAILURES_TOTAL: &str = "smg_policy_controller_load_scrape_failures_total";
 /// Rank rows the load driver wrote.
 pub const LOAD_ROWS_TOTAL: &str = "smg_policy_controller_load_rows_total";
+/// Members whose engine family or zone the standing generation's list does
+/// not name, by `list` (`engines`, `zones`). Such a member is admitted and
+/// reads position 0 in that field. A generation with no list counts none.
+pub const MEMBERS_OUTSIDE_LIST: &str = "smg_policy_controller_members_outside_list";
+/// Writes to the load table that moved an overload verdict.
+pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_policy_controller_overload_flips_total";
 
 /// The controller's series and the handle that renders them.
 pub(crate) struct Metrics {
@@ -45,6 +55,9 @@ pub(crate) struct Metrics {
     /// One gauge per [`State::ALL`] entry, in that order.
     state: [Gauge; 4],
     loads: LoadCounters,
+    /// The members outside a list: `engines`, then `zones`.
+    outside: [Gauge; 2],
+    overload_flips: Counter,
     /// Held from a scrape's sample of the state to the end of its render:
     /// the four gauges are written from one sample and read back whole.
     scrape: Mutex<()>,
@@ -63,8 +76,27 @@ struct LoadCounters {
     rows: Counter,
 }
 
+/// The store's counts one scrape reports.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct StoreCounts {
+    /// The members outside the standing generation's lists.
+    pub(crate) outside: OutsideLists,
+    /// The load writes that moved an overload verdict.
+    pub(crate) overload_flips: u64,
+}
+
+impl StoreCounts {
+    /// What `store` counts now.
+    pub(crate) fn of(store: &MemoryStore) -> Self {
+        Self {
+            outside: store.outside_lists(),
+            overload_flips: store.overload_flips(),
+        }
+    }
+}
+
 impl Metrics {
-    /// A recorder with the two series registered and the start time set.
+    /// A recorder with the series registered and the start time set.
     ///
     /// No histogram lives here yet, so the recorder needs no upkeep task;
     /// the first histogram brings one.
@@ -108,6 +140,16 @@ impl Metrics {
             None,
             "Rank rows the load driver wrote".into(),
         );
+        recorder.describe_gauge(
+            KeyName::from_const_str(MEMBERS_OUTSIDE_LIST),
+            None,
+            "Members whose engine family or zone the policy document's list does not name, by list (engines, zones)".into(),
+        );
+        recorder.describe_counter(
+            KeyName::from_const_str(OVERLOAD_FLIPS_TOTAL),
+            None,
+            "Writes to the load table that moved an overload verdict".into(),
+        );
         let state = State::ALL.map(|state| {
             let key = Key::from_parts(STATE, vec![Label::new("state", state.as_str())]);
             recorder.register_gauge(&key, &metadata)
@@ -133,6 +175,12 @@ impl Metrics {
                 .collect(),
             rows: recorder.register_counter(&Key::from_name(LOAD_ROWS_TOTAL), &metadata),
         };
+        let outside = ["engines", "zones"].map(|list| {
+            let key = Key::from_parts(MEMBERS_OUTSIDE_LIST, vec![Label::new("list", list)]);
+            recorder.register_gauge(&key, &metadata)
+        });
+        let overload_flips =
+            recorder.register_counter(&Key::from_name(OVERLOAD_FLIPS_TOTAL), &metadata);
         start.set(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -143,6 +191,8 @@ impl Metrics {
             handle,
             state,
             loads,
+            outside,
+            overload_flips,
             scrape: Mutex::new(()),
         };
         metrics.set_state(State::Starting);
@@ -150,14 +200,29 @@ impl Metrics {
     }
 
     /// One scrape's text form: the state sampled once by `state` and its
-    /// gauge written, the load driver's counts read, and the render, with
-    /// no other scrape between the sample and the render. Two scrapes
-    /// across a change of role each render one state, their own.
-    pub(crate) fn render(&self, state: impl FnOnce() -> State, loads: &Stats) -> String {
+    /// gauge written, the load driver's counts and the store's read, and
+    /// the render, with no other scrape between the sample and the render.
+    /// Two scrapes across a change of role each render one state, their
+    /// own.
+    pub(crate) fn render(
+        &self,
+        state: impl FnOnce() -> State,
+        loads: &Stats,
+        store: impl FnOnce() -> StoreCounts,
+    ) -> String {
         let _one = self.scrape.lock();
         self.set_state(state());
         self.observe_loads(loads);
+        self.observe_store(store());
         self.handle.render()
+    }
+
+    /// Sets the store's series from one read of its counts.
+    fn observe_store(&self, counts: StoreCounts) {
+        let [engines, zones] = &self.outside;
+        engines.set(f64::from(counts.outside.engines));
+        zones.set(f64::from(counts.outside.zones));
+        self.overload_flips.absolute(counts.overload_flips);
     }
 
     /// Sets the load counters from the driver's atomics.
@@ -200,8 +265,8 @@ impl Metrics {
 mod tests {
     use std::time::Duration;
 
-    use super::{Metrics, START_TIME_SECONDS, STATE};
-    use crate::{controller::readiness::State, ingest::loads::Stats};
+    use super::{Metrics, StoreCounts, MEMBERS_OUTSIDE_LIST, START_TIME_SECONDS, STATE};
+    use crate::{controller::readiness::State, ingest::loads::Stats, store::OutsideLists};
 
     fn line(rendered: &str, series: &str, label: &str) -> Option<String> {
         rendered
@@ -213,7 +278,7 @@ mod tests {
     #[test]
     fn the_state_gauge_follows_the_transitions_on_the_controllers_own_recorder() {
         let metrics = Metrics::new();
-        let rendered = metrics.render(|| State::Starting, &Stats::default());
+        let rendered = metrics.render(|| State::Starting, &Stats::default(), StoreCounts::default);
         assert_eq!(
             line(&rendered, STATE, "state=\"starting\"").as_deref(),
             Some("smg_policy_controller_state{state=\"starting\"} 1")
@@ -224,7 +289,7 @@ mod tests {
         );
         assert!(rendered.contains("# HELP smg_policy_controller_state "));
 
-        let rendered = metrics.render(|| State::Leader, &Stats::default());
+        let rendered = metrics.render(|| State::Leader, &Stats::default(), StoreCounts::default);
         assert_eq!(
             line(&rendered, STATE, "state=\"starting\"").as_deref(),
             Some("smg_policy_controller_state{state=\"starting\"} 0")
@@ -237,7 +302,7 @@ mod tests {
         let other = Metrics::new();
         assert_eq!(
             line(
-                &other.render(|| State::Starting, &Stats::default()),
+                &other.render(|| State::Starting, &Stats::default(), StoreCounts::default),
                 STATE,
                 "state=\"leader\""
             )
@@ -281,6 +346,7 @@ mod tests {
                         State::Leader
                     },
                     &stats,
+                    StoreCounts::default,
                 )
             }
         });
@@ -295,6 +361,7 @@ mod tests {
                 State::Follower
             },
             &stats,
+            StoreCounts::default,
         );
         let waited = Instant::now();
         while !first.is_finished() {
@@ -328,7 +395,7 @@ mod tests {
 
         let metrics = Metrics::new();
         let stats = Stats::default();
-        let rendered = metrics.render(|| State::Starting, &stats);
+        let rendered = metrics.render(|| State::Starting, &stats, StoreCounts::default);
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 0"));
         assert!(rendered.contains("smg_policy_controller_load_rows_total 0"));
 
@@ -337,7 +404,7 @@ mod tests {
         stats.rows.fetch_add(7, Ordering::Relaxed);
         stats.scrapes.fetch_add(1, Ordering::Relaxed);
         stats.poll_failures.deadline.fetch_add(1, Ordering::Relaxed);
-        let rendered = metrics.render(|| State::Starting, &stats);
+        let rendered = metrics.render(|| State::Starting, &stats, StoreCounts::default);
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 3"));
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"suppressed\"} 2"));
         assert!(rendered
@@ -353,9 +420,46 @@ mod tests {
     }
 
     #[test]
+    fn the_stores_counts_render_by_list_from_each_scrapes_own_read() {
+        let metrics = Metrics::new();
+        let rendered = metrics.render(|| State::Leader, &Stats::default(), StoreCounts::default);
+        assert_eq!(
+            line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"engines\"").as_deref(),
+            Some("smg_policy_controller_members_outside_list{list=\"engines\"} 0")
+        );
+        assert!(rendered.contains("smg_policy_controller_overload_flips_total 0"));
+        assert!(rendered.contains("# HELP smg_policy_controller_members_outside_list "));
+
+        let counts = StoreCounts {
+            outside: OutsideLists {
+                engines: 2,
+                zones: 5,
+            },
+            overload_flips: 9,
+        };
+        let rendered = metrics.render(|| State::Leader, &Stats::default(), || counts);
+        assert_eq!(
+            line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"engines\"").as_deref(),
+            Some("smg_policy_controller_members_outside_list{list=\"engines\"} 2")
+        );
+        assert_eq!(
+            line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"zones\"").as_deref(),
+            Some("smg_policy_controller_members_outside_list{list=\"zones\"} 5")
+        );
+        assert!(rendered.contains("smg_policy_controller_overload_flips_total 9"));
+
+        // The count outside a list falls once a generation names the member.
+        let rendered = metrics.render(|| State::Leader, &Stats::default(), StoreCounts::default);
+        assert_eq!(
+            line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"zones\"").as_deref(),
+            Some("smg_policy_controller_members_outside_list{list=\"zones\"} 0")
+        );
+    }
+
+    #[test]
     fn the_start_time_is_set_once_at_construction() {
         let metrics = Metrics::new();
-        let rendered = metrics.render(|| State::Starting, &Stats::default());
+        let rendered = metrics.render(|| State::Starting, &Stats::default(), StoreCounts::default);
         let start = rendered
             .lines()
             .find(|l| l.starts_with(START_TIME_SECONDS) && !l.starts_with('#'))
