@@ -440,6 +440,19 @@ pub struct StaleGeneration {
     pub offered: u64,
 }
 
+/// How many members of the standing membership name an engine family or a
+/// zone that the standing generation's list, which holds entries, does not
+/// hold: each reads position 0 in that field. Counted at every write that
+/// reads the members under the lists, a membership write and an apply that
+/// changes them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OutsideLists {
+    /// Members outside `view.engines`.
+    pub engines: u32,
+    /// Members outside `view.zones`.
+    pub zones: u32,
+}
+
 /// Everything a decision reads, as one publication left it. A decision
 /// borrows it for its build
 /// ([`MemoryStore::build_view`](crate::store::MemoryStore::build_view)), and
@@ -664,7 +677,9 @@ impl Iterator for Segments<'_> {
 }
 
 /// The candidate row of one member: its fixed fields from its registration,
-/// its status bits, and its load record when one is on file.
+/// its status bits, and its load record when one is on file. Its engine
+/// family, zone and labels are the standing generation's lists' to say
+/// ([`Writer::list`]).
 fn row_of(member: &WorkerRow, sample: Option<&LoadSample>, origin: Instant) -> Candidate {
     let facts = &member.facts;
     Candidate {
@@ -815,6 +830,8 @@ pub(super) struct Writer {
     silenced: u32,
     /// How many writes to the load table moved an overload verdict.
     flips: u64,
+    /// The standing members outside the standing generation's lists.
+    outside: OutsideLists,
     /// The last publication the window counts from: a window's end, or a
     /// load write that published by itself.
     last_window: Option<Instant>,
@@ -848,6 +865,7 @@ impl Writer {
             judging: false,
             silenced: 0,
             flips: 0,
+            outside: OutsideLists::default(),
             last_window: None,
             waiting: false,
         }
@@ -872,16 +890,20 @@ impl Writer {
     /// naming the standing one, and nothing is published: the number only
     /// rises, so no reader sees a generation and then a lower one. Each
     /// pool takes the thresholds of the new generation's binding, and every
-    /// engine is judged again under them from what is on file.
+    /// engine is judged again under them from what is on file. A
+    /// generation whose lists differ from the standing one's has each of
+    /// `members`, the standing membership, read again under them, so the
+    /// first world of a generation holds rows of its own lists.
     ///
     /// The generation this one replaces is kept until the next apply, and
     /// the one kept until now is handed back for the caller to let go
     /// outside the store's lock: an engine is freed by the thread that
     /// applies, never by a decider dropping the last world of an old
     /// generation, unless a decider holds a world across two applies.
-    pub(super) fn apply(
+    pub(super) fn apply<'a>(
         &mut self,
         spec: Arc<AppliedSpec>,
+        members: impl Iterator<Item = &'a WorkerRow>,
     ) -> Result<(Arc<World>, Option<Arc<AppliedSpec>>), StaleGeneration> {
         let standing = self.spec.generation();
         if spec.generation() <= standing {
@@ -890,10 +912,51 @@ impl Writer {
                 offered: spec.generation(),
             });
         }
+        let relisted = spec.lists() != self.spec.lists();
         let before = self.retired.replace(mem::replace(&mut self.spec, spec));
+        if relisted {
+            self.list(members);
+        }
         self.bind();
         self.judge_every();
         Ok((self.publish(), before))
+    }
+
+    /// Read every member under the standing generation's lists: its engine
+    /// family and its zone as positions, its labels as bits, in each of
+    /// its rows. For a membership write, whose rows are new, and for an
+    /// apply whose lists differ. A pool with a row that moved is published
+    /// whole.
+    fn list<'a>(&mut self, members: impl Iterator<Item = &'a WorkerRow>) {
+        let Self {
+            places,
+            working,
+            spec,
+            outside,
+            ..
+        } = self;
+        let lists = spec.lists();
+        *outside = OutsideLists::default();
+        for member in members {
+            let facts = &member.facts;
+            let listed = lists.listed(&facts.engine_kind, facts.zone.as_deref(), &facts.labels);
+            outside.engines += u32::from(listed.engine_outside);
+            outside.zones += u32::from(listed.zone_outside);
+            let now = (listed.engine_kind, listed.zone, listed.labels);
+            for place in places_of(places, member.id) {
+                let Some(pool) = working.get_mut(place.pool as usize) else {
+                    continue;
+                };
+                let Some(row) = pool.rows.get_mut(place.row as usize) else {
+                    continue;
+                };
+                if (row.engine_kind, row.zone, row.labels) == now {
+                    continue;
+                }
+                (row.engine_kind, row.zone, row.labels) = now;
+                pool.dirty = true;
+            }
+        }
     }
 
     /// Each pool's thresholds under the standing generation: those of the
@@ -1107,6 +1170,11 @@ impl Writer {
         self.flips
     }
 
+    /// The standing members outside the standing generation's lists.
+    pub(super) fn outside(&self) -> OutsideLists {
+        self.outside
+    }
+
     /// Derive the pools of the membership `members` at the store's `epoch`,
     /// each row with its load record on file, make them the working copy
     /// and publish them through the one door: every pool is new, so the
@@ -1115,7 +1183,7 @@ impl Writer {
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
-        members: impl Iterator<Item = &'a WorkerRow>,
+        members: impl Iterator<Item = &'a WorkerRow> + Clone,
         sample_of: impl Fn(WorkerId, u16) -> Option<LoadSample>,
     ) -> Arc<World> {
         #[derive(Clone, Copy)]
@@ -1154,6 +1222,10 @@ impl Writer {
         // with no veto standing neither collects nor sorts them.
         let standing = !self.vetoes.by_gateway.is_empty();
         let mut ids = Vec::new();
+        // The members are walked once more where the standing generation
+        // declares a list: a generation with none costs the write this one
+        // test.
+        let listed = (!self.spec.lists().is_empty()).then(|| members.clone());
         for member in members {
             if standing {
                 ids.push(member.id);
@@ -1246,6 +1318,11 @@ impl Writer {
         }
         self.places
             .sort_unstable_by_key(|place| (place.id, place.pool));
+        // Each row's engine family, zone and labels under the standing
+        // generation's lists, before the rows are cut for the publication.
+        if let Some(members) = listed {
+            self.list(members);
+        }
         // The engines, from the places, which stand by member: a member's
         // first place is where its record is read, each is where a verdict
         // is written. The writer's lists are written over in place, so the

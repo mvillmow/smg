@@ -94,7 +94,7 @@ pub use workers::{
     identity, identity_of, HealthPolicy, MembershipChange, MembershipTail, Overload, Reachability,
     Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
-pub use world::{Ask, Built, StaleGeneration, ViewBuffers, World, PUBLISH_WINDOW};
+pub use world::{Ask, Built, OutsideLists, StaleGeneration, ViewBuffers, World, PUBLISH_WINDOW};
 
 /// The verified identity of a gateway: the fingerprint of the subject its
 /// session was authenticated as, never a message field. Leases, vetoes and

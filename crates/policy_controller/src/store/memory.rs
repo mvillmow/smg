@@ -30,7 +30,10 @@ use crate::{
             identity, MembershipChange, MembershipTail, WorkerFacts, WorkerPatch, WorkerRow,
             WorkerStatus, WorkersStore,
         },
-        world::{micros, Ask, Built, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW},
+        world::{
+            micros, Ask, Built, OutsideLists, StaleGeneration, ViewBuffers, World, Writer,
+            PUBLISH_WINDOW,
+        },
         GatewayId,
     },
     view::{LoadRow, Role, WorkerId},
@@ -130,7 +133,8 @@ impl MemoryStore {
 
     /// Apply a generation: every world from here on is published under
     /// `spec`, the first at once, with the standing membership and its rows
-    /// as they are. The store's one entry for a generation; a store starts
+    /// as they are, each row's engine family, zone and labels read under
+    /// the generation's own lists. The store's one entry for a generation; a store starts
     /// under [`AppliedSpec::unbound`].
     ///
     /// The number only rises. A generation whose number is not above the
@@ -146,8 +150,13 @@ impl MemoryStore {
         // one is this one, let go after the lock.
         let spec = Arc::new(spec);
         let before = {
+            // The membership stands while its rows are read under the
+            // generation's lists: the workers lock, then the load lock, as
+            // a membership write takes the two.
+            let workers = self.workers.lock();
             let mut loads = self.loads.lock();
-            let (world, before) = loads.writer.apply(Arc::clone(&spec))?;
+            let members = workers.rows.values().map(|row| &row.row);
+            let (world, before) = loads.writer.apply(Arc::clone(&spec), members)?;
             self.world.store(world);
             before
         };
@@ -297,6 +306,14 @@ impl MemoryStore {
     /// nothing.
     pub fn overload_flips(&self) -> u64 {
         self.loads.lock().writer.flips()
+    }
+
+    /// How many members of the standing membership name an engine family
+    /// or a zone that the standing generation's list does not hold, by the
+    /// list. Such a worker is admitted and reads position 0 in that field;
+    /// a generation that declares no list counts none.
+    pub fn outside_lists(&self) -> OutsideLists {
+        self.loads.lock().writer.outside()
     }
 
     /// How many workers the load table holds an entry for.

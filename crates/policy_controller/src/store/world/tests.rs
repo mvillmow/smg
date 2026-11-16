@@ -2,6 +2,7 @@
 //! [`MemoryStore`]: every instant is handed in, none is slept.
 
 use std::{
+    iter,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -10,8 +11,8 @@ use std::{
 };
 
 use super::{
-    run_of, seek, Ask, Built, GatewayRun, PoolVeto, PoolVetoes, StaleGeneration, ViewBuffers,
-    World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
+    run_of, seek, Ask, Built, GatewayRun, OutsideLists, PoolVeto, PoolVetoes, StaleGeneration,
+    ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
     spec::{BindingSpec, Match, OverloadSpec},
@@ -1129,10 +1130,9 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
         (0, 0, 0)
     );
     assert!(!row.has_capacity && !row.has_room && !row.health.overloaded);
-    assert_eq!(
-        (row.zone, row.labels, row.engine_kind, row.connector),
-        (0, 0, 0, 0)
-    );
+    assert_eq!(row.connector, 0);
+    // Under a generation that declares no list the listed fields read 0.
+    assert_eq!((row.zone, row.labels, row.engine_kind), (0, 0, 0));
     assert!(!row.vision && !row.ec_compatible && !row.session_hit);
 
     // The row reads the record of its own rank, never another rank's.
@@ -2061,13 +2061,15 @@ fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
     let mut writer = Writer::new(PUBLISH_WINDOW, Instant::now());
     let first = Arc::new(generation(1));
     let held = Arc::downgrade(&first);
-    let (world, before) = writer.apply(first).expect("above the unbound start");
+    let (world, before) = writer
+        .apply(first, iter::empty())
+        .expect("above the unbound start");
     assert!(before.is_none(), "nothing was kept before the first apply");
     // A reader still holds a world of generation 1 when the next is
     // applied; the unbound start, kept since the first apply, is handed
     // back.
     let (_, before) = writer
-        .apply(Arc::new(generation(2)))
+        .apply(Arc::new(generation(2)), iter::empty())
         .expect("above the standing one");
     assert_eq!(before.map(|spec| spec.generation()), Some(0));
     // The reader lets its world go: the writer keeps the generation, so
@@ -2076,7 +2078,7 @@ fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
     assert_eq!(held.strong_count(), 1, "kept by the writer alone");
     // The next apply hands it back, and the caller's drop is its end.
     let (_, before) = writer
-        .apply(Arc::new(generation(3)))
+        .apply(Arc::new(generation(3)), iter::empty())
         .expect("above the standing one");
     let before = before.expect("the generation before the last");
     assert_eq!((before.generation(), held.strong_count()), (1, 1));
@@ -2783,4 +2785,139 @@ fn the_deciding_door_hands_the_rows_and_the_engine_of_one_publication() {
         )
     });
     assert_eq!(next, (2, Some(2)));
+}
+
+/// A generation that declares the view's three lists.
+fn generation_listing(
+    number: u64,
+    labels: &[&str],
+    zones: &[&str],
+    engines: &[&str],
+) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    let owned = |list: &[&str]| list.iter().map(|name| (*name).to_string()).collect();
+    document.view.labels = owned(labels);
+    document.view.zones = owned(zones);
+    document.view.engines = owned(engines);
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+/// A worker of the model that names an engine family, a zone and labels.
+fn listed_member(
+    store: &MemoryStore,
+    key: &str,
+    engine: &str,
+    zone: Option<&str>,
+    labels: &[(&str, &str)],
+) -> WorkerId {
+    let labels = labels.iter();
+    let facts = WorkerFacts {
+        engine_kind: engine.to_string(),
+        zone: zone.map(str::to_string),
+        labels: labels
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+        ..facts(key, Role::Single, &[MODEL])
+    };
+    store.upsert(facts).id()
+}
+
+/// What a member's row reads in the three listed fields: its engine family,
+/// its zone, its labels.
+fn listed(world: &World, id: WorkerId) -> (u16, u16, u64) {
+    let rows = rows_of(world, MODEL);
+    let row = rows.iter().find(|row| row.id == id);
+    let row = row.expect("the member's row");
+    (row.engine_kind, row.zone, row.labels)
+}
+
+#[test]
+fn a_row_names_its_engine_family_and_zone_by_position_and_holds_a_bit_a_label() {
+    let store = MemoryStore::new();
+    let lists = generation_listing(
+        1,
+        &["tier", "tier=gold", "pool=a"],
+        &["east", "west"],
+        &["alpha", "beta"],
+    );
+    store.apply(lists).expect("applied");
+    let gold = listed_member(&store, "gold", "beta", Some("west"), &[("tier", "gold")]);
+    let labels = [("tier", "silver"), ("pool", "a")];
+    let silver = listed_member(&store, "silver", "alpha", None, &labels);
+    // A position counts from 1 in the list's order. A bit a selector, in
+    // the list's order: a key alone is met by any value of it.
+    let world = store.world();
+    assert_eq!(listed(&world, gold), (2, 2, 0b011));
+    assert_eq!(listed(&world, silver), (1, 0, 0b101));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    // A family or a zone the lists do not name is admitted, reads 0 and is
+    // counted under its list. A worker that names neither is not counted.
+    let stray = listed_member(&store, "stray", "gamma", Some("north"), &[("pool", "b")]);
+    let bare = listed_member(&store, "bare", "", None, &[]);
+    let world = store.world();
+    assert_eq!(listed(&world, stray), (0, 0, 0));
+    assert_eq!(listed(&world, bare), (0, 0, 0));
+    assert_eq!(listed(&world, gold), (2, 2, 0b011));
+    let outside = OutsideLists {
+        engines: 1,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+}
+
+#[test]
+fn an_apply_whose_lists_differ_reads_every_member_again_in_its_first_world() {
+    let store = MemoryStore::new();
+    let west = listed_member(&store, "w", "beta", Some("west"), &[("tier", "gold")]);
+    let north = listed_member(&store, "n", "beta", Some("north"), &[]);
+    // No generation, no list: every field reads 0 and nothing is outside.
+    assert_eq!(listed(&store.world(), west), (0, 0, 0));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    let zones = ["east", "west"];
+    let engines = ["alpha", "beta"];
+    store
+        .apply(generation_listing(1, &["tier=gold"], &zones, &engines))
+        .expect("applied");
+    // The apply's own world holds the rows of its own lists.
+    let first = store.world();
+    assert_eq!(first.spec().generation(), 1);
+    assert_eq!(listed(&first, west), (2, 2, 0b1));
+    assert_eq!(listed(&first, north), (2, 0, 0));
+    let outside = OutsideLists {
+        engines: 0,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+    // The same lists under the next number: no member is read again, and
+    // the pool's rows are the ones the last world listed.
+    store
+        .apply(generation_listing(2, &["tier=gold"], &zones, &engines))
+        .expect("applied");
+    let second = store.world();
+    assert_eq!(second.spec().generation(), 2);
+    assert!(Arc::ptr_eq(
+        &rows_of(&first, MODEL),
+        &rows_of(&second, MODEL)
+    ));
+    assert_eq!(store.outside_lists(), outside);
+    // Other lists: the positions and the bits move with them.
+    store
+        .apply(generation_listing(
+            3,
+            &["zone", "tier=gold"],
+            &["north", "west"],
+            &["beta"],
+        ))
+        .expect("applied");
+    let third = store.world();
+    assert_eq!(listed(&third, west), (1, 2, 0b10));
+    assert_eq!(listed(&third, north), (1, 1, 0));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    // A generation that declares none: every field reads 0 again.
+    store.apply(generation(4)).expect("applied");
+    let fourth = store.world();
+    assert_eq!(listed(&fourth, west), (0, 0, 0));
+    assert_eq!(listed(&fourth, north), (0, 0, 0));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
 }
