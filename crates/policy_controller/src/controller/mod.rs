@@ -36,6 +36,7 @@ pub mod config;
 )]
 mod deciders;
 pub mod election;
+mod floor;
 mod gateways;
 mod generations;
 mod lifecycle;
@@ -729,6 +730,9 @@ impl Controller {
         let mut looks = shared.standing.clone();
         let mut election = election::start(elector, Arc::clone(&store), standing)
             .map_err(Error::ElectionThread)?;
+        // A gateway's term floor above this replica's term reaches the
+        // election through its door.
+        shared.floors.open(election.door());
 
         let mut shutdown = pin!(shutdown);
         let mut fault = pin!(fault);

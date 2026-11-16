@@ -30,6 +30,7 @@ use super::{
     config::Scope,
     deciders::{self, Deciders, Reads},
     election::{split_identity, Standing},
+    floor::Floors,
     gateways::Gateways,
     generations::Generations,
     membership::Door,
@@ -76,6 +77,9 @@ pub(crate) struct Shared {
     pub(crate) door: Door,
     /// The threads the decisions run on, a model's on one.
     pub(crate) deciders: Deciders,
+    /// A gateway's term floor above this replica's term, on its way to the
+    /// election.
+    pub(crate) floors: Floors,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -139,6 +143,7 @@ impl Shared {
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
             deciders,
+            floors: Floors::default(),
         })
     }
 
