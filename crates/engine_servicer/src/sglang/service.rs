@@ -29,6 +29,21 @@ fn no_control_wire(rpc: &str) -> Status {
     Status::unimplemented(format!("{rpc} {NO_CONTROL_WIRE}"))
 }
 
+// Ordinary text uses the existing Generate/Abort lifecycle even in an EPD pool.
+// Media and the private control envelope still require the fenced control RPC.
+fn requires_managed_control(request: &sg::GenerateRequest) -> bool {
+    request.mm_inputs.is_some()
+        || !request.extra_mm_inputs.is_empty()
+        || !request.input_embeds.is_empty()
+        || request.media_identity.is_some()
+        || request.sampling_params.as_ref().is_some_and(|params| {
+            params
+                .custom_params
+                .as_ref()
+                .is_some_and(|custom| custom.fields.contains_key("__smg_managed_epd_v1"))
+        })
+}
+
 #[tonic::async_trait]
 impl SglangScheduler for SglangService {
     type GenerateStream = BoxStream<sg::GenerateResponse>;
@@ -39,6 +54,11 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<sg::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        if self.state.managed && requires_managed_control(request.get_ref()) {
+            return Err(Status::failed_precondition(
+                "managed pool requires the managed control service",
+            ));
+        }
         let trace_headers = trace_context::trace_headers(request.metadata());
         let stream = generate::generate(
             &self.state,
@@ -176,5 +196,35 @@ impl SglangScheduler for SglangService {
         Ok(Response::new(sg::ListLoadedLoRaAdaptersResponse {
             loaded_adapters: self.state.loras.adapters.clone(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_pool_accepts_ordinary_text_but_not_media_or_control_envelopes() {
+        let mut request = sg::GenerateRequest::default();
+        assert!(!requires_managed_control(&request));
+        request.mm_inputs = Some(Default::default());
+        assert!(requires_managed_control(&request));
+        request.mm_inputs = None;
+        request.extra_mm_inputs.push(Default::default());
+        assert!(requires_managed_control(&request));
+        request.extra_mm_inputs.clear();
+        request.input_embeds.push(1.0);
+        assert!(requires_managed_control(&request));
+        request.input_embeds.clear();
+        request.media_identity = Some(Default::default());
+        assert!(requires_managed_control(&request));
+        request.media_identity = None;
+        request.sampling_params = Some(sg::SamplingParams {
+            custom_params: Some(prost_types::Struct {
+                fields: [("__smg_managed_epd_v1".to_owned(), Default::default())].into(),
+            }),
+            ..Default::default()
+        });
+        assert!(requires_managed_control(&request));
     }
 }

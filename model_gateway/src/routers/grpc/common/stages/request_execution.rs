@@ -293,7 +293,28 @@ pub(crate) async fn execute_plan(
     // consumed it). Taking it transfers a rendezvous plan's encode jobs and
     // their SHM Drop guards here: dispatch consumes them, while an early
     // error before dispatch drops them and reclaims the SHM.
-    let encode = ctx.encode_outputs.take();
+    let encode = match ctx.encode_outputs.take() {
+        Some(EncodeOutputs::PreparedInput(input)) => {
+            let workers = stage_output(ctx.workers.as_ref(), "execute_prepared_input")?;
+            ctx.load_guards = Some(LoadGuards::scaled(
+                workers,
+                ctx.sticky_key.as_deref(),
+                sub_requests,
+            ));
+            let ExecutionPlan::EncodePrefillDecode {
+                request: ProtoGenerateRequest::Sglang(request),
+            } = execution_plan
+            else {
+                return Err(error::internal_error(
+                    "sglang_epd_plan",
+                    "prepared input requires a SGLang EPD plan",
+                ));
+            };
+            ctx.response.execution_result = Some(input.execute(*request, workers, admission)?);
+            return Ok(());
+        }
+        other => other,
+    };
     // The watch on a rendezvous plan's encode dispatch: made by the first
     // attempt's launch, read by its replays (see `prepare_epd_attempt`).
     let encode_watch = &mut ctx.encode_watch;
@@ -819,6 +840,10 @@ async fn prepare_epd_attempt(
     carried: &mut Option<EncodeWatch>,
 ) -> Result<Option<Vec<PushCleanup>>, Response> {
     match encode {
+        Some(EncodeOutputs::PreparedInput(_)) => Err(error::internal_error(
+            "sglang_epd_plan",
+            "prepared input reached the legacy encode handoff",
+        )),
         Some(EncodeOutputs::Push(plan)) => Ok(Some(plan.encode(proto_request).await?)),
         Some(EncodeOutputs::Rendezvous { dispatch, .. }) => {
             *carried = launch_encode_dispatch(dispatch);

@@ -1057,7 +1057,12 @@ pub(crate) fn finish_generate_request(
     ctx.state.response.router_stop_obligations =
         builder.finalize_generate_request(proto_request, ctx.tokenizer_arc().as_ref());
 
-    if inject_pd_metadata {
+    if inject_pd_metadata
+        && !matches!(
+            ctx.state.encode_outputs,
+            Some(EncodeOutputs::PreparedInput(_))
+        )
+    {
         if let Some(workers) = ctx.state.workers.as_ref() {
             maybe_inject_pd_metadata(proto_request, workers);
         }

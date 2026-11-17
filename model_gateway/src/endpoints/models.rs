@@ -147,6 +147,25 @@ pub async fn list_models(
     query: Option<&str>,
     request_id: String,
 ) -> Response {
+    if let Some(cards) = managed_cards(&context.router_config) {
+        let shape = ModelShape::from_headers(headers);
+        let page = if matches!(shape, ModelShape::Anthropic) {
+            match messages::ListModelsQuery::parse(query) {
+                Ok(page) => page,
+                Err(why) => {
+                    return shape
+                        .error(
+                            error::bad_request("invalid_query_parameter", why),
+                            request_id,
+                        )
+                        .await
+                }
+            }
+        } else {
+            messages::ListModelsQuery::default()
+        };
+        return shape.list(cards, &page, request_id).await;
+    }
     list_models_with(
         &context.worker_registry,
         &context.client,
@@ -229,6 +248,13 @@ pub async fn retrieve_model(
     model_id: &str,
     request_id: String,
 ) -> Response {
+    if let Some(cards) = managed_cards(&context.router_config) {
+        let shape = ModelShape::from_headers(headers);
+        return match cards.into_iter().find(|card| card.id == model_id) {
+            Some(card) => shape.single(card),
+            None => shape.not_found(model_id, request_id).await,
+        };
+    }
     retrieve_model_with(&context.worker_registry, headers, model_id, request_id).await
 }
 
@@ -249,6 +275,30 @@ pub(crate) async fn retrieve_model_with(
         Some(card) => shape.single(card),
         None => shape.not_found(model_id, request_id).await,
     }
+}
+
+/// Managed chat has a separate worker registry but the same configured model inventory.
+fn managed_cards(config: &crate::config::RouterConfig) -> Option<Vec<ModelCard>> {
+    if !config.is_sglang_epd() {
+        return None;
+    }
+    let canonical = config.model_path.as_ref()?;
+    let mut ids = std::collections::BTreeSet::from([canonical.clone()]);
+    ids.extend(
+        config
+            .model_aliases
+            .iter()
+            .filter(|(_, target)| *target == canonical)
+            .map(|(alias, _)| alias.clone()),
+    );
+    Some(
+        ids.into_iter()
+            .map(|id| {
+                ModelCard::new(id)
+                    .with_model_type(openai_protocol::model_type::ModelType::VISION_LLM)
+            })
+            .collect(),
+    )
 }
 
 /// The caller's credential: a `Bearer` token (case-insensitive scheme per
@@ -530,6 +580,42 @@ mod tests {
         server::http_client,
         worker::{test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType},
     };
+
+    /// Managed inventory follows the derived selector and exposes only routable aliases.
+    #[test]
+    fn managed_inventory_survives_config_roundtrip_without_a_second_switch() {
+        let mut config = crate::config::RouterConfig {
+            model_path: Some("Qwen/model".into()),
+            startup_worker_runtime_type: Some(RuntimeType::Sglang),
+            mode: crate::config::RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: None,
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            model_aliases: [
+                ("alias".into(), "Qwen/model".into()),
+                ("other".into(), "unrelated".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert!(encoded.get("sglang_managed_epd").is_none());
+        let restored: crate::config::RouterConfig = serde_json::from_value(encoded).unwrap();
+        assert!(restored.is_sglang_epd());
+        let cards = managed_cards(&restored).unwrap();
+        assert_eq!(
+            cards.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["Qwen/model", "alias"]
+        );
+        config.startup_worker_runtime_type = Some(RuntimeType::Vllm);
+        assert!(managed_cards(&config).is_none());
+        config.startup_worker_runtime_type = None;
+        assert!(managed_cards(&config).is_none());
+    }
 
     /// An inventory with no model in it answers the gateway's JSON error
     /// envelope with a typed code, as every other refusal does, in the

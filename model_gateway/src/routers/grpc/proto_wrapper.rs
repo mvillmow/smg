@@ -700,6 +700,8 @@ impl ProtoGenerateComplete {
 /// `ProtoGenerateStreamChunk` / `ProtoGenerateComplete` arm.
 pub enum ProtoStream {
     Sglang(SglangStream),
+    /// Managed supervisor owns all E/P/D cancellation; this wrapper only reads D output.
+    Managed(Box<super::sglang_epd::executor::ResponseStream>),
     Vllm(VllmStream),
     Trtllm(TrtllmStream),
     Mlx(MlxStream),
@@ -2071,6 +2073,10 @@ impl ProtoStream {
                 .next()
                 .await
                 .map(|result| result.map(ProtoGenerateResponse::Sglang)),
+            Self::Managed(stream) => stream
+                .next()
+                .await
+                .map(|result| result.map(|r| ProtoGenerateResponse::Sglang(Box::new(r)))),
             Self::Vllm(stream) => stream
                 .next()
                 .await
@@ -2123,6 +2129,7 @@ impl ProtoStream {
             Self::Mlx(stream) => stream.mark_completed(),
             Self::TokenSpeed(stream) => stream.mark_completed(),
             Self::Zmq(stream) => stream.mark_completed(),
+            Self::Managed(_) => {}
             Self::Fanout(stream) => stream.mark_completed(),
             Self::Tracked(stream) => stream.inner.mark_completed(),
             Self::DecodeSide(side) => side.inner.mark_completed(),
@@ -2153,7 +2160,7 @@ impl ProtoStream {
             Self::Trtllm(stream) => stream.set_deadline(deadline),
             Self::Mlx(stream) => stream.set_deadline(deadline),
             Self::TokenSpeed(stream) => stream.set_deadline(deadline),
-            Self::Zmq(_) => {}
+            Self::Zmq(_) | Self::Managed(_) => {}
             Self::Fanout(stream) => stream.apply_deadline(deadline),
             Self::Tracked(stream) => stream.inner.apply_deadline(deadline),
             Self::DecodeSide(side) => side.inner.apply_deadline(deadline),
@@ -2199,6 +2206,7 @@ impl ProtoStream {
             Self::Mlx(stream) => Self::Mlx(stream.defer_abort_within(bound)),
             Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_within(bound)),
             Self::Zmq(stream) => Self::Zmq(stream),
+            Self::Managed(stream) => Self::Managed(stream),
             Self::Fanout(stream) => Self::Fanout(stream.defer_abort_within(bound)),
             Self::Tracked(stream) => {
                 let TrackedStream {

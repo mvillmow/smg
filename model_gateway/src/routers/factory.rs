@@ -59,6 +59,13 @@ pub struct RouterFactory;
 impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        let prepared_input = if ctx.router_config.is_sglang_epd() {
+            Some(Arc::new(
+                super::grpc::sglang_epd::router::PreparedInputAdapter::new(ctx).await?,
+            ))
+        } else {
+            None
+        };
         match ctx.router_config.connection_mode {
             ConnectionMode::Grpc | ConnectionMode::Zmq => {
                 // Register the per-role policies each disaggregation mode needs,
@@ -100,7 +107,11 @@ impl RouterFactory {
                 let mode = grpc_mode(&ctx.router_config).ok_or_else(|| {
                     "gRPC connection mode requires a gRPC routing mode".to_string()
                 })?;
-                Self::create_grpc_router(ctx, mode)
+                Ok(Box::new(GrpcRouter::with_prepared_input(
+                    ctx,
+                    mode,
+                    prepared_input,
+                )?))
             }
             ConnectionMode::Http => match &ctx.router_config.mode {
                 RoutingMode::Regular { .. } => Self::create_regular_router(ctx).await,

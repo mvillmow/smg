@@ -116,6 +116,7 @@ pub(crate) enum Endpoint {
 /// embeddings/classify build none.
 #[derive(Clone)]
 pub(crate) struct PipelineDeps {
+    prepared_input: Option<Arc<super::sglang_epd::router::PreparedInputAdapter>>,
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     prefill_admission: Option<Arc<PrefillAdmission>>,
@@ -157,6 +158,7 @@ impl PipelineDeps {
         queue_timeout: Duration,
     ) -> Self {
         Self {
+            prepared_input: None,
             worker_registry,
             policy_registry,
             prefill_admission,
@@ -181,6 +183,7 @@ impl PipelineDeps {
         queue_timeout: Duration,
     ) -> Self {
         Self {
+            prepared_input: None,
             worker_registry,
             policy_registry,
             prefill_admission,
@@ -193,6 +196,15 @@ impl PipelineDeps {
             request_timeout: None,
             grouped_dp_sticky: GroupedDpSticky::Off,
         }
+    }
+
+    /// Use the prepared-input handoff without replacing shared P/D routing.
+    pub(crate) fn with_prepared_input(
+        mut self,
+        adapter: Option<Arc<super::sglang_epd::router::PreparedInputAdapter>>,
+    ) -> Self {
+        self.prepared_input = adapter;
+        self
     }
 
     /// Bound each attempt's calls to its workers, and the streams they open,
@@ -270,6 +282,7 @@ impl PipelineDeps {
     fn test_default() -> Self {
         use crate::config::types::PolicyConfig;
         Self {
+            prepared_input: None,
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             prefill_admission: None,
@@ -303,6 +316,7 @@ struct PipelineStages {
 /// Generic request pipeline for all request types.
 #[derive(Clone)]
 pub(crate) struct RequestPipeline {
+    prepared_input: Option<Arc<super::sglang_epd::router::PreparedInputAdapter>>,
     stages: Arc<PipelineStages>,
     /// Backend type for metrics labeling
     backend_type: &'static str,
@@ -349,12 +363,20 @@ impl RequestPipeline {
         let worker_selection = WorkerSelectionStage::new(
             deps.worker_registry.clone(),
             deps.policy_registry.clone(),
-            mode.worker_selection(),
+            if deps.prepared_input.is_some() {
+                Mode::PrefillDecode.worker_selection()
+            } else {
+                mode.worker_selection()
+            },
             deps.prefill_admission.clone(),
         )
         .with_queue_timeout(deps.queue_timeout);
-        let plan_settings = mode.plan_settings();
-        let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
+        let mut plan_settings = mode.plan_settings();
+        // Text-only requests on a prepared-input pool use ordinary PD dispatch.
+        // Media requests keep their instance-bound bootstrap in the adapter.
+        plan_settings.inject_pd_metadata |= deps.prepared_input.is_some();
+        let encode = (matches!(mode, Mode::EncodePrefillDecode) && deps.prepared_input.is_none())
+            .then(EncodeStage::new);
         let rate_limit = RateLimitReserveStage::new(deps.rate_limit_manager.clone());
 
         let stages = match endpoint {
@@ -488,6 +510,7 @@ impl RequestPipeline {
         };
 
         Some(Self {
+            prepared_input: deps.prepared_input.clone(),
             stages: Arc::new(stages),
             backend_type: backend,
             mode,
@@ -542,11 +565,30 @@ impl RequestPipeline {
             };
         }
 
+        if let Some(adapter) = &self.prepared_input {
+            use super::utils::tonic_ext::TonicStatusExt;
+            let prepared = adapter.prepare(ctx).map_err(|status| {
+                status.to_http_error("sglang_epd_capability", status.message().to_owned())
+            })?;
+            // Text-only requests use the existing PD dispatch, admission and cleanup.
+            // The prepared-input protocol is needed only for encoder output.
+            if prepared.has_media() {
+                ctx.state.encode_outputs = Some(EncodeOutputs::PreparedInput(Box::new(prepared)));
+            }
+        }
         let stages = &self.stages;
         step!(
             stages.preparation.name(),
             stages.preparation.execute(ctx).await
         )?;
+        if matches!(
+            ctx.state.encode_outputs,
+            Some(EncodeOutputs::PreparedInput(_))
+        ) {
+            // References are retained by the protocol adapter. Neither the
+            // shared builder nor P/D may fetch or preprocess them again.
+            ctx.state.multimodal_refs = None;
+        }
         step!(
             stages.rate_limit.name(),
             stages.rate_limit.execute(ctx).await
@@ -693,6 +735,10 @@ impl RequestPipeline {
         metrics_endpoint: Option<&'static str>,
         retry_config: Option<&'a RetryConfig>,
     ) -> RunFuture<'a> {
+        // The immutable prepared-input operation is not replayable after dispatch.
+        // Preserve the original adapter's no-retry behavior until a retained
+        // native-input replay is supported, rather than falling into legacy Generate.
+        let retry_config = retry_config.filter(|_| self.prepared_input.is_none());
         let requested = cache_trace::requested(ctx.input.headers.as_ref());
         if !cache_trace::enabled() && !requested {
             return Box::pin(self.run_inner(ctx, metrics_endpoint, retry_config));
