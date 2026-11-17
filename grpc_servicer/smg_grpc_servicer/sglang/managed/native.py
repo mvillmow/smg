@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import math
 
 LAYOUT = "sglang_native_manifest_v1"
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -148,82 +147,14 @@ def export_layout(req, binding):
     return output
 
 
-def _validate_array(value, limit):
-    """Check shape before constructing a native tensor from integer metadata."""
-    if (
-        len(value.shape) > 3
-        or math.prod(value.shape) != len(value.values)
-        or len(value.values) > limit
-    ):
-        raise ValueError("invalid managed integer metadata shape")
-
-
 def validate_layout(manifest, binding):
-    """Validate the final scheduler boundary, including full native padding identity."""
-    if manifest.ByteSize() > MAX_MANIFEST_BYTES:
-        raise ValueError("managed manifest exceeds byte bound")
-    if manifest.version != 1 or manifest.binding != binding or binding.layout_contract != LAYOUT:
-        raise ValueError("managed manifest binding/version mismatch")
-    if manifest.integrity_digest != digest(manifest):
-        raise ValueError("managed manifest integrity mismatch")
-    count = len(manifest.unpadded_ids)
-    if not 0 < count <= MAX_TOKENS or len(manifest.padded_ids) != count:
-        raise ValueError("invalid managed native prompt length")
-    if not 0 < len(manifest.images) <= MAX_IMAGES or not manifest.image_token_id:
-        raise ValueError("invalid managed image count/token")
-    _validate_array(manifest.mrope_positions, MAX_TOKENS * 3)
-    _validate_array(manifest.mrope_delta, 1)
-    if list(manifest.mrope_positions.shape) != [3, count]:
-        raise ValueError("missing managed native positions")
-    if len(manifest.mrope_delta.values) != 1:
-        raise ValueError("missing managed native position delta")
-    if manifest.HasField("token_types"):
-        _validate_array(manifest.token_types, MAX_TOKENS)
-        if len(manifest.token_types.values) != count:
-            raise ValueError("invalid managed token types")
-    previous_end = -1
-    for index, item in enumerate(manifest.images):
-        if (
-            item.occurrence != index
-            or len(item.full_identity) != 32
-            or (item.HasField("processor_fingerprint") and not item.processor_fingerprint)
-        ):
-            raise ValueError("invalid managed full media identity")
-        if item.native_hash != int.from_bytes(item.full_identity[:8], "big"):
-            raise ValueError("native hash differs from full media identity")
-        if len(item.routing_label) > 256:
-            raise ValueError("native routing label exceeds limit")
-        if binding.media_routing_labels and (
-            index >= len(binding.media_routing_labels)
-            or item.routing_label != binding.media_routing_labels[index]
-        ):
-            raise ValueError("native routing label differs from frozen input binding")
-        hashed = hashlib.sha256(b"sglang-mm-wide-pad-v1" + item.full_identity).digest()
-        pads = [
-            1000000 + (int.from_bytes(hashed[i : i + 8], "big") & ((1 << 62) - 1))
-            for i in range(0, 32, 8)
-        ]
-        if (
-            list(item.pad_values) != pads
-            or len(item.grid_thw) not in (0, 3)
-            or any(v <= 0 for v in item.grid_thw)
-        ):
-            raise ValueError("managed identity/padding/grid mismatch")
-        if not item.offsets or item.native_format not in (1, 2, 3):
-            raise ValueError("incomplete managed native image layout")
-        for offset in item.offsets:
-            if not previous_end < offset.start <= offset.end < count:
-                raise ValueError("invalid managed image offsets")
-            if any(v not in pads for v in manifest.padded_ids[offset.start : offset.end + 1]):
-                raise ValueError("managed image sentinel mismatch")
-            if (
-                manifest.unpadded_ids[previous_end + 1 : offset.start]
-                != manifest.padded_ids[previous_end + 1 : offset.start]
-            ):
-                raise ValueError("managed layout changed a non-image token")
-            previous_end = offset.end
-    if manifest.unpadded_ids[previous_end + 1 :] != manifest.padded_ids[previous_end + 1 :]:
-        raise ValueError("managed layout changed a non-image token")
+    """Use the gateway's validator at the final native boundary too."""
+    from smg.smg_rs import ManagedEncoderProcessor
+
+    ManagedEncoderProcessor.validate_layout(
+        manifest.SerializeToString(deterministic=True),
+        binding.SerializeToString(deterministic=True),
+    )
 
 
 def decode_input(manifest, binding):

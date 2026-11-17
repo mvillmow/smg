@@ -149,7 +149,7 @@ pub(crate) fn build(
         || ctx.state.multimodal_refs.is_some()
         || matches!(
             ctx.state.encode_outputs.as_ref(),
-            Some(EncodeOutputs::PreparedInput(input)) if input.has_media()
+            Some(EncodeOutputs::PreparedInput(_))
         );
     let mut proto_request = build_request(
         builder_client,

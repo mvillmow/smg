@@ -620,3 +620,9 @@ macro_rules! impl_rank_load_conversions {
     };
 }
 pub(crate) use impl_rank_load_conversions;
+
+/// Native SGLang encoder control protocol, without tensor payload adaptation.
+pub mod sglang_encoder_proto {
+    #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
+    tonic::include_proto!("sglang.grpc.encoder");
+}

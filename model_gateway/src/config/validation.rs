@@ -706,14 +706,14 @@ impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         if config.is_sglang_epd()
-            && (config.model_path.as_ref().is_none_or(String::is_empty)
-                || config.enable_igw
-                || config.discovery.is_some()
+            && (config.enable_igw
                 || config.connection_mode != ConnectionMode::Grpc
                 || !matches!(&config.mode, RoutingMode::EncodePrefillDecode { .. }))
         {
             return Err(ConfigError::ValidationFailed {
-                reason: "SGLang EPD requires --model-path and explicit E/P/D pools, and does not support discovery or IGW".into(),
+                reason:
+                    "SGLang prepared-input EPD requires gRPC E/P/D routing and does not support IGW"
+                        .into(),
             });
         }
         bounds::validate(config)?;

@@ -32,7 +32,8 @@ fn no_control_wire(rpc: &str) -> Status {
 // Ordinary text uses the existing Generate/Abort lifecycle even in an EPD pool.
 // Media and the private control envelope still require the fenced control RPC.
 fn requires_managed_control(request: &sg::GenerateRequest) -> bool {
-    request.mm_inputs.is_some()
+    !request.prepared_input.is_empty()
+        || request.mm_inputs.is_some()
         || !request.extra_mm_inputs.is_empty()
         || !request.input_embeds.is_empty()
         || request.media_identity.is_some()
@@ -54,9 +55,12 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<sg::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        if !request.get_ref().prepared_control.is_empty() {
+            return super::prepared::generate(&self.state, request.into_inner()).map(Response::new);
+        }
         if self.state.managed && requires_managed_control(request.get_ref()) {
             return Err(Status::failed_precondition(
-                "managed pool requires the managed control service",
+                "prepared-input metadata is required",
             ));
         }
         let trace_headers = trace_context::trace_headers(request.metadata());

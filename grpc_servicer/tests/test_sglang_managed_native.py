@@ -19,7 +19,21 @@ def test_native_epd_metadata_roundtrip_without_media_or_embeddings():
     from smg_grpc_servicer.sglang.managed import native
 
     m = native._proto()
-    b = m.InputBinding(prefill_rid="p", layout_contract=native.LAYOUT)
+    b = m.InputBinding(
+        prefill_rid="p",
+        layout_contract=native.LAYOUT,
+        model_revision="weights",
+        processor_contract="qwen3",
+        prefill=m.Instance(worker_id="p", generation="p-generation"),
+        bootstrap=m.Bootstrap(host="p", port=8998, room=1),
+        decode=m.OperationRef(
+            identity=m.Identity(logical_request_id="r", attempt_id="a"),
+            target=m.Instance(worker_id="d", generation="d-generation"),
+            operation_id="d",
+            request_digest=b"r" * 32,
+            plan_digest=b"p" * 32,
+        ),
+    )
     item = MultimodalDataItem(
         modality=Modality.IMAGE, offsets=[(1, 4)], precomputed_embeddings=torch.zeros((4, 8))
     )

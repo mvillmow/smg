@@ -4,24 +4,6 @@ package smg.sglang.managed.v1;
 
 import "sglang_scheduler.proto";
 
-// Separate services: an old scheduler must never accept a managed operation.
-service ManagedSglang {
-  rpc GetCapabilities(CapabilityQuery) returns (Capabilities);
-  rpc GeneratePrefill(PrefillStart) returns (stream ControlEvent);
-  rpc GenerateDecode(stream DecodeCommand) returns (stream ControlEvent);
-  rpc Terminate(Termination) returns (TerminationReceipt);
-}
-
-service ManagedEncoder {
-  rpc GetCapabilities(CapabilityQuery) returns (Capabilities);
-  rpc Encode(EncodeRequest) returns (stream ControlEvent);
-  rpc Cancel(Termination) returns (TerminationReceipt);
-  rpc GetOperation(OperationRef) returns (OperationStatus);
-  rpc WatchLoad(Instance) returns (stream LoadSnapshot);
-}
-
-message CapabilityQuery {}
-
 message Capabilities {
   uint32 version = 1;
   Instance instance = 2;
@@ -124,24 +106,6 @@ message PreparedDecodeInput {
   bytes integrity_digest = 12;
 }
 
-message DecodeStart {
-  uint32 version = 1;
-  InputBinding binding = 2;
-  Budget budget = 3;
-  // Contains generation options and, for inline text only, complete tokens.
-  // All multimodal fields, session and n > 1 are refused by this service.
-  .sglang.grpc.scheduler.GenerateRequest generation = 4;
-  bool deferred_from_prefill = 5;
-}
-
-message DecodeCommand {
-  oneof command {
-    DecodeStart start = 1;
-    PreparedDecodeInput bind_prepared_input = 2;
-    string cancel = 3;
-  }
-}
-
 message EncodePart {
   string native_part_rid = 1;
   uint32 part_idx = 2;
@@ -162,80 +126,4 @@ message PrefillStart {
   InputBinding binding = 4;
   .sglang.grpc.scheduler.GenerateRequest generation = 5;
   ExternalEncodePlan encode_plan = 6;
-}
-
-message EncodeRequest {
-  uint32 version = 1;
-  OperationRef operation = 2;
-  Budget budget = 3;
-  InputBinding receiver_binding = 4;
-  ExternalEncodePlan plan = 5;
-  repeated string image_references = 6;
-  string transfer_backend = 7;
-  string tenant_id = 8;
-}
-
-enum Stage {
-  STAGE_UNSPECIFIED = 0;
-  ACCEPTED = 1;
-  PREPROCESSED = 2;
-  ENCODED = 3;
-  DELIVERED = 4;
-  INPUT_BOUND = 5;
-  NATIVE_SUBMITTED = 6;
-  CANCEL_REQUESTED = 7;
-  QUIESCED = 8;
-}
-
-message Failure {
-  string code = 1;
-  string message = 2;
-}
-
-message ControlEvent {
-  OperationRef operation = 1;
-  uint64 event_seq = 2;
-  uint64 admission_seq = 3;
-  optional uint32 part_idx = 4;
-  oneof event {
-    Stage stage = 5;
-    PreparedDecodeInput media_prepared = 6;
-    .sglang.grpc.scheduler.GenerateResponse generation = 7;
-    Failure failed = 8;
-  }
-}
-
-message Termination {
-  OperationRef operation = 1;
-  uint64 original_expiry_unix_ms = 2;
-  string native_rid = 3;
-  string reason = 4;
-}
-
-message TerminationReceipt {
-  // Cancellation recorded, not a claim about CUDA/RDMA completion.
-  bool recorded = 1;
-  bool quiesced = 2;
-}
-
-message OperationStatus {
-  OperationRef operation = 1;
-  uint64 admission_seq = 2;
-  Stage stage = 3;
-  bool terminal = 4;
-  bool quiesced = 5;
-}
-
-message LoadSnapshot {
-  Instance instance = 1;
-  uint64 snapshot_seq = 2;
-  uint64 covered_admission_seq = 3;
-  uint64 capacity = 4;
-  uint64 active = 5;
-  uint64 cpu_work = 6;
-  uint64 gpu_work = 7;
-  uint64 artifact_bytes = 8;
-  uint64 staging_bytes = 9;
-  uint64 send_bytes = 10;
-  uint64 draining_work = 11;
 }

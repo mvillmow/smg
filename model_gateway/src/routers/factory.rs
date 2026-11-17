@@ -61,7 +61,7 @@ impl RouterFactory {
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
         let prepared_input = if ctx.router_config.is_sglang_epd() {
             Some(Arc::new(
-                super::grpc::sglang_epd::router::PreparedInputAdapter::new(ctx).await?,
+                super::grpc::sglang_epd::router::PreparedInputAdapter::new(),
             ))
         } else {
             None

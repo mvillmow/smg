@@ -6,7 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
@@ -19,7 +18,7 @@ use super::{
     context_length::pair_context_length,
     helpers,
     pd_protocol::{EncodeHandoff, PdProtocol},
-    ContextRequirements, PipelineStage,
+    ContextRequirements,
 };
 #[cfg(test)]
 use crate::observability::log_throttle::KeyedLogThrottle;
@@ -45,11 +44,12 @@ use crate::{
         error,
         grpc::{
             context::{
-                stage_output, DispatchContext, EncodeWorkerAssignment, ExecutionPlan,
-                PreparationOutput, RequestContext, RequestInput, RequestType, RoutingSnapshot,
-                WireConstraint, WorkerSelection,
+                stage_output, DispatchContext, EncodeOutputs, EncodeWorkerAssignment,
+                ExecutionPlan, PreparationOutput, RequestContext, RequestInput, RequestType,
+                RoutingSnapshot, WireConstraint, WorkerSelection,
             },
             multimodal,
+            sglang_epd::router as prepared_input,
         },
         prefill_queue_full, prefill_queue_timeout,
     },
@@ -311,9 +311,12 @@ fn disaggregated((prefill, decode, runtime_type): PdWorkerPair) -> WorkerSelecti
     }
 }
 
-#[async_trait]
-impl PipelineStage for WorkerSelectionStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+impl WorkerSelectionStage {
+    /// Called by the pipeline on the stage's own type. It is no
+    /// `PipelineStage` impl: that trait boxes the future of every call, an
+    /// allocation per request, and the pipeline never needs this stage as a
+    /// trait object.
+    pub(crate) async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         self.select(ctx).await.map_err(|refusal| {
             let request_id = helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref());
             self.report_refusal(
@@ -323,10 +326,6 @@ impl PipelineStage for WorkerSelectionStage {
                 refusal,
             )
         })
-    }
-
-    fn name(&self) -> &'static str {
-        "WorkerSelection"
     }
 }
 
@@ -503,7 +502,7 @@ impl<'a> SelectionInputs<'a> {
 }
 
 impl WorkerSelectionStage {
-    /// The selection behind [`PipelineStage::execute`]; a refusal it returns
+    /// The selection behind [`Self::execute`]; a refusal it returns
     /// is reported there by [`Self::report_refusal`]. The request's inputs are
     /// gathered first and kept for the retries in the routing snapshot, the
     /// mode's pick runs on them ([`Self::pick`]), and the selection is checked
@@ -638,22 +637,25 @@ impl WorkerSelectionStage {
                 Ok((disaggregated(pair), Some(guard)))
             }
             WorkerSelectionMode::EncodePrefillDecode => {
-                let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
-                    let refs = multimodal::assemble_media_refs(plan)
-                        .map_err(multimodal::MmRefsError::into_response)?;
-                    Ok(refs
-                        .items
-                        .iter()
-                        .map(|item| {
-                            let mut hash = blake3::Hasher::new();
-                            hash.update(&item.modality.to_le_bytes());
-                            hash.update(item.url.as_bytes());
-                            hash.finalize().as_bytes().to_vec()
-                        })
-                        .collect())
-                } else {
-                    encode_item_hashes(inputs.intermediate)
-                };
+                let hashes =
+                    if let Some(EncodeOutputs::PreparedInput(input)) = &ctx.state.encode_outputs {
+                        Ok(input.hashes())
+                    } else if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
+                        let refs = multimodal::assemble_media_refs(plan)
+                            .map_err(multimodal::MmRefsError::into_response)?;
+                        Ok(refs
+                            .items
+                            .iter()
+                            .map(|item| {
+                                let mut hash = blake3::Hasher::new();
+                                hash.update(&item.modality.to_le_bytes());
+                                hash.update(item.url.as_bytes());
+                                hash.finalize().as_bytes().to_vec()
+                            })
+                            .collect())
+                    } else {
+                        encode_item_hashes(inputs.intermediate)
+                    };
                 let encode_item_hashes = match hashes {
                     Ok(hashes) => hashes,
                     Err(err) => {
@@ -2096,6 +2098,9 @@ impl WorkerSelectionStage {
             WireConstraint::admits(demand.wire, worker.as_ref())
                 && media.accepts(worker.as_ref())
                 && match PdProtocol::encode_handoff(worker.metadata().spec.runtime_type) {
+                    Some(EncodeHandoff::PreparedInput) => {
+                        prepared_input::capability(worker.as_ref()).is_some()
+                    }
                     Some(EncodeHandoff::Push) => ec_role(worker.as_ref(), "ec_producer"),
                     Some(EncodeHandoff::Rendezvous) => !media.media_refs,
                     None => false,
@@ -2137,6 +2142,8 @@ impl WorkerSelectionStage {
         let compatible = |encoder: &Arc<dyn Worker>, worker: &dyn Worker| {
             let runtime = worker.metadata().spec.runtime_type;
             encoder.metadata().spec.runtime_type == runtime
+                && (PdProtocol::encode_handoff(runtime) != Some(EncodeHandoff::PreparedInput)
+                    || prepared_input::compatible(encoder.as_ref(), worker))
                 && (PdProtocol::encode_handoff(runtime) != Some(EncodeHandoff::Push)
                     || worker.worker_type() != &WorkerType::Prefill
                     || ec_pair(encoder.as_ref(), worker))
@@ -2190,6 +2197,8 @@ impl WorkerSelectionStage {
         // and, under a push handoff, its EC roles and connector.
         let pairs_with_prefill = |worker: &Arc<dyn Worker>| {
             worker.metadata().spec.runtime_type == pair.runtime
+                && (handoff != Some(EncodeHandoff::PreparedInput)
+                    || prepared_input::compatible(worker.as_ref(), pair.prefill.as_ref()))
                 && (handoff != Some(EncodeHandoff::Push)
                     || ec_pair(worker.as_ref(), pair.prefill.as_ref()))
         };
@@ -2431,7 +2440,7 @@ mod tests {
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use llm_tokenizer::TokenizerRegistry;
     use openai_protocol::{generate::GenerateRequest, worker::HealthCheckConfig};
-    use smg_grpc_client::vllm_proto as vllm;
+    use smg_grpc_client::{sglang_managed::proto::Capabilities, vllm_proto as vllm};
 
     use super::*;
     use crate::{
@@ -4404,6 +4413,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A mismatched P must not hide a usable E/P/D pipeline, even with pairing disabled.
+    #[test]
+    fn prepared_epd_filters_encoder_contract_before_pair_selection() {
+        let registry = Arc::new(WorkerRegistry::new());
+        for (port, role, backend) in [
+            (8960, WorkerType::Encode, "mooncake"),
+            (8961, WorkerType::Prefill, "zmq_to_scheduler"),
+            (8962, WorkerType::Prefill, "mooncake"),
+            (8963, WorkerType::Decode, "mooncake"),
+        ] {
+            let capability = Capabilities {
+                version: 1,
+                role: match role {
+                    WorkerType::Encode => "encoder",
+                    WorkerType::Prefill => "prefill",
+                    _ => "decode",
+                }
+                .into(),
+                model_revision: "weights".into(),
+                processor_contract: "qwen3".into(),
+                layout_contract: "sglang_native_manifest_v1".into(),
+                embedding_dtype: "bfloat16".into(),
+                embedding_backend: backend.into(),
+                kv_backend: "mooncake".into(),
+                topology_contract: "single-host-tp2".into(),
+                tp_size: 2,
+                ..Default::default()
+            };
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                        .model(ModelCard::new("served-name"))
+                        .worker_type(role)
+                        .runtime_type(RuntimeType::Sglang)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .label("supports_vision", "true")
+                        .label(
+                            "sglang_prepared",
+                            serde_json::to_string(&capability).unwrap(),
+                        )
+                        .label("sglang_prepared_key", "same-pd-contract")
+                        .build(),
+                ))
+                .unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        for _ in 0..4 {
+            let (encoders, prefill, _, _) = stage
+                .select_encode_prefill_decode_workers(
+                    "served-name",
+                    PlacementInputs::default(),
+                    &[vec![1]],
+                    EpdDemands {
+                        wire: None,
+                        encode: MediaDemands {
+                            media_refs: false,
+                            vision: true,
+                            pipeline: PipelinePin::Any,
+                        },
+                        decode_vision: false,
+                        image_fanout: false,
+                    },
+                    None,
+                )
+                .unwrap_or_else(|_| panic!("compatible native pipeline is available"));
+            assert_eq!(prefill.url(), "grpc://127.0.0.1:8962");
+            assert_eq!(encoders[0].worker.url(), "grpc://127.0.0.1:8960");
+        }
+        let workers = registry.get_all();
+        assert!(prepared_input::pipeline_ready(&workers, Default::default()));
+        let mismatched: Vec<_> = workers
+            .into_iter()
+            .filter(|w| !w.url().ends_with(":8962"))
+            .collect();
+        assert!(!prepared_input::pipeline_ready(
+            &mismatched,
+            Default::default()
+        ));
     }
 
     /// EPD selects a compatible EC consumer even with mixed runtimes and connectors.
@@ -7582,15 +7677,15 @@ mod tests {
         );
     }
 
-    /// The stage's `execute` future is boxed once per request (`async_trait`)
-    /// and fits the allocator's 2,048-byte class on 64-bit targets: 1,744
-    /// bytes. It read 4,112 when the admission budget's two async wrappers
-    /// each kept the admission they had moved on (three copies of a 1.1 KB
-    /// future, and a 16-byte field took the box from the 4,096 class to
-    /// 5,120); returned as futures they hold it once. A field that grows the
-    /// future past the class needs its own read.
+    /// The stage's `execute` future lives unboxed inside the pipeline's
+    /// ingress future and is held to 2,048 bytes on 64-bit targets (1,744
+    /// when the bound was set). It read 4,112 when the admission budget's
+    /// two async wrappers each kept the admission they had moved on (three
+    /// copies of a 1.1 KB future); returned as futures they hold it once. A
+    /// field that grows the future past the bound needs its own read. A
+    /// boxed future would read 16 bytes here, the size of its pointer.
     #[test]
-    fn the_selection_stage_future_fits_its_class() {
+    fn the_selection_stage_future_is_unboxed_and_bounded() {
         let registry = Arc::new(WorkerRegistry::new());
         let stage = WorkerSelectionStage::new(
             Arc::clone(&registry),
@@ -7599,22 +7694,22 @@ mod tests {
             None,
         );
         let mut ctx = prepared_ctx(registry, None);
-        let future = size_of_val(&*stage.execute(&mut ctx));
+        let future = size_of_val(&stage.execute(&mut ctx));
         assert!(
-            future <= 2048,
+            (17..=2048).contains(&future),
             "the stage's execute future is {future} bytes"
         );
     }
 
-    /// One attempt's dispatch future (`execute_plan`'s) stays in the
-    /// 2,048-byte class the selection stage's future is held to: 1,152 bytes
+    /// One attempt's dispatch future (`execute_plan`'s) stays within the
+    /// 2,048-byte bound the selection stage's future is held to: 1,152 bytes
     /// on 64-bit targets. The pipeline awaits it by value, so it sizes every
     /// attempt's future: that one read 7,280 bytes while the two
     /// disaggregated dispatches were awaited by value, and reads 1,528 with
     /// both boxed at their call. A dispatch that grows the future past the
-    /// class is boxed at its call or needs its own read.
+    /// bound is boxed at its call or needs its own read.
     #[test]
-    fn the_dispatch_future_fits_its_class() {
+    fn the_dispatch_future_fits_its_bound() {
         let mut ctx = dispatch_ctx("test-model", grpc_wire(RuntimeType::Vllm));
         let future = size_of_val(&execute_plan(
             &mut ctx,

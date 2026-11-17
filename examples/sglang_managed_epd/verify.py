@@ -8,6 +8,7 @@ import argparse
 import base64
 import io
 import json
+import re
 import time
 import urllib.request
 
@@ -105,9 +106,9 @@ def main():
                     usage
                 )
                 assert (
-                    ("4" in text)
+                    (text.strip().rstrip(".") == "4")
                     if count == 0
-                    else all(c in text.lower() for c in ["red", "blue"][:count])
+                    else re.findall(r"\b(red|blue)\b", text.lower()) == ["red", "blue"][:count]
                 )
             except urllib.error.HTTPError as e:
                 print("HTTP_ERROR", e.code, e.read().decode(), flush=True)

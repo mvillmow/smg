@@ -233,10 +233,13 @@ impl CliArgs {
         }
     }
 
-    /// Selecting a discovery provider, by either spelling, turns IGW mode on.
+    /// Discovery turns IGW on unless the operator selected the native SGLang EPD pipeline.
     /// Returns whether this call turned it on.
     pub(crate) fn enable_igw_for_discovery(&mut self) -> bool {
-        let enable = self.selected_discovery_provider().is_some() && !self.routing.enable_igw;
+        let native_epd =
+            self.workers.epd_disaggregation && matches!(self.model.backend, Some(Backend::Sglang));
+        let enable =
+            self.selected_discovery_provider().is_some() && !self.routing.enable_igw && !native_epd;
         self.routing.enable_igw |= enable;
         enable
     }

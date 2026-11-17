@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import ctypes
 import os
 import sys
@@ -25,7 +24,7 @@ def available_cpus():
     return max(1, count)
 
 
-def complete(config, args, role):
+def complete(args, role):
     """Derive native contracts and finite limits instead of requiring duplicated deployment JSON."""
     # This adapter exports one complete Qwen3-VL layout from a single TP group.
     for field in ("nnodes", "pp_size", "dp_size", "attn_dp_size"):
@@ -33,26 +32,10 @@ def complete(config, args, role):
             raise ValueError(f"managed EPD does not support native {field} != 1")
     if getattr(args, "enable_unified_memory", False):
         raise ValueError("managed EPD does not support unified-memory KV envelopes")
-    supplied = copy.deepcopy(config)
-    contract = supplied.pop("contract", {})
-    native_revision = getattr(args, "revision", None)
-    revisions = [
-        value
-        for value in (
-            native_revision,
-            supplied.get("model_revision"),
-            contract.get("model_revision"),
-        )
-        if value
-    ]
-    if len(set(revisions)) > 1:
-        raise ValueError("managed model_revision differs from native revision or contract")
-    revision = supplied.pop("model_revision", contract.get("model_revision")) or getattr(
-        args, "revision", None
-    )
+    revision = getattr(args, "revision", None)
     if not revision:
-        raise ValueError("managed workers require a pinned model_revision or native --revision")
-    advertise_host = supplied.pop("advertise_host", None) or args.host
+        raise ValueError("managed workers require a pinned native --revision")
+    advertise_host = args.host
     if advertise_host in ("0.0.0.0", "::"):
         from sglang.srt.utils.network import get_local_ip_auto
 
@@ -73,29 +56,6 @@ def complete(config, args, role):
         bootstrap_port=args.disaggregation_bootstrap_port,
         tp_size=args.tp_size,
     )
-    # Internal overrides cannot misadvertise native settings.
-    for key in (
-        "embedding_dtype",
-        "embedding_backend",
-        "kv_backend",
-        "tp_size",
-        "topology_contract",
-    ):
-        for source in (supplied, contract):
-            advertised = source.get(key)
-            if advertised is not None and advertised != derived[key]:
-                raise ValueError(f"managed {key} differs from native runtime")
-    if (
-        contract.get("processor_contract", PROCESSOR_CONTRACT) != PROCESSOR_CONTRACT
-        or supplied.get("processor_contract", PROCESSOR_CONTRACT) != PROCESSOR_CONTRACT
-    ):
-        raise ValueError("managed processor contract is determined by the validated adapter")
-    if (
-        role == "prefill"
-        and contract.get("bootstrap_port", derived["bootstrap_port"]) != derived["bootstrap_port"]
-    ):
-        raise ValueError("managed bootstrap port differs from native prefill")
-    derived.update(contract)
     defaults = dict(
         worker_id=f"{role}-{advertise_host}:{args.port}",
         # Completed operations retain their replay fence for up to 182 seconds.
@@ -120,12 +80,8 @@ def complete(config, args, role):
             max_receivers=8,
             max_control_bytes=4 * 1024**2,
             max_images=32,
-            drr_quantum=4096,
-            aging_seconds=2,
-            tenant_weights={},
             max_early_waiters=32,
             early_wait_seconds=5,
-            load_interval_ms=100,
             max_http_connections=64,
             image_token_id=151655,
             processor_options={
@@ -137,18 +93,11 @@ def complete(config, args, role):
         )
     else:
         defaults.update(role=role, contract=derived)
-    unknown = supplied.keys() - defaults.keys()
-    if unknown:
-        raise ValueError(f"unknown managed configuration fields: {sorted(unknown)}")
-    defaults.update(supplied)
     if role == "encoder":
-        if "processor_options" not in supplied:
-            defaults["processor_options"]["max_inflight"] = defaults["max_cpu"]
+        defaults["processor_options"]["max_inflight"] = defaults["max_cpu"]
         receivers = defaults["max_active"] * defaults["max_receivers"]
-        if "max_early_waiters" not in supplied:
-            defaults["max_early_waiters"] = receivers
-        if "max_http_connections" not in supplied:
-            defaults["max_http_connections"] = receivers + 16
+        defaults["max_early_waiters"] = receivers
+        defaults["max_http_connections"] = receivers + 16
     return defaults
 
 

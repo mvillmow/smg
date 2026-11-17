@@ -42,7 +42,10 @@ use smg::routers::grpc::worker_media::{
     PixelFormat, WorkerMediaError, WorkerMediaItem, WorkerMediaPipeline, WorkerMediaSettings,
     SCHEMES,
 };
-use smg_grpc_client::vllm_proto as vllm;
+use smg_grpc_client::{
+    sglang_managed::{self, proto as managed, Limits},
+    vllm_proto as vllm,
+};
 use tokio::sync::oneshot;
 
 fn to_py_err(error: ServicerError) -> PyErr {
@@ -540,6 +543,21 @@ pub struct PyManagedEncoderProcessor {
 
 #[pymethods]
 impl PyManagedEncoderProcessor {
+    /// Apply the same bounded manifest validator at the Python native boundary.
+    #[staticmethod]
+    fn validate_layout(manifest: &[u8], binding: &[u8]) -> PyResult<()> {
+        let limits = Limits::default();
+        if manifest.len() > limits.manifest_bytes || binding.len() > limits.manifest_bytes {
+            return Err(PyValueError::new_err("managed manifest exceeds byte bound"));
+        }
+        let input = managed::PreparedDecodeInput::decode(manifest)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let binding = managed::InputBinding::decode(binding)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        sglang_managed::validate_manifest(&input, &binding, limits)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
     /// Load the shared Rust processor once, without changing legacy model support defaults.
     #[new]
     fn new(

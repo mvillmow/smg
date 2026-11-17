@@ -1488,11 +1488,6 @@ impl JobQueue {
 
                 // Process all workers with unified loop
                 for (url, worker_type, bootstrap_port) in workers {
-                    // The encoder control service has its own capability protocol. P/D
-                    // use standard registration, including the native decode window.
-                    if router_config.is_sglang_epd() && worker_type == "encode" {
-                        continue;
-                    }
                     let url = if router_config.is_sglang_epd() {
                         worker_registration_url(&url)
                     } else {

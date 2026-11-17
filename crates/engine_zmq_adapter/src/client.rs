@@ -423,6 +423,13 @@ impl ZmqEngineClient {
                 .input_ids
                 .clone_from(&input.unpadded_ids);
         }
+        if let Some(sp) = req.sampling_params.as_ref() {
+            refuse_unenforceable_constraint(
+                sglang_constraint_ref(sp),
+                self.structured_outputs_support(),
+            )
+            .map_err(tonic::Status::invalid_argument)?;
+        }
         let original_text = req.tokenized.as_ref().map(|t| t.original_text.clone());
         let pin = req.data_parallel_rank;
         let placement = if role == "prefill" {

@@ -85,7 +85,10 @@ use crate::{
     config::{bind_socket_addr, ReadinessRoleConfig, RouterConfig, RoutingMode},
     middleware::ProbeResponse,
     observability::inflight_tracker::InFlightRequestTracker,
-    routers::grpc::multimodal::{mm_settings, models_without_media_processing},
+    routers::grpc::{
+        multimodal::{mm_settings, models_without_media_processing},
+        sglang_epd::router as prepared_input,
+    },
     worker::{registry::event::WorkerEvent, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
@@ -207,6 +210,10 @@ impl ModelReadiness {
             .find(|(role, _)| healthy_of(Some(*role)) == 0)
         {
             Some(*lacking)
+        } else if router_config.is_sglang_epd()
+            && !prepared_input::pipeline_ready(workers, router_config.pd_pairing_mode)
+        {
+            Some("no_compatible_epd_pipeline")
         } else if !router_config.disable_tokenizer_autoload
             && !workers
                 .iter()
@@ -287,11 +294,6 @@ impl ProbeState {
     /// Current readiness snapshot (single atomic pointer load).
     pub fn readiness(&self) -> Arc<ReadinessSnapshot> {
         self.readiness.load_full()
-    }
-
-    /// Publish readiness from the independent managed worker registry.
-    pub(crate) fn publish_managed(&self, snapshot: ReadinessSnapshot) {
-        self.readiness.store(Arc::new(snapshot));
     }
 
     /// Re-derive the readiness snapshot from live state.
@@ -427,7 +429,7 @@ impl ProbeState {
         // follows).
         let mut model_ids = worker_registry.get_models();
         model_ids.sort_unstable();
-        let models = model_ids
+        let models: Vec<_> = model_ids
             .into_iter()
             .filter(|model| model != UNKNOWN_MODEL_ID)
             .filter_map(|model| {
@@ -460,7 +462,8 @@ impl ProbeState {
         }
 
         self.readiness.store(Arc::new(ReadinessSnapshot {
-            workers_ready,
+            workers_ready: workers_ready
+                && (!router_config.is_sglang_epd() || models.iter().any(|m| m.ready)),
             tokenizers_ready,
             healthy_workers: healthy_workers.len(),
             total_workers: workers.len(),

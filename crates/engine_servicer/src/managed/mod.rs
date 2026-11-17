@@ -1,9 +1,6 @@
 //! Managed EPD state is separate from the legacy servicer registry and fallback.
 
-pub mod decode;
-pub mod ledger;
 pub mod native;
-pub mod service;
 
 use smg_grpc_client::sglang_managed::proto::Capabilities;
 
@@ -48,6 +45,9 @@ impl ManagedConfig {
             generation: self.generation.clone(),
         })?;
         if self.max_clock_error_ms == 0
+            || self.max_duration_ms == 0
+            || self.max_work == 0
+            || self.max_context_bytes < 8 * 1024 * 1024
             || self.contract.model_revision.is_empty()
             || self.contract.processor_contract.is_empty()
             || self.contract.topology_contract.is_empty()

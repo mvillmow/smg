@@ -37,6 +37,7 @@ mod generate;
 mod info;
 mod lora;
 mod media_identity;
+mod prepared;
 mod service;
 #[cfg(test)]
 mod tests;
@@ -48,11 +49,7 @@ use engine_zmq_adapter::{
     StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
 use smg_grpc_client::{
-    sglang_managed::{
-        proto::{managed_sglang_server::ManagedSglangServer, Instance},
-        Limits,
-    },
-    sglang_proto::sglang_scheduler_server::SglangSchedulerServer,
+    sglang_managed::Limits, sglang_proto::sglang_scheduler_server::SglangSchedulerServer,
 };
 use tonic::service::Routes;
 
@@ -60,9 +57,7 @@ use crate::{
     engine_link::EngineLink,
     health_probe,
     kv_events::{record_with_queue, KvEventRelay, RankLoads},
-    managed::{
-        ledger::Ledger, native::ManagedNativeRuntime, service::ManagedService, ManagedConfig,
-    },
+    managed::{native::ManagedNativeRuntime, ManagedConfig},
     metrics::{Identity, ServicerMetrics},
     proto_json,
     servicer::{self, Shared, WireState},
@@ -328,6 +323,8 @@ impl RankLoads for State {
 
 pub(super) struct State {
     pub(super) managed: bool,
+    pub(super) prepared: std::sync::OnceLock<Arc<ManagedNativeRuntime>>,
+    pub(super) managed_config: Option<ManagedConfig>,
     pub(super) model: SglangModelInfo,
     loras: lora::PreloadedLoras,
     /// What every servicer's state shares: the engine link, the admitted
@@ -357,7 +354,6 @@ impl WireState for State {
 pub struct SglangServicerServer {
     server: servicer::Server,
     state: Arc<State>,
-    managed: Option<ManagedService<ManagedNativeRuntime>>,
 }
 
 impl SglangServicerServer {
@@ -464,6 +460,8 @@ impl SglangServicerServer {
                 });
         let state = Arc::new(State {
             managed: managed_config.is_some(),
+            prepared: std::sync::OnceLock::new(),
+            managed_config: managed_config.clone(),
             loras: lora::PreloadedLoras::from_server_args(&config.model.server_args_json)?,
             media_identity_key,
             media_disaggregation_mode,
@@ -480,35 +478,20 @@ impl SglangServicerServer {
             media_identity_enabled,
             health_probe_timeout: health_probe::timeout_from_env(HEALTH_CHECK_TIMEOUT_ENV),
         });
-        let mut routes = Routes::new(
+        let routes = Routes::new(
             SglangSchedulerServer::new(service::SglangService {
                 state: Arc::clone(&state),
             })
             .max_decoding_message_size(usize::MAX)
             .max_encoding_message_size(usize::MAX),
         );
-        let mut managed = None;
         let mut metadata = None;
         if let Some(config) = managed_config {
-            let capabilities = config.capabilities();
-            let instance = Instance {
-                worker_id: config.worker_id,
-                generation: config.generation,
-            };
-            let ledger = Ledger::new(
-                instance.clone(),
-                config.max_records,
-                config.max_work,
-                config.max_context_bytes,
-                config.retention_ms,
-                config.max_duration_ms,
-            )
-            .map_err(|e| ServicerError::InvalidConfig(e.to_string()))?;
-            let native_state = Arc::clone(&state);
+            let native_state = Arc::downgrade(&state);
             let runtime = Arc::new(
                 ManagedNativeRuntime::new(
-                    Arc::new(move || native_state.shared.engine().ok().cloned()),
-                    config.max_records,
+                    Arc::new(move || native_state.upgrade()?.shared.engine().ok().cloned()),
+                    &config,
                     Limits::default(),
                 )
                 .map_err(|e| ServicerError::InvalidConfig(e.to_string()))?,
@@ -516,20 +499,10 @@ impl SglangServicerServer {
             if let Some(endpoint) = config.metadata_endpoint {
                 metadata = Some((Arc::clone(&runtime), endpoint));
             }
-            let control = ManagedService::new(
-                runtime,
-                instance,
-                ledger,
-                Limits::default(),
-                config.max_duration_ms,
-            )
-            .with_capabilities(capabilities, config.max_clock_error_ms);
-            routes = routes.add_service(
-                ManagedSglangServer::new(control.clone())
-                    .max_decoding_message_size(Limits::default().manifest_bytes)
-                    .max_encoding_message_size(Limits::default().manifest_bytes),
-            );
-            managed = Some(control);
+            state
+                .prepared
+                .set(runtime)
+                .map_err(|_| ServicerError::InvalidConfig("duplicate prepared runtime".into()))?;
         }
         let connect_state = Arc::clone(&state);
         let server = servicer::Server::start(
@@ -559,11 +532,7 @@ impl SglangServicerServer {
                 }
             },
         )?;
-        Ok(Self {
-            server,
-            state,
-            managed,
-        })
+        Ok(Self { server, state })
     }
 
     /// The bound `ip:port`.
@@ -602,13 +571,6 @@ impl SglangServicerServer {
     /// Announce SERVING (`true`) or drain (`false`): health flips at once,
     /// new admission closes while in-flight streams keep running until `stop`.
     pub fn set_serving(&self, serving: bool) {
-        if !serving {
-            if let Some(managed) = &self.managed {
-                if let Err(error) = managed.drain() {
-                    tracing::warn!(%error, "managed drain failed");
-                }
-            }
-        }
         self.state.shared.set_serving(serving);
     }
 

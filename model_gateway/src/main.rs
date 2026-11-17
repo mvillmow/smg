@@ -3966,6 +3966,14 @@ mod tests {
         assert!(!already_on.enable_igw_for_discovery());
         assert!(already_on.routing.enable_igw);
 
+        let mut native_epd = cli_args_from(&[
+            "--backend",
+            "sglang",
+            "--epd-disaggregation",
+            "--service-discovery",
+        ]);
+        assert!(!native_epd.enable_igw_for_discovery());
+        assert!(!native_epd.routing.enable_igw);
         let mut no_discovery = cli_args_from(&[]);
         assert!(!no_discovery.enable_igw_for_discovery());
         assert!(!no_discovery.routing.enable_igw);

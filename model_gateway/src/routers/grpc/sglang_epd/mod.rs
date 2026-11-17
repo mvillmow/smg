@@ -1,9 +1,2 @@
-//! Explicit managed SGLang EPD. Legacy EPD never enters this executor.
-
-pub mod executor;
-pub mod planner;
-pub mod registry;
+//! SGLang prepared-input adaptation for the shared EPD pipeline.
 pub mod router;
-
-#[cfg(test)]
-mod tests;

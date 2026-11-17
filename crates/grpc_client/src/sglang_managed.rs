@@ -114,10 +114,6 @@ pub mod clock {
     }
 }
 
-#[expect(
-    clippy::allow_attributes,
-    reason = "generated tonic code controls these lint attributes"
-)]
 pub mod proto {
     #![allow(
         clippy::all,

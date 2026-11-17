@@ -7,25 +7,6 @@ from types import SimpleNamespace
 import pytest
 from smg_grpc_servicer.sglang.managed.config import complete
 from smg_grpc_servicer.sglang.managed.encoder_bridge import NativeReferences
-from smg_grpc_servicer.sglang.managed.encoder_service import FairQueue
-
-
-def test_drr_aging_admits_large_work_and_reclaims_tenant_state(monkeypatch):
-    """Small requests cannot indefinitely delay an aged large request."""
-    clock = [0.0]
-    monkeypatch.setattr(
-        "smg_grpc_servicer.sglang.managed.encoder_service.time.monotonic", lambda: clock[0]
-    )
-    queue = FairQueue(10, 2.0, {"small": 2})
-    large = SimpleNamespace(work=10000)
-    queue.put("large", large)
-    queue.put("small", SimpleNamespace(work=1))
-    assert queue.pop().work == 1
-    clock[0] = 3.0
-    queue.put("small", SimpleNamespace(work=1))
-    assert queue.pop() is large
-    queue.pop()
-    assert not queue.queues and not queue.deficits
 
 
 def test_native_send_reference_outlives_cancel_acknowledgement():
@@ -112,15 +93,12 @@ def test_request_payload_released_only_after_native_quiescence(monkeypatch, rele
         service = object.__new__(EncoderService)
         service.backend = SimpleNamespace(encoder=SimpleNamespace(release_request=release))
         service.cpu = asyncio.Semaphore(0)
-        service.config = {"max_cpu": 1, "image_token_id": 1}
-        service.cpu_target, service.cpu_active = 1, 1
-        service.cpu_changed = asyncio.Event()
+        service.config = {"max_cpu": 1, "image_token_id": 1, "max_staging_bytes_per_request": 1024}
+        service.cpu_active = 1
         service.execution = asyncio.BoundedSemaphore(1)
         await service.execution.acquire()
-        service._event = AsyncMock()
-        payload = SimpleNamespace(image_references=["x" * 1048576])
-        entry = Entry(None, 1, float("inf"), "rid", request=payload, cancelled=True)
-        entry.context_bytes = 1048576
+        payload = SimpleNamespace(mm_items=["x" * 1048576])
+        entry = Entry(1, float("inf"), "rid", request=payload, cancelled=True)
 
         class SendBuffer:
             """Stand in for an embedding held by a failed native send's frame."""
@@ -142,7 +120,7 @@ def test_request_payload_released_only_after_native_quiescence(monkeypatch, rele
         del sender
         task = asyncio.create_task(service._run(entry, execution_held=True))
         await asyncio.wait_for(releasing.wait(), 2)
-        assert entry.request is payload and entry.context_bytes == 1048576
+        assert entry.request is payload
         assert not entry.quiesced
         finish.set()
         await task
@@ -151,11 +129,11 @@ def test_request_payload_released_only_after_native_quiescence(monkeypatch, rele
         assert service.execution._value == (0 if release_fails else 1)
         if release_fails:
             assert service.draining
-            assert entry.request is payload and entry.context_bytes == 1048576
+            assert entry.request is payload
             assert not entry.quiesced
             assert references[0]() is not None
         else:
-            assert entry.request is None and entry.context_bytes == 0
+            assert entry.request is None
             assert entry.quiesced
             assert references[0]() is None
 
@@ -173,14 +151,14 @@ def native_args():
         encoder_transfer_backend="zmq_to_scheduler",
         disaggregation_bootstrap_port=43002,
         model_path="/models/qwen3",
-        revision=None,
+        revision="weights",
     )
 
 
 @pytest.mark.parametrize("role", ["encoder", "prefill", "decode"])
 def test_minimal_config_derives_contract_and_finite_bounds(role):
     """All roles share the same model contract without copying TP/dtype/transport settings."""
-    config = complete({"model_revision": "weights"}, native_args(), role)
+    config = complete(native_args(), role)
     contract = config if role == "encoder" else config["contract"]
     assert contract["model_revision"] == "weights"
     assert contract["tp_size"] == 2
@@ -195,29 +173,6 @@ def test_minimal_config_derives_contract_and_finite_bounds(role):
     if role == "encoder":
         assert config["control_listen"] == "0.0.0.0:43010"
         assert config["receive_endpoint"] == "http://10.0.0.1:43000"
-
-
-@pytest.mark.parametrize("role", ["encoder", "prefill", "decode"])
-@pytest.mark.parametrize("field,value", [("tp_size", 8), ("topology_contract", "single-host-tp8")])
-def test_explicit_contract_cannot_misadvertise_native_settings(role, field, value):
-    """A legacy explicit file must agree with the actual runtime."""
-    config = {"model_revision": "weights"}
-    if role == "encoder":
-        config[field] = value
-    else:
-        config["contract"] = {field: value}
-    with pytest.raises(ValueError, match="differs from native"):
-        complete(config, native_args(), role)
-
-
-def test_bounds_override_keeps_processor_concurrency_consistent():
-    """One CPU limit controls both admission and the Rust preprocessing pool."""
-    config = complete({"model_revision": "weights", "max_cpu": 4}, native_args(), "encoder")
-    assert config["processor_options"]["max_inflight"] == 4
-    with pytest.raises(ValueError, match="unknown managed"):
-        complete({"model_revision": "weights", "max_cup": 4}, native_args(), "encoder")
-    with pytest.raises(ValueError, match="pinned"):
-        complete({}, native_args(), "prefill")
 
 
 @pytest.mark.parametrize(
@@ -235,15 +190,7 @@ def test_native_layout_cannot_advertise_an_unsupported_topology(field, value):
     args = native_args()
     setattr(args, field, value)
     with pytest.raises(ValueError, match="does not support"):
-        complete({"model_revision": "weights"}, args, "prefill")
-
-
-def test_encoder_nested_contract_cannot_override_native_tp():
-    """Legacy nested contracts obey the same runtime fence as encoder top-level fields."""
-    with pytest.raises(ValueError, match="differs from native"):
-        complete(
-            {"model_revision": "weights", "contract": {"tp_size": 8}}, native_args(), "encoder"
-        )
+        complete(args, "prefill")
 
 
 @pytest.mark.parametrize("backend", ["mooncake", "zmq_to_scheduler"])
@@ -253,7 +200,7 @@ def test_receiver_fanout_preserves_memory_bound_and_advertised_capacity(backend)
 
     args = native_args()
     args.encoder_transfer_backend = backend
-    config = complete({"model_revision": "weights"}, args, "encoder")
+    config = complete(args, "encoder")
     config["generation"] = "generation"
     service = EncoderService(config, SimpleNamespace(scheduler=None), None)
     assert config["max_receivers"] == 8
@@ -345,19 +292,18 @@ def test_queued_cancel_does_not_wait_for_or_release_a_native_execution_slot(monk
         monkeypatch.setattr(parent, "server", server, raising=False)
 
     async def scenario():
-        config = complete({"model_revision": "weights"}, native_args(), "encoder")
+        config = complete(native_args(), "encoder")
         config["generation"] = "generation"
         backend = SimpleNamespace(
             scheduler=None, encoder=SimpleNamespace(release_request=AsyncMock())
         )
         service = EncoderService(config, backend, None)
-        service._event = AsyncMock()
         for _ in range(service.execution_capacity):
             await service.execution.acquire()
-        entry = Entry(None, 1, float("inf"), "cancelled", request=object(), context_bytes=64)
-        sibling = Entry(None, 1, float("inf"), "sibling")
-        service.queue.put("tenant", entry)
-        service.queue.put("tenant", sibling)
+        entry = Entry(1, float("inf"), "cancelled", request=object())
+        sibling = Entry(1, float("inf"), "sibling")
+        service.queue.append(entry)
+        service.queue.append(sibling)
         waiting, failure = asyncio.Event(), asyncio.Event()
         metadata.publish.side_effect = lambda *_args, **_kwargs: failure.set()
 
@@ -372,11 +318,11 @@ def test_queued_cancel_does_not_wait_for_or_release_a_native_execution_slot(monk
         await asyncio.wait_for(entry.task, 1)
         await reader
         metadata.publish.assert_awaited_once()
-        assert entry.quiesced and entry.request is None and entry.context_bytes == 0
+        assert entry.quiesced and entry.request is None
         assert service.execution._value == 0
         assert service.cpu._value == config["max_cpu"]
-        assert service.queue.pop() is sibling
-        assert not service.queue.queues and not service.queue.deficits
+        assert service.queue.popleft() is sibling
+        assert not service.queue
         backend.encoder.release_request.assert_awaited_once_with("cancelled")
 
     asyncio.run(scenario())
@@ -422,13 +368,10 @@ def test_cancelled_queued_encode_retires_early_receiver_control(monkeypatch, kin
             )
         )
         entry = Entry(
-            None,
             1,
             float("inf"),
             "rid",
-            request=SimpleNamespace(
-                receiver_binding=SimpleNamespace(bootstrap=SimpleNamespace(host="10.0.0.2"))
-            ),
+            request=SimpleNamespace(prefill_host="10.0.0.2"),
         )
         service.part = AsyncMock(return_value=entry)
         task = asyncio.create_task(
@@ -464,7 +407,6 @@ def test_zmq_abandonment_wakes_native_wait_without_releasing_active_send(
     import sys
     from unittest.mock import AsyncMock, Mock
 
-    from smg_grpc_proto.generated import sglang_managed_pb2 as pb
     from smg_grpc_proto.generated import sglang_scheduler_pb2 as sg
     from smg_grpc_servicer.sglang.managed.encoder_service import EncoderService, Entry
 
@@ -507,15 +449,11 @@ def test_zmq_abandonment_wakes_native_wait_without_releasing_active_send(
         )
         service.submitter = object()
         service.cpu = asyncio.Semaphore(0)
-        service.config = {"max_cpu": 1, "image_token_id": 1}
-        service.cpu_target, service.cpu_active = 1, 1
-        service.cpu_changed = asyncio.Event()
+        service.config = {"max_cpu": 1, "image_token_id": 1, "max_staging_bytes_per_request": 1024}
+        service.cpu_active = 1
         service.execution = asyncio.BoundedSemaphore(1)
         await service.execution.acquire()
-        service._event = AsyncMock()
-        entry = Entry(
-            None, 1, float("inf"), "rid", request=SimpleNamespace(image_references=["image"])
-        )
+        entry = Entry(1, float("inf"), "rid", request=SimpleNamespace(mm_items=["image"]))
         if expire:
 
             async def expire_after_native_start():
@@ -525,34 +463,31 @@ def test_zmq_abandonment_wakes_native_wait_without_releasing_active_send(
             # Exercise deadline expiry only after native ownership exists; CPU
             # scheduling delays must not turn this into a pre-admission test.
             entry.cancellation.wait = expire_after_native_start
-        entry.context_bytes = 1024
         entry.task = asyncio.create_task(service._run(entry, execution_held=True))
         await asyncio.wait_for(started.wait(), 1)
         if not expire:
             service._cancel(entry)
         await asyncio.wait_for(abandoned.wait(), 1)
         assert entry.cancelled
-        assert entry.context_bytes == 1024 and not entry.quiesced
+        assert entry.request is not None and not entry.quiesced
         encoder.release_request.assert_not_awaited()
         assert service.execution._value == 0
         if abandon_fails:
             assert service.draining
-            assert any(call.kwargs.get("error") for call in service._event.call_args_list)
+            assert isinstance(entry.error, str) and entry.error
         finish.set()
         await asyncio.wait_for(entry.task, 1)
         if abandon_fails:
             assert service.draining and entry.terminal
-            assert not entry.quiesced and entry.context_bytes == 1024
+            assert not entry.quiesced
             assert service.execution._value == 0
             encoder.release_request.assert_not_awaited()
             encoder.clear_abandoned_request.assert_not_called()
             return
         encoder.release_request.assert_awaited_once_with("rid")
         encoder.clear_abandoned_request.assert_called_once_with("rid")
-        assert not any(
-            call.kwargs.get("stage") == pb.DELIVERED for call in service._event.call_args_list
-        )
-        assert entry.quiesced and entry.context_bytes == 0 and service.execution._value == 1
+        assert isinstance(entry.error, str) and entry.error
+        assert entry.quiesced and service.execution._value == 1
 
     asyncio.run(scenario())
 
@@ -601,52 +536,6 @@ def test_artifact_materialization_keeps_control_loop_live_and_owns_cpu_work(canc
         asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("batch_size", [2, 8])
-@pytest.mark.parametrize("busy,pending,expected", [(False, 0, 3), (True, 0, 2), (False, 1, 2)])
-def test_cpu_supply_grows_only_when_native_encoder_needs_input(busy, pending, expected, batch_size):
-    """Backlogged CPU producers grow only at an idle native completion boundary."""
-    import asyncio
-    from unittest.mock import AsyncMock
-
-    from smg_grpc_servicer.sglang.managed.encoder_service import EncoderService
-
-    async def scenario():
-        config = complete({"model_revision": "weights", "max_cpu": 4}, native_args(), "encoder")
-        config["generation"] = "generation"
-        queue, lock = asyncio.Queue(), asyncio.Lock()
-        for _ in range(pending):
-            queue.put_nowait(object())
-        if busy:
-            await lock.acquire()
-        backend = SimpleNamespace(
-            scheduler=SimpleNamespace(pending_queue=queue, max_batch_size=batch_size),
-            encoder=SimpleNamespace(encode_dispatch_lock=lock),
-        )
-        service = EncoderService(config, backend, None)
-        service._event = AsyncMock()
-        service.parts["rid"] = SimpleNamespace(gpu_work=1)
-        service.queue.put("tenant", object())
-        for _ in range(2):
-            await service.cpu.acquire()
-            service.cpu_active += 1
-        await service._encoded("rid")
-        assert service.cpu_target == expected
-        # Multiple request callbacks from the same native batch cannot multiply growth.
-        await service._encoded("rid")
-        assert service.cpu_target == expected
-        assert service.cpu_active == 2
-        # Backpressure changes future grants; the running owners remain charged.
-        queue.put_nowait(object())
-        queue.put_nowait(object())
-        service._release_cpu()
-        assert service.cpu_target == 2
-        assert service.cpu_active == 1 and service.cpu._value == 3
-        service._release_cpu()
-        assert service.cpu_active == 0 and service.cpu._value == 4
-
-    asyncio.run(scenario())
-
-
 def test_cpu_capacity_respects_affinity_and_container_quota(monkeypatch):
     """Host core counts must not override a smaller container CPU allocation."""
     from smg_grpc_servicer.sglang.managed import config
@@ -663,7 +552,7 @@ def test_adaptive_cpu_limit_rejects_invalid_processor_bound(processor_limit):
     """A zero or nonintegral hard ceiling must fail instead of stalling dispatch."""
     from smg_grpc_servicer.sglang.managed.config import encoder_cpu_limit
 
-    config = complete({"model_revision": "weights"}, native_args(), "encoder")
+    config = complete(native_args(), "encoder")
     config["processor_options"]["max_inflight"] = processor_limit
     with pytest.raises(ValueError, match="positive integer"):
         encoder_cpu_limit(config, 8)
@@ -673,7 +562,8 @@ def test_adaptive_cpu_limit_intersects_native_memory_and_host_bounds(monkeypatch
     """An explicit ceiling cannot overrun actual CPU or retained tensor capacity."""
     from smg_grpc_servicer.sglang.managed import config as settings
 
-    config = complete({"model_revision": "weights", "max_cpu": 32}, native_args(), "encoder")
+    config = complete(native_args(), "encoder")
+    config["max_cpu"] = config["processor_options"]["max_inflight"] = 32
     monkeypatch.setattr(settings, "available_cpus", lambda: 16)
     assert settings.encoder_cpu_limit(config, 1) == 2
     assert settings.encoder_cpu_limit(config, 32) == settings.encoder_window(config)[0]
@@ -686,7 +576,7 @@ def test_native_revision_needs_no_managed_config_file(role):
     """Existing native identity and role arguments are sufficient for default deployment."""
     args = native_args()
     args.revision = "pinned-weights"
-    config = complete({}, args, role)
+    config = complete(args, role)
     contract = config if role == "encoder" else config["contract"]
     assert contract["model_revision"] == args.revision
     assert contract["tp_size"] == args.tp_size
@@ -716,7 +606,7 @@ def test_wildcard_bind_uses_native_address_discovery(monkeypatch, bind_host):
     args = native_args()
     args.host = bind_host
     args.revision = "weights"
-    config = complete({}, args, "encoder")
+    config = complete(args, "encoder")
     assert config["receive_endpoint"] == "http://10.0.0.2:43000"
     assert config["worker_id"] == "encoder-10.0.0.2:43000"
 
@@ -763,18 +653,6 @@ def test_materialized_pixels_remain_owned_after_artifact_release(batch_size):
     assert result.grid_thw.tolist() == [[1, 2, 2]] * batch_size
 
 
-@pytest.mark.parametrize("role", ["encoder", "prefill", "decode"])
-@pytest.mark.parametrize(
-    "override", [{"model_revision": "other"}, {"contract": {"model_revision": "other"}}]
-)
-def test_contract_revision_cannot_replace_native_revision(role, override):
-    """A manually supplied identity must not misrepresent the revision loaded by the engine."""
-    args = native_args()
-    args.revision = "native-weights"
-    with pytest.raises(ValueError, match="model_revision differs"):
-        complete(override, args, role)
-
-
 def test_receiver_recognizes_pre311_asyncio_timeout(monkeypatch):
     """Python 3.10 asyncio.TimeoutError is distinct from the builtin exception."""
     from smg_grpc_servicer.sglang.managed.launch import receiver_error
@@ -786,39 +664,33 @@ def test_receiver_recognizes_pre311_asyncio_timeout(monkeypatch):
     assert receiver_error(AsyncTimeout("expired"))[1] == 504
 
 
-def test_admitted_operation_does_not_retain_request_arena():
-    """Replay identity is detached from the actual protobuf request carrying media."""
-    from smg_grpc_servicer.sglang.managed.encoder_service import EncoderService, pb
+def test_native_encode_refuses_duplicate_and_stale_instance(monkeypatch):
+    """The standard encoder wire retains one owner and never replays a completed rid."""
+    from smg_grpc_proto.generated import sglang_encoder_pb2 as ep
+    from smg_grpc_servicer.sglang.managed.encoder_service import EncoderService, Rejected
+
+    monkeypatch.setattr("smg_grpc_servicer.sglang.managed.encoder_service.healthy", lambda _: True)
 
     async def scenario():
-        config = complete({"model_revision": "weights"}, native_args(), "encoder")
+        config = complete(native_args(), "encoder")
         config["generation"] = "generation"
-        backend = SimpleNamespace(
-            scheduler=None, encoder=SimpleNamespace(transfer_backend="zmq_to_scheduler")
+        service = EncoderService(config, SimpleNamespace(scheduler=None), None)
+        request = ep.EncodeRequest(
+            req_id="generation.r_local_part_0", mm_items=["image"], num_parts=1, prefill_host="p"
         )
-        service = EncoderService(config, backend, None)
-        # This regression isolates the admitted message's ownership, not fence validation.
-        service._operation = lambda _operation: None
-        service._budget = lambda _budget: float("inf")
-        request = pb.EncodeRequest(
-            version=1, image_references=["data:image/png;base64," + "A" * 1024]
+        entry = service._admit(request, 120)
+        assert entry.rid == request.req_id and entry.request is request
+        load = (await service.GetLoads(None, None)).loads[0]
+        assert (load.num_running_reqs, load.num_waiting_reqs, load.max_running_requests) == (
+            0,
+            1,
+            64,
         )
-        request.operation.operation_id = "owned"
-        request.receiver_binding.prefill_rid = "generation.request"
-        request.receiver_binding.model_revision = "weights"
-        request.receiver_binding.processor_contract = config["processor_contract"]
-        request.transfer_backend = "zmq_to_scheduler"
-        request.plan.receiver_rid = "generation.request"
-        request.plan.image_counts.append(1)
-        request.plan.encoder_receive_endpoints.append(config["receive_endpoint"])
-        request.plan.parts.add(
-            native_part_rid="generation.request_local_part_0", ordered_item_ids=[0]
-        )
-        entry = service._admit(request)
-        request.operation.operation_id = "mutated-parent"
-        request.ClearField("image_references")
-        entry.request = None
-        assert entry.operation.operation_id == "owned"
+        with pytest.raises(Rejected, match="duplicate"):
+            service._admit(request, 120)
+        request.req_id = "old.r"
+        with pytest.raises(Rejected, match="stale"):
+            service._admit(request, 120)
 
     asyncio.run(scenario())
 
@@ -829,9 +701,9 @@ def test_collection_preserves_unknown_work_and_original_retention_horizon():
 
     service = object.__new__(EncoderService)
     service.config = {"retention_ms": 10}
-    expired = Entry(None, 99, 0, "expired", quiesced=True)
-    boundary = Entry(None, 100, 0, "boundary", quiesced=True)
-    unknown = Entry(None, 1, 0, "unknown", terminal=True, quiesced=False)
+    expired = Entry(99, 0, "expired", quiesced=True)
+    boundary = Entry(100, 0, "boundary", quiesced=True)
+    unknown = Entry(1, 0, "unknown", terminal=True, quiesced=False)
     service.entries = {entry.rid: entry for entry in (expired, boundary, unknown)}
     service.parts = dict(service.entries)
     service._collect(110)

@@ -115,6 +115,7 @@ pub(super) async fn generate(
         early_identity = Some(sg::GenerateResponse {
             request_id: req.request_id.clone(),
             media_identity: Some(identity),
+            prepared_input: Vec::new(),
             response: None,
         });
     }

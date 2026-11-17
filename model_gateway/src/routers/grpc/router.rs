@@ -70,7 +70,6 @@ use crate::{
 /// but EPD.
 #[derive(Clone)]
 pub struct GrpcRouter {
-    prepared_input: Option<Arc<super::sglang_epd::router::PreparedInputAdapter>>,
     worker_registry: Arc<WorkerRegistry>,
     mode: Mode,
     pipeline: RequestPipeline,
@@ -88,16 +87,6 @@ pub struct GrpcRouter {
 }
 
 impl GrpcRouter {
-    /// Compose protocol readiness with standard P/D registration.
-    pub(crate) fn maintain_prepared_readiness(
-        &self,
-        probe: Arc<crate::health::ProbeState>,
-    ) -> Option<tokio::task::JoinHandle<()>> {
-        self.prepared_input.as_ref().map(|adapter| {
-            adapter.maintain_readiness(probe, self.shared_components.tokenizer_registry.clone())
-        })
-    }
-
     /// Regular and PD build the Harmony pipeline and responses contexts and
     /// require the MCP orchestrator; EPD leaves them `None` and 501s those
     /// endpoints. Embedding/classify pipelines are Regular-only.
@@ -278,7 +267,6 @@ impl GrpcRouter {
         };
 
         Ok(GrpcRouter {
-            prepared_input,
             worker_registry,
             mode,
             pipeline,

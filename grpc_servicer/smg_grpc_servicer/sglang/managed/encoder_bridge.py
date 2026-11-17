@@ -216,9 +216,8 @@ class OwnedBatchSubmitter:
     Admission and deadlines belong to the managed registry surrounding this adapter.
     """
 
-    def __init__(self, scheduler, on_encoded):
+    def __init__(self, scheduler):
         self.scheduler = scheduler
-        self.on_encoded = on_encoded
 
     async def submit(self, request):
         """Enqueue once and await real batch completion; never cancel its shared future."""
@@ -226,7 +225,4 @@ class OwnedBatchSubmitter:
 
         pending = PendingRequest(request, asyncio.get_running_loop())
         self.scheduler.pending_queue.put_nowait(pending)
-        result = await asyncio.shield(pending.future)
-        if result[3] is None:
-            await self.on_encoded(request["req_id"])
-        return result
+        return await asyncio.shield(pending.future)

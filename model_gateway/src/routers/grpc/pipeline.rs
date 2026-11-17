@@ -363,11 +363,7 @@ impl RequestPipeline {
         let worker_selection = WorkerSelectionStage::new(
             deps.worker_registry.clone(),
             deps.policy_registry.clone(),
-            if deps.prepared_input.is_some() {
-                Mode::PrefillDecode.worker_selection()
-            } else {
-                mode.worker_selection()
-            },
+            mode.worker_selection(),
             deps.prefill_admission.clone(),
         )
         .with_queue_timeout(deps.queue_timeout);
@@ -549,9 +545,13 @@ impl RequestPipeline {
                         &ctx.input.model_id,
                         response,
                     );
-                    if response.extensions().get::<ReportedRefusal>().is_some() {
-                        // The one line this refusal gets was written
-                        // (rate-limited, with the pool's state).
+                    if response.extensions().get::<ReportedRefusal>().is_some()
+                        || response.status().is_client_error()
+                    {
+                        // A refusal is the gateway's answer, not a failure of
+                        // its own: a reported one has its line from the stage
+                        // that refused, any other 4xx the access log's WARN
+                        // line.
                         debug!(
                             "Stage {} refused the request with status {}",
                             $stage,
@@ -572,7 +572,7 @@ impl RequestPipeline {
             })?;
             // Text-only requests use the existing PD dispatch, admission and cleanup.
             // The prepared-input protocol is needed only for encoder output.
-            if prepared.has_media() {
+            if let Some(prepared) = prepared {
                 ctx.state.encode_outputs = Some(EncodeOutputs::PreparedInput(Box::new(prepared)));
             }
         }
@@ -581,20 +581,9 @@ impl RequestPipeline {
             stages.preparation.name(),
             stages.preparation.execute(ctx).await
         )?;
-        if matches!(
-            ctx.state.encode_outputs,
-            Some(EncodeOutputs::PreparedInput(_))
-        ) {
-            // References are retained by the protocol adapter. Neither the
-            // shared builder nor P/D may fetch or preprocess them again.
-            ctx.state.multimodal_refs = None;
-        }
+        step!("RateLimitReserve", stages.rate_limit.execute(ctx).await)?;
         step!(
-            stages.rate_limit.name(),
-            stages.rate_limit.execute(ctx).await
-        )?;
-        step!(
-            stages.worker_selection.name(),
+            "WorkerSelection",
             stages.worker_selection.execute(ctx).await
         )?;
         let workers = stage_output(ctx.state.workers.as_ref(), "run_ingress")?;

@@ -411,14 +411,22 @@ impl PDRouter {
                     // routers (504 under its code), never as the worker's
                     // transport failing.
                     Err(e) if is_request_timeout(&e) => {
-                        error!("Response body read timed out: {}", e);
+                        error!(
+                            worker = Endpoint::redacted_str(worker.url()),
+                            "Response body read timed out: {}",
+                            cause(&e)
+                        );
                         request_timeout_response(format!(
                             "Failed to read response body: {}",
                             cause(&e)
                         ))
                     }
                     Err(e) => {
-                        error!("Failed to read response body: {}", e);
+                        error!(
+                            worker = Endpoint::redacted_str(worker.url()),
+                            "Failed to read response body: {}",
+                            cause(&e)
+                        );
                         error::bad_gateway(
                             "read_response_body_failed",
                             format!("Failed to read response body: {}", cause(&e)),
@@ -457,7 +465,11 @@ impl PDRouter {
                 }
             }
             Err(e) => {
-                error!("Failed to proxy request server: {}", e);
+                error!(
+                    worker = Endpoint::redacted_str(worker.url()),
+                    "Failed to proxy request server: {}",
+                    cause(&e)
+                );
                 error::internal_error(
                     "proxy_request_failed",
                     format!("Failed to proxy request: {}", cause(&e)),
@@ -551,8 +563,9 @@ impl PDRouter {
 
     /// The bootstrap rendezvous for one request, generated once so both sides
     /// carry the same rooms: one value per prompt for a batch, scalars
-    /// otherwise. With a selected prefill DP rank on a worker of `dp_size > 1`,
-    /// every room is congruent to that rank; otherwise the rooms are free.
+    /// otherwise. With a selected prefill DP rank on a worker whose `dp_size`
+    /// is above 1 and below `i64::MAX`, every room is congruent to that rank;
+    /// otherwise the rooms are free.
     fn bootstrap_fields(
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
@@ -560,11 +573,18 @@ impl PDRouter {
     ) -> serde_json::Result<BootstrapFields> {
         let host = prefill_worker.bootstrap_host();
         let port = prefill_worker.bootstrap_port();
+        // At or above the room's range the ranked draw's range,
+        // `0..i64::MAX - dp_size`, would be empty.
         let room_rank = match (prefill_rank, prefill_worker.dp_size()) {
-            (Some(rank), Some(dp_size)) if dp_size > 1 => usize::try_from(rank)
-                .ok()
-                .filter(|&rank| rank < dp_size)
-                .map(|rank| (rank, dp_size)),
+            (Some(rank), Some(dp_size))
+                if dp_size > 1
+                    && i64::try_from(dp_size).is_ok_and(|dp_size| dp_size < i64::MAX) =>
+            {
+                usize::try_from(rank)
+                    .ok()
+                    .filter(|&rank| rank < dp_size)
+                    .map(|rank| (rank, dp_size))
+            }
             _ => None,
         };
         let room = || match room_rank {
@@ -1427,7 +1447,11 @@ impl PDRouter {
                     let mut drained = StatusCode::OK;
                     while let Some(chunk) = chunks.next().await {
                         if let Err(e) = chunk {
-                            warn!("Error consuming prefill response: {e}");
+                            warn!(
+                                worker = Endpoint::redacted_str(prefill.url()),
+                                "Error consuming prefill response: {}",
+                                cause(&e)
+                            );
                             drained = StatusCode::BAD_GATEWAY;
                             break;
                         }
@@ -1482,17 +1506,28 @@ impl PDRouter {
         let (prefill_body, (decode_head_elapsed, decode_response)) = match pd_result {
             Ok(pair) => pair,
             Err(DispatchError::Transport(side, e)) => {
+                let worker = match side {
+                    PdSide::Prefill => &prefill,
+                    PdSide::Decode => &decode,
+                };
                 // The request's own timeout on either side is the request's
                 // end (see `retry::request_timeout_response`); the caller
                 // records the 504 on both workers as it records every status.
                 if is_request_timeout(&e) {
-                    error!("PD request timed out, both sides aborted: {e}");
+                    error!(
+                        worker = Endpoint::redacted_str(worker.url()),
+                        worker_type = side.name(),
+                        "PD request timed out, both sides aborted: {}",
+                        cause(&e)
+                    );
                     return request_timeout_response(format!("Transport error: {}", cause(&e)));
                 }
                 error!(
+                    worker = Endpoint::redacted_str(worker.url()),
                     worker_type = side.name(),
-                    "PD {} request failed below HTTP, both sides aborted: {e}",
-                    side.name()
+                    "PD {} request failed below HTTP, both sides aborted: {}",
+                    side.name(),
+                    cause(&e)
                 );
                 // Don't record_outcome here — the caller (execute_dual_dispatch)
                 // records outcomes from the response status after we return.
@@ -2073,6 +2108,7 @@ impl PDRouter {
             let mut response = if context.return_logprob {
                 self.process_non_streaming_response(
                     decode_response,
+                    decode.as_ref(),
                     status,
                     context.return_logprob,
                     prefill_body,
@@ -2091,11 +2127,19 @@ impl PDRouter {
                         response
                     }
                     Err(e) if is_request_timeout(&e) => {
-                        error!("Decode response timed out: {e}");
+                        error!(
+                            worker = Endpoint::redacted_str(decode.url()),
+                            "Decode response timed out: {}",
+                            cause(&e)
+                        );
                         request_timeout_response(format!("Failed to read response: {}", cause(&e)))
                     }
                     Err(e) => {
-                        error!("Failed to read decode response: {}", e);
+                        error!(
+                            worker = Endpoint::redacted_str(decode.url()),
+                            "Failed to read decode response: {}",
+                            cause(&e)
+                        );
                         PdSide::Decode.answer(SidePhase::Stream, StatusCode::BAD_GATEWAY, cause(&e))
                     }
                 }
@@ -2310,6 +2354,7 @@ impl PDRouter {
     async fn process_non_streaming_response(
         &self,
         res: reqwest::Response,
+        decode: &dyn Worker,
         status: StatusCode,
         return_logprob: bool,
         prefill_body: Option<Bytes>,
@@ -2318,11 +2363,19 @@ impl PDRouter {
         let decode_body = match response {
             Ok(decode_body) => decode_body,
             Err(e) if is_request_timeout(&e) => {
-                error!("Decode response timed out: {e}");
+                error!(
+                    worker = Endpoint::redacted_str(decode.url()),
+                    "Decode response timed out: {}",
+                    cause(&e)
+                );
                 return request_timeout_response(format!("Failed to read response: {}", cause(&e)));
             }
             Err(e) => {
-                error!("Failed to read decode response: {}", e);
+                error!(
+                    worker = Endpoint::redacted_str(decode.url()),
+                    "Failed to read decode response: {}",
+                    cause(&e)
+                );
                 return PdSide::Decode.answer(
                     SidePhase::Stream,
                     StatusCode::BAD_GATEWAY,
@@ -2387,7 +2440,11 @@ impl PDRouter {
             match prefill_response.bytes().await {
                 Ok(body) => Some(body),
                 Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
+                    warn!(
+                        worker = Endpoint::redacted_str(prefill_url),
+                        "Failed to read prefill response body for logprobs: {}",
+                        cause(&e)
+                    );
                     None
                 }
             }
@@ -2396,7 +2453,11 @@ impl PDRouter {
             debug!("Consuming prefill response body (non-logprob request)");
             match prefill_response.bytes().await {
                 Ok(_) => debug!("Prefill response consumed successfully"),
-                Err(e) => warn!("Error consuming prefill response: {}", e),
+                Err(e) => warn!(
+                    worker = Endpoint::redacted_str(prefill_url),
+                    "Error consuming prefill response: {}",
+                    cause(&e)
+                ),
             }
             None
         };
@@ -4190,6 +4251,243 @@ mod tests {
         );
     }
 
+    /// A server whose answer's head and first bytes leave at once and whose
+    /// body then breaks off, on every path and method: a worker that dies
+    /// mid-answer.
+    async fn spawn_cut_body_stub() -> String {
+        let app = axum::Router::new().fallback(axum::routing::any(|| async {
+            let head = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                b"{\"partial\":",
+            ))]);
+            let cut = futures_util::stream::once(async {
+                // The head and the first bytes are read before the cut.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                Err::<Bytes, std::io::Error>(std::io::Error::other("the engine went away"))
+            });
+            (
+                [(CONTENT_TYPE, "application/json")],
+                Body::from_stream(head.chain(cut)),
+            )
+        }));
+        spawn_stub(app).await
+    }
+
+    /// Every line this router writes about a call that failed below HTTP
+    /// names its worker by the masked address and gives the HTTP client's
+    /// reason without the client's URL. The client ends its error text with
+    /// the URL it called, query included, after a failed send and a failed
+    /// body read alike, so each row registers its failing worker with a
+    /// token in the address's query and reads the row's line: three for the
+    /// proxied GET, two for the parallel dispatch, four for the decode body
+    /// (cut and timed out, with and without logprobs) and two for the
+    /// prefill body.
+    /// Every row is read to its end, so one run names every line that is
+    /// written another way. (The line about a prefill body drained in the
+    /// background is written from a detached task, outside this capture.)
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_failed_calls_line_names_the_worker_masked_without_the_clients_url() {
+        use PdSide::{Decode, Prefill};
+
+        // What a row's failing server does: nothing listens at its address;
+        // it takes the request and answers nothing in the request's time; its
+        // head and first bytes leave and the body breaks off, or never ends.
+        #[derive(Clone, Copy, Debug)]
+        enum Server {
+            Unreachable,
+            Silent,
+            Cut,
+            Stalled,
+        }
+        use Server::{Cut, Silent, Stalled, Unreachable};
+
+        // The call a row makes: the proxied GET, or one unstreamed chat with
+        // the failing server on a side, with logprobs asked or not.
+        #[derive(Clone, Copy, Debug)]
+        enum Call {
+            ProxiedGet,
+            Chat(PdSide, bool),
+        }
+        use Call::{Chat, ProxiedGet};
+
+        const BAD_GATEWAY: StatusCode = StatusCode::BAD_GATEWAY;
+        const GATEWAY_TIMEOUT: StatusCode = StatusCode::GATEWAY_TIMEOUT;
+
+        // (the line's words, the call, the failing server, the answer)
+        let rows = [
+            (
+                "Failed to proxy request server",
+                ProxiedGet,
+                Unreachable,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            ("Failed to read response body", ProxiedGet, Cut, BAD_GATEWAY),
+            (
+                "Response body read timed out",
+                ProxiedGet,
+                Stalled,
+                GATEWAY_TIMEOUT,
+            ),
+            (
+                "PD request timed out, both sides aborted",
+                Chat(Prefill, false),
+                Silent,
+                GATEWAY_TIMEOUT,
+            ),
+            (
+                "request failed below HTTP, both sides aborted",
+                Chat(Decode, false),
+                Unreachable,
+                BAD_GATEWAY,
+            ),
+            (
+                "Failed to read decode response",
+                Chat(Decode, false),
+                Cut,
+                BAD_GATEWAY,
+            ),
+            (
+                "Failed to read decode response",
+                Chat(Decode, true),
+                Cut,
+                BAD_GATEWAY,
+            ),
+            (
+                "Decode response timed out",
+                Chat(Decode, false),
+                Stalled,
+                GATEWAY_TIMEOUT,
+            ),
+            (
+                "Decode response timed out",
+                Chat(Decode, true),
+                Stalled,
+                GATEWAY_TIMEOUT,
+            ),
+            (
+                "Error consuming prefill response",
+                Chat(Prefill, false),
+                Cut,
+                StatusCode::OK,
+            ),
+            (
+                "Failed to read prefill response body for logprobs",
+                Chat(Prefill, true),
+                Cut,
+                StatusCode::OK,
+            ),
+        ];
+
+        let client = Arc::new(
+            http_client_builder()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .unwrap(),
+        );
+        let worker_at = |url: String, worker_type: WorkerType| -> Arc<dyn Worker> {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Sglang)
+                .http_client(Arc::clone(&client))
+                .build();
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            Arc::new(worker)
+        };
+
+        let mut wrong = Vec::new();
+        let mut lines_wanted = Vec::new();
+        for (what, call, server, status) in rows {
+            let (url, _refused) = match server {
+                Unreachable => {
+                    let refused = RefusedAddress::reserve();
+                    (refused.http_url(), Some(refused))
+                }
+                Silent => (
+                    spawn_delayed_stub(
+                        StatusCode::OK,
+                        json!({}),
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                    .0,
+                    None,
+                ),
+                Cut => (spawn_cut_body_stub().await, None),
+                Stalled => (spawn_stalled_body_stub().await, None),
+            };
+            let registered = format!("{url}?token=s3cret");
+            let answered = match call {
+                ProxiedGet => {
+                    let worker = worker_at(registered, WorkerType::Prefill);
+                    PDRouter::proxy_to_worker(&worker, "get_server_info", None)
+                        .await
+                        .status()
+                }
+                Chat(side, logprobs) => {
+                    let healthy = healthy_stub(Shape::Parallel, side.partner()).await;
+                    let (prefill_url, decode_url) = match side {
+                        Prefill => (registered, healthy),
+                        Decode => (healthy, registered),
+                    };
+                    let router = single_attempt_router();
+                    for (url, worker_type) in [
+                        (prefill_url, WorkerType::Prefill),
+                        (decode_url, WorkerType::Decode),
+                    ] {
+                        router
+                            .worker_registry
+                            .register_or_replace(worker_at(url, worker_type));
+                    }
+                    let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+                    let request = serde_json::from_value(json!({
+                        "model": "m",
+                        "logprobs": logprobs,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    }))
+                    .expect("valid chat request");
+                    router
+                        .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                        .await
+                        .status()
+                }
+            };
+            if answered != status {
+                wrong.push(format!(
+                    "{what:?} ({call:?} on {server:?}): answered {answered}, not {status}"
+                ));
+            }
+            // The masked address of these workers is the address without its query.
+            lines_wanted.push((what, url));
+        }
+
+        logs_assert(|lines: &[&str]| {
+            let mut wrong = wrong.clone();
+            for (what, masked) in &lines_wanted {
+                let named: Vec<_> = lines
+                    .iter()
+                    .filter(|line| line.contains(*what) && line.contains(masked.as_str()))
+                    .collect();
+                if named.is_empty() {
+                    wrong.push(format!("{what:?}: no such line names {masked}"));
+                } else if let Some(line) = named.iter().find(|line| line.contains("s3cret")) {
+                    wrong.push(format!(
+                        "{what:?}: the line carries the client's URL: {line}"
+                    ));
+                }
+            }
+            if wrong.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} findings over {} rows:\n{}",
+                    wrong.len(),
+                    lines_wanted.len(),
+                    wrong.join("\n")
+                ))
+            }
+        });
+    }
+
     #[tokio::test]
     async fn messages_and_responses_dispatch_to_their_worker_routes() {
         let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
@@ -5190,6 +5488,99 @@ mod tests {
             Some(&Value::from("eng0"))
         );
         assert_eq!(body.get("bootstrap_room"), None, "no bootstrap on vLLM PD");
+    }
+
+    /// What a Mooncake pair's two sides are sent for one chat request, the
+    /// prefill body first. The prefill engine's id was discovered
+    /// (`engine_id`) or was not, and its server answers with handoff params
+    /// of its own, which neither Mooncake form relays.
+    async fn sent_to_a_mooncake_pair(engine_id: Option<&str>) -> [Value; 2] {
+        let (prefill_url, prefill_seen) =
+            spawn_recording_stub(r#"{"kv_transfer_params":{"remote_engine_id":"its-own"}}"#).await;
+        let (decode_url, decode_seen) =
+            spawn_recording_stub(r#"{"object":"chat.completion"}"#).await;
+        let mut prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MooncakeConnector")
+            .bootstrap_port(Some(9123));
+        if let Some(engine_id) = engine_id {
+            prefill = prefill.kv_engine_id(engine_id);
+        }
+        let decode = BasicWorkerBuilder::new(decode_url)
+            .worker_type(WorkerType::Decode)
+            .runtime_type(RuntimeType::Vllm);
+        let router = create_test_pd_router();
+        for worker in [prefill.build(), decode.build()] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        let response = router
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        [(prefill_seen, "prefill"), (decode_seen, "decode")].map(|(seen, side)| {
+            let mut requests = taken(&seen);
+            assert_eq!(requests.len(), 1, "exactly one {side} request");
+            let (path, body) = requests.remove(0);
+            assert_eq!(path, "/v1/chat/completions", "{side}");
+            body
+        })
+    }
+
+    /// A Mooncake pair whose prefill engine's id was discovered: one minted
+    /// transfer id goes to both sides. The prefill side pins its blocks
+    /// under it; the decode side pulls them by it from the prefill engine's
+    /// bootstrap address.
+    #[tokio::test]
+    async fn vllm_pd_mooncake_mints_one_transfer_id_for_both_sides() {
+        let [prefill, decode] = sent_to_a_mooncake_pair(Some("eng0")).await;
+        let transfer_id = prefill
+            .pointer("/kv_transfer_params/transfer_id")
+            .and_then(Value::as_str)
+            .expect("a transfer id on the prefill side");
+        assert!(transfer_id.starts_with("xfer-"), "{transfer_id}");
+        assert_eq!(
+            prefill.get("kv_transfer_params"),
+            Some(&json!({
+                "do_remote_decode": true,
+                "do_remote_prefill": false,
+                "transfer_id": transfer_id,
+            }))
+        );
+        assert_eq!(
+            decode.get("kv_transfer_params"),
+            Some(&json!({
+                "do_remote_decode": false,
+                "do_remote_prefill": true,
+                "transfer_id": transfer_id,
+                "remote_engine_id": "eng0",
+                "remote_bootstrap_addr": "http://127.0.0.1:9123",
+            }))
+        );
+    }
+
+    /// A Mooncake pair whose prefill engine's id was not discovered: nothing
+    /// is minted, neither side carries handoff params, and the gateway warns
+    /// that the decode side recomputes the prompt.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn vllm_pd_mooncake_without_an_engine_id_sends_no_handoff_params() {
+        let [prefill, decode] = sent_to_a_mooncake_pair(None).await;
+        assert_eq!(prefill.get("kv_transfer_params"), None);
+        assert_eq!(decode.get("kv_transfer_params"), None);
+        assert!(logs_contain(
+            "Mooncake without a discovered kv_engine_id cannot be minted for"
+        ));
     }
 
     #[tokio::test]
@@ -6376,6 +6767,33 @@ mod tests {
             assert!(free.iter().all(in_range));
             let residues: std::collections::HashSet<u64> = free.iter().map(|r| r % 4).collect();
             assert!(residues.len() > 1, "{rank:?}: {residues:?}");
+        }
+    }
+
+    /// A prefill worker whose DP size is at or above the room's range gets a
+    /// free room, like a worker of one rank: the ranked draw would have no
+    /// range to draw from.
+    #[test]
+    fn a_dp_size_the_room_cannot_carry_gets_a_free_room() {
+        let rooms = |size: usize| -> Vec<u64> {
+            let worker = BasicWorkerBuilder::new("http://prefill:8000")
+                .worker_type(WorkerType::Prefill)
+                .dp_config(1, size)
+                .build();
+            let fields = PDRouter::bootstrap_fields(&worker, Some(64), Some(1)).unwrap();
+            serde_json::from_str(fields.room.get()).unwrap()
+        };
+        // The ranked draw's range is `0..i64::MAX - size`: `edge` is the last
+        // size it is not empty for (one room, the rank itself), and from
+        // `edge + 1` on the worker takes the free room.
+        let edge = usize::try_from(i64::MAX - 1).unwrap();
+        assert!(rooms(edge).iter().all(|&room| room == 1));
+        for size in [edge + 1, usize::MAX] {
+            let free: std::collections::HashSet<u64> = rooms(size).into_iter().collect();
+            assert!(
+                free.len() > 1 && free.iter().all(|&room| room <= i64::MAX as u64),
+                "{size}: {free:?}"
+            );
         }
     }
 

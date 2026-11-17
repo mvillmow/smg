@@ -89,7 +89,7 @@ def run_server(args):
         raise ValueError("managed EPD requires the Rust servicer")
     if args.encoder_only:
         return encoder_main(args)
-    config = complete({}, args, args.disaggregation_mode)
+    config = complete(args, args.disaggregation_mode)
     if config["role"] not in ("prefill", "decode"):
         raise ValueError("managed P/D requires native --disaggregation-mode prefill or decode")
     set_identity(config, config["role"])
@@ -180,7 +180,7 @@ async def serve(config, args):
     import grpc
     import uvicorn
     from smg.smg_rs import ManagedEncoderProcessor
-    from smg_grpc_proto.generated import sglang_managed_pb2_grpc as rpc
+    from smg_grpc_proto.generated import sglang_encoder_pb2_grpc as rpc
 
     from .config import encoder_cpu_limit, encoder_staging_bytes
     from .encoder_bridge import launch_runtime
@@ -189,8 +189,7 @@ async def serve(config, args):
     backend = launch_runtime(args, config["max_active"])
     service = server = None
     try:
-        # These are ceilings, not a fixed running concurrency. The registry starts
-        # small and grows only when CPU supply leaves the native scheduler idle.
+        # Fixed bounded CPU supply feeds the native batch scheduler.
         config["max_staging_bytes_per_request"] = encoder_staging_bytes(
             backend.encoder.model_config.hidden_size, config["embedding_dtype"]
         )
@@ -206,12 +205,16 @@ async def serve(config, args):
             config["max_artifact_bytes"],
         )
         service = EncoderService(config, backend, processor)
+        service.server_args = args
         app = receiver_app(config, service)
 
         server = grpc.aio.server(
             options=[("grpc.max_receive_message_length", config["max_control_bytes"])]
         )
-        rpc.add_ManagedEncoderServicer_to_server(service, server)
+        rpc.add_SglangEncoderServicer_to_server(service, server)
+        from smg_grpc_proto.generated import sglang_scheduler_pb2_grpc as sg_rpc
+
+        sg_rpc.add_SglangSchedulerServicer_to_server(service, server)
         if not server.add_insecure_port(config["control_listen"]):
             raise RuntimeError("managed encoder control port could not be bound")
         service.start()
@@ -301,47 +304,7 @@ def encoder_main(args):
 
     # Initialize before native TP children or Rust preprocessing thread pools.
     configure_threads()
-    config = complete({}, args, "encoder")
-    positive = (
-        "max_records",
-        "max_active",
-        "max_work",
-        "max_context_bytes",
-        "retention_ms",
-        "max_duration_ms",
-        "max_clock_error_ms",
-        "max_cpu",
-        "max_artifact_bytes",
-        "max_staging_bytes_per_request",
-        "max_receivers",
-        "max_control_bytes",
-        "max_images",
-        "drr_quantum",
-        "aging_seconds",
-        "max_early_waiters",
-        "early_wait_seconds",
-        "load_interval_ms",
-        "max_http_connections",
-    )
-    if any(
-        type(config.get(key)) not in (int, float) or not 0 < config[key] < 2**53 for key in positive
-    ):
-        raise ValueError("managed encoder requires finite positive resource and deadline limits")
-    if any(
-        type(config[key]) is not int
-        for key in positive
-        if key not in ("aging_seconds", "early_wait_seconds")
-    ):
-        raise ValueError(
-            "managed encoder resource counts, bytes and millisecond limits must be integers"
-        )
-    if config["max_images"] > 32 or config["max_active"] > config["max_records"]:
-        raise ValueError("invalid managed encoder admission bounds")
-    if any(type(weight) is not int or weight <= 0 for weight in config["tenant_weights"].values()):
-        raise ValueError("DRR weights must be positive integers")
-    shutdown_timeout = config.get("shutdown_timeout_seconds", 30)
-    if type(shutdown_timeout) not in (int, float) or not 0 < shutdown_timeout <= 300:
-        raise ValueError("managed shutdown timeout must be in (0, 300] seconds")
+    config = complete(args, "encoder")
     set_identity(config, "encoder")
     os.environ["SMG_SGLANG_MANAGED_PROCESSOR_CONTRACT"] = config["processor_contract"]
     native_window, _ = encoder_window(config)
