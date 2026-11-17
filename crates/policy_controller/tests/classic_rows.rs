@@ -39,6 +39,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{Map, Value};
 
 mod classic {
+    pub mod bucket;
     pub mod manual;
     pub mod pair_index;
     pub mod power_of_two;
@@ -261,7 +262,8 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// rows ([`replay_sheets`]): a module added here has both. The pair index's
 /// rows pick nothing, so its module brings its own replay and its own rule
 /// for a copied row.
-const MODULES: [Module; 3] = [
+const MODULES: [Module; 4] = [
+    module::<classic::bucket::Row>(classic::bucket::INLINE),
     module::<classic::manual::Row>(classic::manual::INLINE),
     Module {
         policy: classic::pair_index::POLICY,
@@ -481,6 +483,13 @@ fn sheets_under(dir: &Path) -> Vec<(String, String)> {
             (path.to_string_lossy().into_owned(), text)
         })
         .collect()
+}
+
+#[test]
+fn the_classic_bucket_rows_replay_pick_for_pick_and_share_for_share() {
+    let (rows, defects) = replay_sheet(classic::bucket::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
 }
 
 #[test]
@@ -715,16 +724,17 @@ fn a_policy_with_no_sheet_is_a_defect_and_so_is_a_second_sheet() {
     assert_eq!(unheld, Vec::<String>::new());
     let (_, unheld) = replay_sheets(sheets.get(..1).expect("the first sheet"));
     assert!(
-        matches!(unheld.as_slice(), [one, other]
-            if one.starts_with("no sheet of pair-index")
-                && other.starts_with("no sheet of power_of_two")),
+        matches!(unheld.as_slice(), [one, other, third]
+            if one.starts_with("no sheet of manual")
+                && other.starts_with("no sheet of pair-index")
+                && third.starts_with("no sheet of power_of_two")),
         "{unheld:#?}"
     );
     let mut twice = sheets.clone();
     twice.extend(sheets.first().cloned());
     let (_, unheld) = replay_sheets(&twice);
     assert!(
-        matches!(unheld.as_slice(), [one] if one.starts_with("2 sheets of manual")),
+        matches!(unheld.as_slice(), [one] if one.starts_with("2 sheets of bucket")),
         "{unheld:#?}"
     );
     // A sheet that lacks a copied row answers for it.
@@ -827,6 +837,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
         [
             "a_second_name.json",
             "broken.json",
+            "bucket.json",
             "manual.json",
             "pair-index.json",
             "power_of_two.json",
@@ -856,6 +867,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
 #[test]
 fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
     let sheets = copied_sheets();
+    let (bucket, _) = replay_sheet(classic::bucket::INLINE, "the inline rows");
     let (manual, _) = replay_sheet(classic::manual::INLINE, "the inline rows");
     let (pair_index, _) = replay_sheet(classic::pair_index::INLINE, "the inline rows");
     let (power_of_two, _) = replay_sheet(classic::power_of_two::INLINE, "the inline rows");
@@ -863,9 +875,11 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
     assert_eq!(
         lines,
         [
+            format!("bucket.json: {bucket} rows, 0 defects"),
             format!("manual.json: {manual} rows, 0 defects"),
             format!("pair-index.json: {pair_index} rows, 0 defects"),
             format!("power_of_two.json: {power_of_two} rows, 0 defects"),
+            format!("policy bucket: {bucket} rows, 0 defects"),
             format!("policy manual: {manual} rows, 0 defects"),
             format!("policy pair-index: {pair_index} rows, 0 defects"),
             format!("policy power_of_two: {power_of_two} rows, 0 defects"),
@@ -877,16 +891,18 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
     assert_eq!(
         lines,
         [
-            format!("manual.json: {manual} rows, 0 defects"),
-            format!("policy manual: {manual} rows, 0 defects"),
+            format!("bucket.json: {bucket} rows, 0 defects"),
+            format!("policy bucket: {bucket} rows, 0 defects"),
+            "policy manual: no sheet".to_string(),
             "policy pair-index: no sheet".to_string(),
             "policy power_of_two: no sheet".to_string(),
         ]
     );
     assert!(
-        matches!(defects.as_slice(), [one, other]
-            if one.starts_with("no sheet of pair-index")
-                && other.starts_with("no sheet of power_of_two")),
+        matches!(defects.as_slice(), [one, other, third]
+            if one.starts_with("no sheet of manual")
+                && other.starts_with("no sheet of pair-index")
+                && third.starts_with("no sheet of power_of_two")),
         "{defects:#?}"
     );
 
@@ -894,11 +910,11 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
     twice.extend(sheets.first().cloned());
     let (lines, defects) = replay_report(&twice);
     assert_eq!(
-        lines.get(4).map(String::as_str),
-        Some("policy manual: 2 sheets")
+        lines.get(5).map(String::as_str),
+        Some("policy bucket: 2 sheets")
     );
     assert!(
-        matches!(defects.as_slice(), [one] if one.starts_with("2 sheets of manual")),
+        matches!(defects.as_slice(), [one] if one.starts_with("2 sheets of bucket")),
         "{defects:#?}"
     );
 
@@ -906,7 +922,7 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
     broken.push(("broken.json".to_string(), "no sheet".to_string()));
     let (lines, defects) = replay_report(&broken);
     assert_eq!(
-        lines.get(3).map(String::as_str),
+        lines.get(4).map(String::as_str),
         Some("broken.json: 0 rows, 1 defects")
     );
     assert!(
@@ -938,17 +954,19 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
             .any(|defect| defect.contains("recorded Sequence"))
             && defects
                 .iter()
-                .all(|defect| defect.starts_with("manual.json")),
+                .all(|defect| defect.starts_with("bucket.json")),
         "{defects:#?}"
     );
     let found = defects.len();
     assert_eq!(
         lines,
         [
-            format!("manual.json: {manual} rows, {found} defects"),
+            format!("bucket.json: {bucket} rows, {found} defects"),
+            format!("manual.json: {manual} rows, 0 defects"),
             format!("pair-index.json: {pair_index} rows, 0 defects"),
             format!("power_of_two.json: {power_of_two} rows, 0 defects"),
-            format!("policy manual: {manual} rows, {found} defects"),
+            format!("policy bucket: {bucket} rows, {found} defects"),
+            format!("policy manual: {manual} rows, 0 defects"),
             format!("policy pair-index: {pair_index} rows, 0 defects"),
             format!("policy power_of_two: {power_of_two} rows, 0 defects"),
         ]

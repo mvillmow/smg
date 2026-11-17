@@ -31,6 +31,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     affinity::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
+    bucket::Bucket,
     builtins::{
         FewestSessions, LeastLoad, LeastRequests, ResidentWork, SessionAffinity,
         DEFAULT_MEAN_PREFILL_TOKENS,
@@ -510,8 +511,8 @@ impl Default for WarmupSliceParams {
     }
 }
 
-/// The bucket scorer: prefill placement by request-size buckets whose
-/// boundaries a periodic task adjusts.
+/// The bucket scorer: prefill placement by request size, over ranges of
+/// sizes cut again each interval from the tokens booked on the workers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BucketParams {
@@ -519,14 +520,15 @@ pub struct BucketParams {
     #[serde(default = "one")]
     #[schemars(extend("exclusiveMinimum" = 0))]
     pub weight: f32,
-    /// The absolute part of the balance rule, in requests (default 64).
+    /// The absolute part of the balance rule, in booked tokens (default 64).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abs_threshold: Option<u32>,
     /// The relative part of the balance rule; at least 1 (default 1.5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1.0))]
     pub rel_threshold: Option<f32>,
-    /// The boundary task's cadence, in seconds; above zero (default 5).
+    /// The bookings' window and the cut's cadence, in seconds; above zero
+    /// (default 5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub adjust_interval_s: Option<u32>,
@@ -1938,7 +1940,7 @@ fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
         ScoreStage::PrefixAffinity(p) => built_scorer(PrefixAffinity::new(p, gates)),
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
         ScoreStage::WarmupSlice(p) => built_scorer(WarmupSlice::new(p, gates)),
-        ScoreStage::Bucket(_) => Resolved::NotInBuild("the bucket scorer"),
+        ScoreStage::Bucket(p) => built_scorer(Bucket::new(p)),
         ScoreStage::ConsistentHash(p) if p.prefix_tokens.is_some() => {
             Resolved::NotInBuild("the consistent-hash prefix key")
         }
@@ -2533,7 +2535,7 @@ fn session_rule(
 
 /// The ten preset names of today, as whole profiles. The ones whose stages
 /// this build does not carry yet answer `UnknownPreset`.
-pub const PRESETS: [&str; 8] = [
+pub const PRESETS: [&str; 9] = [
     "random",
     "round_robin",
     "passthrough",
@@ -2542,6 +2544,7 @@ pub const PRESETS: [&str; 8] = [
     "consistent_hashing",
     "manual",
     "cache_aware",
+    "bucket",
 ];
 
 /// The header the `manual` preset names as its session key, the gateway's
@@ -2667,6 +2670,15 @@ impl PolicySpec {
                     "kv-pressure".into(),
                     "least-load".into(),
                 ],
+                pick: "best".into(),
+            },
+            // Prefill placement by request size: the worker whose range of
+            // sizes holds the prompt, the least booked survivor when the
+            // balance rule spills, each at the stage's defaults; any other
+            // phase is the picker's draw.
+            "bucket" => ProfileSpec {
+                filter: standard_filters(),
+                score: vec!["bucket".into()],
                 pick: "best".into(),
             },
             other => return Err(SpecError::UnknownPreset(other.to_string())),
@@ -3236,8 +3248,8 @@ mod tests {
             }
         }
         assert_eq!(
-            PolicySpec::preset("bucket").err(),
-            Some(SpecError::UnknownPreset("bucket".into()))
+            PolicySpec::preset("no_such_policy").err(),
+            Some(SpecError::UnknownPreset("no_such_policy".into()))
         );
     }
 
@@ -4076,6 +4088,7 @@ mod tests {
             "consistent-hash",
             "kv-pressure",
             "warmup-slice",
+            "bucket",
         ];
         for name in SCORERS {
             let bare = spec_with_score(&format!("{name:?}"));
@@ -4091,12 +4104,13 @@ mod tests {
                 );
             }
         }
-        // The affinity stages build with their parameters; the forms a later
-        // step carries are refused by name.
+        // The affinity stages and the bucket stage build with their
+        // parameters; the forms a later step carries are refused by name.
         for score in [
             r#"{"kv-pressure":{"spread":0.3,"ceiling":0.9}}"#,
             r#"{"warmup-slice":{"secs":0,"miss_share":0.5}}"#,
             r#"{"prefix-affinity":{"threshold":0.5,"source":"merged","spill":{"abs":8,"rel":2.0}}}"#,
+            r#"{"bucket":{"abs_threshold":32,"rel_threshold":1.0001,"adjust_interval_s":5}}"#,
         ] {
             assert!(spec_with_score(score).validate().is_ok(), "{score}");
         }
@@ -4110,7 +4124,6 @@ mod tests {
                 r#"{"prefix-affinity":{"spill":{"uncached_credit":true}}}"#,
                 "prefix-affinity",
             ),
-            (r#"{"bucket":{"abs_threshold":32}}"#, "bucket"),
             (
                 r#"{"consistent-hash":{"prefix_tokens":512,"bounded_load":{"factor":1.5,"abs_margin":4}}}"#,
                 "consistent-hash",
