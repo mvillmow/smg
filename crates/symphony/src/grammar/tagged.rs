@@ -90,11 +90,13 @@ impl Values<'_> {
     /// A value written as it is: any text up to the parameter's close, a tag the table reads
     /// inside a call (the opener of a parameter, the function's close) or a terminal that ends the
     /// call. A value that went on over the next parameter's tag would be read as one long value,
-    /// and the members behind it would be owed once more.
+    /// and the members behind it would be owed once more. The opener ends the value at its word,
+    /// before its sign: a model that runs on writes the word first, and a stop at the sign would
+    /// leave the word in the value.
     fn text(&self) -> Slot {
         let mut excludes = vec![
             PARAMETER_CLOSE.to_string(),
-            PARAMETER_OPEN.to_string(),
+            PARAMETER_OPEN.trim_end_matches('=').to_string(),
             FUNCTION_CLOSE.to_string(),
         ];
         excludes.extend(self.call_exits.iter().map(|exit| exit.to_string()));
@@ -263,7 +265,7 @@ mod tests {
         let text = value!({
             "type": "any_text",
             "excludes": [
-                "</parameter>", "<parameter=", "</function>", "</tool_call>", "<tool_call>",
+                "</parameter>", "<parameter", "</function>", "</tool_call>", "<tool_call>",
             ],
         });
         let city = value!({"type": "const_string", "value": "city"});
@@ -347,7 +349,7 @@ mod tests {
             "type": "any_text",
             "excludes": [
                 "</parameter>",
-                "<parameter=",
+                "<parameter",
                 "</function>",
                 "</seed:tool_call>",
                 "<seed:tool_call>",

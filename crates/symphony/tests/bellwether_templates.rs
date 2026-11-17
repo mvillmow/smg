@@ -1585,8 +1585,10 @@ fn a_required_tag_takes_its_calls_and_no_text_after_them() {
 
 /// Inside a value written as text, the tagged tables' tag takes none of the tags the table reads
 /// in a call: a value that goes on over the next parameter's tag, or over the function's close,
-/// is refused where that tag would stand. A tag spelled wrong is the value's text, as any other
-/// text is: no rule of the syntax reads it.
+/// is refused where that tag would stand. The opener of a parameter ends the value at its word,
+/// before the sign that follows it: a model that runs on writes the word first, and a stop at the
+/// sign would leave the word in the value. So the word with another ending is refused as well,
+/// and a value still holds a `<` that opens nothing.
 #[test]
 fn a_tagged_value_stops_before_the_next_tag_of_its_call() {
     const CLOSED: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
@@ -1594,6 +1596,8 @@ fn a_tagged_value_stops_before_the_next_tag_of_its_call() {
     // required member comes once more.
     const RUN_ON: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n<parameter=days>\n3\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
     const OVER_THE_CLOSE: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n</function>\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    const PLURAL: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n<parameters>\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    const LESS_THAN: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon < Paris\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
     const MISSPELLED: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n<parameter>days>\n3\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
     let tools = [Tool {
         tool_type: "function".to_string(),
@@ -1653,8 +1657,16 @@ fn a_tagged_value_stops_before_the_next_tag_of_its_call() {
                     "{what}: a value over the function's close"
                 );
                 assert!(
-                    accepts(&tag, &format!("{before}{MISSPELLED}")),
-                    "{what}: a tag spelled wrong is the value's text"
+                    !accepts(&tag, &format!("{before}{MISSPELLED}")),
+                    "{what}: the opener's word with its sign spelled wrong"
+                );
+                assert!(
+                    !accepts(&tag, &format!("{before}{PLURAL}")),
+                    "{what}: the opener's word in the plural"
+                );
+                assert!(
+                    accepts(&tag, &format!("{before}{LESS_THAN}")),
+                    "{what}: a value that holds a tag's first character"
                 );
             }
         }

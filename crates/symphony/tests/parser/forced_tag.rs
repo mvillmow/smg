@@ -288,8 +288,9 @@ fn nodes<'a>(value: &'a serde_json::Value, seen: &mut Vec<&'a serde_json::Value>
 }
 
 /// On every table of the tagged syntax, the free text of a value excludes each tag the table
-/// reads inside a call beside the value's own close: the opener of a parameter and the close of
-/// the function. A value that went on over them would be read as one long value.
+/// reads inside a call beside the value's own close: the opener of a parameter, from its word
+/// on, and the close of the function. A value that went on over them would be read as one long
+/// value.
 #[test]
 fn a_tagged_value_excludes_the_tags_its_call_reads() {
     let tools = tools();
@@ -307,26 +308,40 @@ fn a_tagged_value_excludes_the_tags_its_call_reads() {
             let mut seen = Vec::new();
             nodes(&payload, &mut seen);
             for node in seen {
-                if node["type"] != "any_text" {
+                // A parameter is a sequence that opens with its tag; its value stands behind the
+                // key and the tag's end. The prefix of an opened thought excludes the tags of a
+                // call too and is no value.
+                let Some(parts) = node["elements"].as_array() else {
                     continue;
-                }
-                let excluded = |text: &str| {
-                    node["excludes"]
-                        .as_array()
-                        .is_some_and(|excludes| excludes.iter().any(|exclude| exclude == text))
                 };
-                if !excluded("</parameter>") {
+                if parts
+                    .first()
+                    .is_none_or(|first| first["value"] != "<parameter=")
+                {
                     continue;
                 }
-                assert!(
-                    excluded("<parameter=") && excluded("</function>"),
-                    "{} ({configuration}): a value may go on over the next tag of its call: \
-                     {node}",
-                    table.name()
-                );
-                let name = table.name().to_string();
-                if !tables.contains(&name) {
-                    tables.push(name);
+                for value in parts
+                    .iter()
+                    .skip(3)
+                    .filter(|part| part["type"] == "any_text")
+                {
+                    let excluded = |text: &str| {
+                        value["excludes"]
+                            .as_array()
+                            .is_some_and(|excludes| excludes.iter().any(|exclude| exclude == text))
+                    };
+                    assert!(
+                        excluded("</parameter>")
+                            && excluded("<parameter")
+                            && excluded("</function>"),
+                        "{} ({configuration}): a value may go on over the next tag of its call: \
+                         {value}",
+                        table.name()
+                    );
+                    let name = table.name().to_string();
+                    if !tables.contains(&name) {
+                        tables.push(name);
+                    }
                 }
             }
         }
