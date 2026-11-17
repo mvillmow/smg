@@ -50,7 +50,7 @@ use std::{mem, time::Duration};
 use prost::Message as _;
 
 use crate::{
-    decision::{Decision, ShedReason, Target, Trace},
+    decision::{Decision, Lifted, ShedReason, Target, Trace},
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
     view::{
@@ -454,7 +454,16 @@ fn trace(trace: &Trace) -> proto::Trace {
             .collect(),
         seed: trace.seed,
         generation: trace.generation,
+        lifted: lifted(trace.lifted) as i32,
         ..proto::Trace::default()
+    }
+}
+
+/// The contract's word for the veto the all-vetoed rule lifted.
+const fn lifted(mark: Lifted) -> proto::LiftedVeto {
+    match mark {
+        Lifted::None => proto::LiftedVeto::None,
+        Lifted::Overload => proto::LiftedVeto::Overload,
     }
 }
 
@@ -463,7 +472,8 @@ mod tests {
     use super::{busy, credit, decided, emptied, Checked, Lists, Refusal, Viewed};
     use crate::{
         decision::{
-            Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
+            Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets,
+            Trace,
         },
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
         view::{
@@ -926,6 +936,24 @@ mod tests {
         assert!(emptied(spent).capacity() >= 8);
     }
 
+    /// The wire's trace carries the veto the all-vetoed rule lifted, and
+    /// none for a pick no rule made.
+    #[test]
+    fn the_wire_carries_the_lifted_veto() {
+        let steered = Trace {
+            lifted: Lifted::Overload,
+            ..Trace::default()
+        };
+        assert_eq!(
+            super::trace(&steered).lifted,
+            proto::LiftedVeto::Overload as i32
+        );
+        assert_eq!(
+            super::trace(&Trace::default()).lifted,
+            proto::LiftedVeto::None as i32
+        );
+    }
+
     fn traced() -> Trace {
         Trace {
             profile: 3,
@@ -939,6 +967,7 @@ mod tests {
             top_len: 2,
             seed: 41,
             generation: 6,
+            ..Trace::default()
         }
     }
 

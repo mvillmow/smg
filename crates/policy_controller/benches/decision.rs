@@ -1,9 +1,11 @@
 //! The engine's cost per decision: the view build and the decision at 8, 64
 //! and 512 candidates, per preset, the least-load decision with a credit
-//! held per row, a keyed decision on its pin and off it, and the spec's
-//! parse-and-validate time at apply. Ids: `policy_engine/view_build/<n>`,
+//! held per row, the steer of a pool over its thresholds on every row, a
+//! keyed decision on its pin and off it, and the spec's parse-and-validate
+//! time at apply. Ids: `policy_engine/view_build/<n>`,
 //! `policy_engine/decide/<preset>/<n>`,
 //! `policy_engine/decide/least_load_credited/<n>`,
+//! `policy_engine/decide/all_vetoed/<n>`,
 //! `policy_engine/decide/manual_keyed_hit/8`,
 //! `policy_engine/decide/manual_keyed_miss/8` and
 //! `policy_engine/spec/parse_validate`. The view is built from the synthetic
@@ -118,6 +120,39 @@ fn decide(c: &mut Criterion) {
         };
         let cx = Constraints::default();
         group.bench_with_input(BenchmarkId::new("least_load_credited", n), &n, |b, _| {
+            let mut seed = 0u64;
+            b.iter(|| {
+                seed += 1;
+                let facts = RequestFacts {
+                    model: "m",
+                    prompt_tokens: 512,
+                    seed,
+                    now_micros: 1_000_000,
+                    ..RequestFacts::default()
+                };
+                engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
+            });
+        });
+    }
+    // The all-vetoed rule's own path: every row over its thresholds, so the
+    // profile's filters leave nobody, run once more with the overload veto
+    // lifted, and the decision steers to the fewest requests in flight.
+    let engine = engine_of("least_load");
+    for &n in &SIZES {
+        let fleet = fleet(n);
+        let mut view = Vec::with_capacity(n);
+        build_view(&fleet, &mut view);
+        for row in &mut view {
+            row.health.overloaded = true;
+        }
+        let mut scratch = Scratch::new();
+        let pool = PoolFacts {
+            pool_size: n as u32,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        let cx = Constraints::default();
+        group.bench_with_input(BenchmarkId::new("all_vetoed", n), &n, |b, _| {
             let mut seed = 0u64;
             b.iter(|| {
                 seed += 1;
