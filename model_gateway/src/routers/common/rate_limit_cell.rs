@@ -121,6 +121,16 @@ impl RateLimitCell {
         }
     }
 
+    /// [`Self::take_for_streaming_handoff`] on the request's cell when it
+    /// has one (tenant rate limiting is enabled): the reservation is settled
+    /// with real usage inside the streaming processor on success, or
+    /// abandoned on early disconnect/error by the reservation's safety net
+    /// the processor hands the response body (`ReservationAttachment`'s
+    /// `Drop`).
+    pub(crate) fn stream_reservation(cell: Option<&Self>) -> Option<Arc<SharedReservationHandle>> {
+        cell.and_then(Self::take_for_streaming_handoff)
+    }
+
     /// Settle a buffered success's reservation with the engine's counts, if
     /// this logical request reserved one. No-op if nothing was reserved
     /// (feature disabled) or the request was never admitted (preparation
