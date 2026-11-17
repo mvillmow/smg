@@ -410,6 +410,13 @@ struct GlobalRoutingSnapshot {
 /// and node maps the same way.
 type ModelIndex = Arc<DashMap<String, Arc<ModelWorkerSnapshot>, FxBuildHasher>>;
 
+/// Shards of the model index, on any host. Iterating the map costs one lock
+/// and one allocation a shard, whether the shard holds an entry or not, and
+/// [`WorkerRegistry::model_count`] iterates it on request paths: the count
+/// must not follow the CPUs the process sees, as the library's default does
+/// (four shards a CPU). The index holds one entry a model.
+const MODEL_INDEX_SHARDS: usize = 16;
+
 /// Model alias to canonical model ID.
 type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
 
@@ -578,7 +585,10 @@ impl WorkerRegistry {
         let (connect_signal_tx, connect_signal_rx) = mpsc::unbounded_channel();
         Self {
             workers: Arc::new(DashMap::new()),
-            model_index: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+            model_index: Arc::new(DashMap::with_hasher_and_shard_amount(
+                FxBuildHasher,
+                MODEL_INDEX_SHARDS,
+            )),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
                 epoch: 0,
                 snapshot: Self::empty_routing_snapshot(),

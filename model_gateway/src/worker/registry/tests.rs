@@ -1855,6 +1855,21 @@ fn test_model_index_fast_lookup() {
     assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
 }
 
+/// The model index is iterated on request paths and the map's iterator pays
+/// for every shard, so its shard count is fixed: not the library's default
+/// of four shards a CPU.
+#[test]
+fn the_model_index_keeps_a_fixed_shard_count() {
+    use dashmap::Map as _;
+
+    let registry = WorkerRegistry::new();
+    assert_eq!(
+        registry.model_index._shard_count(),
+        16,
+        "the model index's shard count follows the CPUs"
+    );
+}
+
 #[test]
 fn routing_pool_reuses_uniform_model_snapshot() {
     let registry = WorkerRegistry::new();
