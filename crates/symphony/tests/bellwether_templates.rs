@@ -1583,6 +1583,84 @@ fn a_required_tag_takes_its_calls_and_no_text_after_them() {
     }
 }
 
+/// Inside a value written as text, the tagged tables' tag takes none of the tags the table reads
+/// in a call: a value that goes on over the next parameter's tag, or over the function's close,
+/// is refused where that tag would stand. A tag spelled wrong is the value's text, as any other
+/// text is: no rule of the syntax reads it.
+#[test]
+fn a_tagged_value_stops_before_the_next_tag_of_its_call() {
+    const CLOSED: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    // The first value is not closed before the next parameter's tag; it is closed late, and the
+    // required member comes once more.
+    const RUN_ON: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n<parameter=days>\n3\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    const OVER_THE_CLOSE: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n</function>\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    const MISSPELLED: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n<parameter>days>\n3\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    let tools = [Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "forecast".to_string(),
+            description: None,
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"location": {"type": "string"}, "days": {"type": "integer"}},
+                "required": ["location", "days"],
+            })),
+            strict: None,
+            extra: Default::default(),
+        },
+    }];
+    let format = symphony::formats::Table::Qwen3Tagged.format();
+    for start in [
+        GrammarStart::Unknown,
+        GrammarStart::Either,
+        GrammarStart::AfterReasoning,
+        GrammarStart::FirstToken,
+    ] {
+        for (reasoning_open, thought_closed) in [(false, false), (true, false), (false, true)] {
+            // What the thought owes before the call, as in the test above.
+            let before = match (reasoning_open, thought_closed, start) {
+                (true, _, GrammarStart::FirstToken) => "\nNo tool fits.\n</think>\n\n",
+                (true, ..) | (false, false, GrammarStart::AfterReasoning) => "\n\n",
+                _ => "",
+            };
+            for one_call in [true, false] {
+                let tag = format
+                    .grammar_for(
+                        &tools,
+                        Options {
+                            at_least_one: true,
+                            reasoning_open,
+                            thought_closed,
+                            one_call,
+                            start,
+                        },
+                    )
+                    .expect("a tag");
+                let what = format!(
+                    "{start:?}, thought open {reasoning_open}, closed {thought_closed}, one call \
+                     {one_call}"
+                );
+                assert!(
+                    accepts(&tag, &format!("{before}{CLOSED}")),
+                    "{what}: every value closed"
+                );
+                assert!(
+                    !accepts(&tag, &format!("{before}{RUN_ON}")),
+                    "{what}: a value over the next parameter's tag"
+                );
+                assert!(
+                    !accepts(&tag, &format!("{before}{OVER_THE_CLOSE}")),
+                    "{what}: a value over the function's close"
+                );
+                assert!(
+                    accepts(&tag, &format!("{before}{MISSPELLED}")),
+                    "{what}: a tag spelled wrong is the value's text"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn every_layout_here_fits_its_table() {
     let Some((word, space)) = classes() else {

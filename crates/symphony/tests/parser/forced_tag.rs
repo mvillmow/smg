@@ -277,6 +277,66 @@ fn a_required_tag_opens_no_call_in_free_text() {
     assert!(checked > 0, "no table reads calls");
 }
 
+/// Every node of a tag's payload, depth first.
+fn nodes<'a>(value: &'a serde_json::Value, seen: &mut Vec<&'a serde_json::Value>) {
+    seen.push(value);
+    match value {
+        serde_json::Value::Array(items) => items.iter().for_each(|item| nodes(item, seen)),
+        serde_json::Value::Object(map) => map.values().for_each(|item| nodes(item, seen)),
+        _ => {}
+    }
+}
+
+/// On every table of the tagged syntax, the free text of a value excludes each tag the table
+/// reads inside a call beside the value's own close: the opener of a parameter and the close of
+/// the function. A value that went on over them would be read as one long value.
+#[test]
+fn a_tagged_value_excludes_the_tags_its_call_reads() {
+    let tools = tools();
+    let mut tables: Vec<String> = Vec::new();
+    for table in Table::ALL {
+        let format = table.format();
+        if !matches!(format.call_syntax(), Some(CallSyntax::Tagged(..))) {
+            continue;
+        }
+        for (configuration, options, passed) in configurations() {
+            let Some(tag) = format.grammar_for(&tools[passed], options) else {
+                continue;
+            };
+            let payload = tag.payload();
+            let mut seen = Vec::new();
+            nodes(&payload, &mut seen);
+            for node in seen {
+                if node["type"] != "any_text" {
+                    continue;
+                }
+                let excluded = |text: &str| {
+                    node["excludes"]
+                        .as_array()
+                        .is_some_and(|excludes| excludes.iter().any(|exclude| exclude == text))
+                };
+                if !excluded("</parameter>") {
+                    continue;
+                }
+                assert!(
+                    excluded("<parameter=") && excluded("</function>"),
+                    "{} ({configuration}): a value may go on over the next tag of its call: \
+                     {node}",
+                    table.name()
+                );
+                let name = table.name().to_string();
+                if !tables.contains(&name) {
+                    tables.push(name);
+                }
+            }
+        }
+    }
+    assert!(
+        tables.iter().any(|table| table == "qwen3_tagged"),
+        "the tagged tables were not reached: {tables:?}"
+    );
+}
+
 /// What the tagged table reads when text follows or precedes a call, as a worker that takes no
 /// grammar may write it: the call, and the text as content, call syntax included. The reader
 /// keeps every byte it is given, so it is the tag above that keeps a required turn to its calls.
